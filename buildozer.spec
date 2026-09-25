@@ -11,7 +11,9 @@ source.include_patterns = assets/*, sources/*
 
 version = 1.0.0
 
-requirements = python3,kivy,pyjnius,android,urllib3,certifi
+# 只用 kivy（不锁版本）。锁 kivy==2.3.x 会拉 thorvg 依赖，
+# 其 recipe 在 NDK r25b 下 glob() 返回空 -> IndexError 导致编译失败。
+requirements = python3,kivy,pyjnius,android
 
 orientation = portrait
 fullscreen = 0
@@ -20,7 +22,9 @@ fullscreen = 0
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
-android.archs = arm64-v8a, armeabi-v7a
+# 只编 arm64-v8a。双架构会让 openssl/python/libffi 各编两遍，
+# 编译时间翻倍且极易超时（实测 13 分钟被打断）。
+android.archs = arm64-v8a
 android.allow_backup = True
 
 # 需要网络权限
