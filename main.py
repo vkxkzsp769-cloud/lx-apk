@@ -278,10 +278,22 @@ LX_HOST_JS = r"""
 var __HANDLER = null, __INITED = null, __RESULT = null, __LOGS = [];
 
 function __mkRequest() {
+  // 明文 http 的处理：
+  // Android targetSdk>=28 默认禁止明文流量（network security policy），
+  // WebView 里对 http:// 发 XHR 会被系统直接拦掉，表现为 onerror/status 0。
+  // 音源里有 11 个 http:// 主机（y.qq.com / dl.stream.qqmusic.qq.com /
+  // www.kugou.com / music.migu.cn 等）。
+  //
+  // 策略：先把 http:// 升级为 https:// 再请求（这些接口绝大多数都支持 https），
+  //       若失败（网络层错误 / status 0）再回退原始 http://（万一明文是放开的）。
+  // 这样无论 manifest 里有没有 usesCleartextTraffic 都能工作。
+  function __upgrade(u) {
+    return /^http:\/\//i.test(u) ? u.replace(/^http:\/\//i, 'https://') : null;
+  }
+
   return function lxRequest(url, options, callback) {
     if (typeof options === 'function') { callback = options; options = {}; }
     options = options || {};
-    var xhr = new XMLHttpRequest();
     var method = (options.method || ((options.body || options.form) ? 'POST' : 'GET')).toUpperCase();
     var body = null;
     if (options.form) {
@@ -290,19 +302,42 @@ function __mkRequest() {
       body = parts.join('&');
     } else if (options.json) { body = JSON.stringify(options.json); }
     else if (options.body != null) { body = String(options.body); }
-    try { xhr.open(method, url, true); } catch (e) { return callback(new Error('bad url'), null); }
-    var h = options.headers || {};
-    for (var hk in h) { try { xhr.setRequestHeader(hk, h[hk]); } catch (e) {} }
-    if (body && !h['Content-Type'] && !h['content-type'])
-      try { xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded'); } catch (e) {}
-    xhr.timeout = options.timeout || 8000;
-    xhr.onreadystatechange = function () {
-      if (xhr.readyState === 4)
+
+    var upgraded = __upgrade(url);
+
+    function attempt(target, allowFallback) {
+      var xhr = new XMLHttpRequest();
+      var settled = false;
+      function fail(err) {
+        if (settled) return;
+        settled = true;
+        // https 失败 -> 回退原始 http
+        if (allowFallback) { attempt(url, false); return; }
+        callback(err, null);
+      }
+      try { xhr.open(method, target, true); }
+      catch (e) { fail(new Error('bad url')); return; }
+
+      var h = options.headers || {};
+      for (var hk in h) { try { xhr.setRequestHeader(hk, h[hk]); } catch (e) {} }
+      if (body && !h['Content-Type'] && !h['content-type'])
+        try { xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded'); } catch (e) {}
+      xhr.timeout = options.timeout || 8000;
+
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        if (settled) return;
+        // status 0 = 网络层失败（含被明文策略拦截）
+        if (xhr.status === 0) { fail(new Error('network')); return; }
+        settled = true;
         callback(null, { statusCode: xhr.status, headers: {}, body: xhr.responseText });
-    };
-    xhr.ontimeout = function () { callback(new Error('timeout'), null); };
-    xhr.onerror = function () { callback(new Error('network'), null); };
-    try { xhr.send(body); } catch (e) { callback(e, null); }
+      };
+      xhr.ontimeout = function () { fail(new Error('timeout')); };
+      xhr.onerror = function () { fail(new Error('network')); };
+      try { xhr.send(body); } catch (e) { fail(e); }
+    }
+
+    attempt(upgraded || url, !!upgraded);
   };
 }
 

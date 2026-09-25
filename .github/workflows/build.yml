@@ -109,17 +109,33 @@ jobs:
           echo "=== 确认补丁生效 ==="
           grep -n "usesCleartextTraffic\|requestLegacyExternalStorage" "$TMPL"
 
-          # 关键：模板只在 p4a 的 create 步骤渲染。
-          # 若 dist 已存在（缓存命中），create 会被跳过 ——
-          # 实测此时权限会就地更新，但模板改动不会生效。
-          # 所以必须删掉旧 dist，强制重新渲染 manifest。
-          for d in .buildozer/android/platform/build-*/dists/lxdownloader; do
-            if [ -d "$d" ]; then
-              echo "删除旧 dist 以强制重渲染 manifest: $d"
-              rm -rf "$d"
+          # 若 dist 已存在（缓存命中），p4a 可能不再从上面的模板重渲染，
+          # 那就直接给已渲染出来的 manifest 补属性。
+          # （不要删 dist 强制重渲染 —— 实测会触发 p4a 构建 venv 里
+          #   pip 的 ImportError: BuildDependencyInstallError，导致 create 失败）
+          for MF in .buildozer/android/platform/build-*/dists/lxdownloader/src/main/AndroidManifest.xml; do
+            if [ -f "$MF" ]; then
+              echo "发现已渲染的 manifest: $MF"
+              python3 - "$MF" <<'PYEOF2'
+          import io, sys
+          path = sys.argv[1]
+          src = io.open(path, encoding='utf-8').read()
+          if 'usesCleartextTraffic' in src:
+              print('manifest 已有 usesCleartextTraffic，跳过')
+          else:
+              anchor = '<application '
+              if anchor not in src:
+                  print('manifest 里没有 <application>，跳过'); sys.exit(0)
+              src = src.replace(
+                  anchor,
+                  '<application android:usesCleartextTraffic="true" '
+                  'android:requestLegacyExternalStorage="true" ', 1)
+              io.open(path, 'w', encoding='utf-8').write(src)
+              print('已给 manifest 补上明文属性')
+          PYEOF2
             fi
           done
-          echo "dist 清理完成"
+          echo "manifest 处理完成"
 
       - name: 编译 APK
         run: |
