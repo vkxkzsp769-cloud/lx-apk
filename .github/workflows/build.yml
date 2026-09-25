@@ -3,11 +3,12 @@ name: Build APK
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:        # 也能在 GitHub 网页上手动点按钮编译
+  workflow_dispatch:
 
 jobs:
   build-android:
     runs-on: ubuntu-22.04
+    timeout-minutes: 90
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -25,7 +26,7 @@ jobs:
           python3 -m pip install --upgrade pip setuptools wheel
           python3 -m pip install "buildozer==1.5.0" "cython<3.0" virtualenv
 
-      - name: 缓存 Android SDK/NDK（大幅加速二次编译）
+      - name: 缓存 Android SDK/NDK
         uses: actions/cache@v4
         with:
           path: |
@@ -38,9 +39,26 @@ jobs:
       - name: 编译 APK
         run: |
           export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-          yes | buildozer -v android debug
+          set -o pipefail
+          yes | buildozer -v android debug 2>&1 | tee build.log
+
+      - name: 失败时打印错误摘要
+        if: failure()
+        run: |
+          echo "=========== 编译失败，错误摘要 ==========="
+          grep -aiE "error|Traceback|Exception|No such file|failed|not found" build.log \
+            | grep -avE "\[DEBUG\]|-Werror|-Wno-|error\.h|_error" | tail -60 || true
+
+      - name: 上传编译日志（失败时也能看）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: 上传 APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: lx-downloader-apk
