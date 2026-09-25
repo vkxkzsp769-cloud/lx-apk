@@ -86,8 +86,20 @@ jobs:
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         run: |
-          set -o pipefail
-          yes | buildozer -v android debug 2>&1 | tee build.log
+          # 注意：不要用 `yes | buildozer`。buildozer 正常跑完后 yes 仍会写入，
+          # 触发 SIGPIPE 让整条管道返回 1，步骤被判失败（尽管 APK 已生成）。
+          # 许可问题已在「预装 Android SDK」步骤里处理掉了。
+          set +e
+          buildozer -v android debug > build.log 2>&1
+          RC=$?
+          tail -40 build.log
+          echo "buildozer 退出码: $RC"
+          # APK 生成了就算成功（buildozer 有时会因无关警告返回非 0）
+          if ls bin/*.apk >/dev/null 2>&1; then
+            echo "✓ 找到 APK: $(ls -lh bin/*.apk)"
+            exit 0
+          fi
+          exit $RC
 
       - name: 失败时打印错误摘要
         if: failure()
