@@ -138,6 +138,10 @@ def test_runtime(app):
     check("_current_source", lambda: print("         -> %s"
                                           % app._current_source()))
     check("download_dir", lambda: print("         -> %s" % appenv.download_dir()))
+    check("品质/格式过滤", test_quality_format_filter)
+    check("歌曲详情填充", test_song_detail)
+    check("fmt_time", test_fmt_time)
+    check("播放器状态机", test_player_state)
 
 
 def test_source_info(app):
@@ -374,6 +378,79 @@ def test_ssl_fallback():
             raise AssertionError("普通错误被错误地降级了")
     finally:
         netutil.urllib.request.urlopen = real
+
+
+def test_quality_format_filter():
+    """品质下拉要按「格式」偏好过滤，并且用平台声明的品质列表"""
+    app = make_app()
+    app._apply_source_info({
+        "meta": {"name": "t", "version": "1"},
+        "sources": {"wy": {"name": "网易云",
+                           "qualitys": ["128k", "320k", "flac", "hires"]}},
+    })
+    app.sp_platform.text = "网易云 (wy)"
+    app.sp_format.text = "自动"
+    app._refresh_qualities()
+    if list(app.sp_quality.values) != ["128k", "320k", "flac", "hires"]:
+        raise AssertionError("自动模式品质不对: %s" % (app.sp_quality.values,))
+
+    app.sp_format.text = "FLAC"
+    app._refresh_qualities()
+    if list(app.sp_quality.values) != ["flac", "hires"]:
+        raise AssertionError("FLAC 过滤不对: %s" % (app.sp_quality.values,))
+
+    app.sp_format.text = "MP3"
+    app._refresh_qualities()
+    if list(app.sp_quality.values) != ["128k", "320k"]:
+        raise AssertionError("MP3 过滤不对: %s" % (app.sp_quality.values,))
+    print("  自动/FLAC/MP3 过滤都正确 ✓")
+
+
+def test_song_detail():
+    """详情弹窗：解析完成后要填上 时长/品质/格式/大小，并放开按钮"""
+    app = make_app()
+    song = {"id": "1", "name": "海阔天空", "singer": "Beyond",
+            "interval": "03:59", "album": ""}
+    app._show_song_popup(song)
+    if not app._pop_play.disabled:
+        raise AssertionError("解析前播放按钮不该可用")
+    app._song_ready(song, "https://x/a.mp3", "320k",
+                    {"format": "mp3", "size": 8123456,
+                     "content_type": "audio/mpeg"})
+    txt = app._pop_info.text
+    print("  详情: %s" % txt.replace("\n", " | "))
+    for want in ("Beyond", "03:59", "320k", "MP3", "7.7 MB"):
+        if want not in txt:
+            raise AssertionError("详情里缺少 %r: %s" % (want, txt))
+    if app._pop_play.disabled or app._pop_dl.disabled:
+        raise AssertionError("解析后按钮应可用")
+    if app._cur_dur != 239:
+        raise AssertionError("时长解析错: %r" % app._cur_dur)
+    app._popup.dismiss()
+
+
+def test_fmt_time():
+    if M.fmt_time(0) != "00:00" or M.fmt_time(239) != "03:59":
+        raise AssertionError("fmt_time 不对: %s / %s"
+                             % (M.fmt_time(0), M.fmt_time(239)))
+    if M.fmt_time(-5) != "00:00" or M.fmt_time(None) != "00:00":
+        raise AssertionError("fmt_time 边界处理不对")
+    print("  fmt_time ✓")
+
+
+def test_player_state():
+    """播放器状态机（不真的播，只验证控制逻辑不炸）"""
+    import player as P
+    import tempfile
+    pl = P.Player(tempfile.mkdtemp())
+    if pl.is_active():
+        raise AssertionError("初始不该是活动状态")
+    pl.seek(10)        # 没有 sound 时也不能抛
+    pl.toggle()
+    pl.stop()
+    if pl.position() != 0.0 or pl.duration() < 0:
+        raise AssertionError("无音源时的查询值不对")
+    print("  空播放器控制安全 ✓")
 
 
 def test_static():

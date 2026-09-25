@@ -28,7 +28,9 @@ from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
 from kivy.uix.progressbar import ProgressBar
+from kivy.uix.slider import Slider
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.spinner import Spinner
 from kivy.uix.textinput import TextInput
@@ -37,6 +39,8 @@ import appenv
 import downloader
 import fonts
 import netease
+import player as player_mod
+import songinfo
 from appenv import (IS_ANDROID, SOURCE_FILE, diag, download_dir,
                     ensure_source, log, log_exc, request_all_files_access,
                     save_source)
@@ -60,6 +64,15 @@ PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我",
 # 顺序即下拉顺序，第一项是 Spinner 的默认值 —— 所以 320k 放最前
 QUALITY_ORDER = ["320k", "128k", "192k", "flac", "flac24bit",
                  "hires", "master"]
+TIME_FMT = "%02d:%02d"
+
+
+def fmt_time(sec):
+    try:
+        sec = int(max(0, sec))
+    except Exception:
+        return "00:00"
+    return TIME_FMT % (sec // 60, sec % 60)
 
 
 # ============================================================
@@ -124,10 +137,19 @@ class LxApp(App):
     # ---------- 生命周期 ----------
     def build(self):
         self.bridge = LxBridge()
+        self.player = player_mod.Player(
+            os.path.join(appenv.APP_DIR, "cache"))
         self.songs = []           # 搜索结果
         self.platforms = []       # [{source,name,qualitys}]
         self.busy = False
         self._asked_permission = False
+        self._cur_duration = 0.0  # 当前播放时长（秒）
+        self._dragging = False    # 用户正在拖进度条
+        self._cur_song = None
+        self._cur_url = None
+        self._cur_ext = None
+        self._cur_dur = 0.0
+        self._popup = None
         self.F = fonts.font_kwargs()
 
         root = BoxLayout(orientation="vertical")
@@ -139,6 +161,7 @@ class LxApp(App):
         root.add_widget(self._build_footer())
 
         Clock.schedule_once(self._guard(self._boot), 0.2)
+        Clock.schedule_interval(self._guard(self._tick), 0.5)
         return root
 
     def _guard(self, fn):
@@ -185,18 +208,24 @@ class LxApp(App):
         row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
         row.add_widget(self._field("平台"))
         self.sp_platform = CNSpinner(text="—", values=[], size_hint_x=None,
-                                     width=dp(104), font_size=dp(14), **self.F)
+                                     width=dp(100), font_size=dp(14), **self.F)
+        self.sp_platform.bind(text=lambda *_: self._refresh_qualities())
         row.add_widget(self.sp_platform)
-        row.add_widget(self._field("音质"))
+        row.add_widget(self._field("品质"))
         self.sp_quality = CNSpinner(text="320k", values=QUALITY_ORDER,
-                                    size_hint_x=None, width=dp(104),
+                                    size_hint_x=None, width=dp(100),
                                     font_size=dp(14), **self.F)
-        self.sp_quality.text = "320k"
         row.add_widget(self.sp_quality)
         panel.add_widget(row)
 
-        # 搜索
+        # 格式 + 搜索
         row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        row.add_widget(self._field("格式", w=dp(40)))
+        self.sp_format = CNSpinner(text="自动", values=songinfo.FORMAT_ORDER,
+                                   size_hint_x=None, width=dp(92),
+                                   font_size=dp(14), **self.F)
+        self.sp_format.bind(text=lambda *_: self._refresh_qualities())
+        row.add_widget(self.sp_format)
         self.ti_search = TextInput(hint_text="输入歌名或歌手", multiline=False,
                                    font_size=dp(15), padding=(dp(10), dp(12)),
                                    background_color=C_CTRL,
@@ -214,8 +243,9 @@ class LxApp(App):
         panel.add_widget(row)
         return panel
 
-    def _field(self, text):
-        lb = Label(text=text, size_hint_x=None, width=dp(42), font_size=dp(14),
+    def _field(self, text, w=None):
+        lb = Label(text=text, size_hint_x=None, width=w or dp(42),
+                   font_size=dp(14),
                    color=C_DIM, halign="left", valign="middle", **self.F)
         lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         return lb
@@ -238,6 +268,29 @@ class LxApp(App):
         box = BoxLayout(orientation="vertical", size_hint_y=None,
                         padding=(dp(14), dp(8)), spacing=dp(6))
         attach_bg(box, C_HEADER)
+
+        # ---- 播放条 ----
+        prow = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(8))
+        self.btn_play = Button(text="▶", size_hint_x=None, width=dp(42),
+                               font_size=dp(16), background_normal="",
+                               background_color=C_CARD, color=C_TEXT, **self.F)
+        self.btn_play.bind(on_release=lambda *_: self.toggle_play())
+        prow.add_widget(self.btn_play)
+
+        self.slider = Slider(min=0, max=1000, value=0, step=1,
+                             cursor_size=(dp(16), dp(16)))
+        self.slider.bind(on_touch_down=self._seek_down,
+                         on_touch_up=self._seek_up)
+        prow.add_widget(self.slider)
+
+        self.lbl_time = Label(text="00:00 / 00:00", size_hint_x=None,
+                              width=dp(96), font_size=dp(12), color=C_DIM,
+                              halign="right", valign="middle", **self.F)
+        self.lbl_time.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        prow.add_widget(self.lbl_time)
+        box.add_widget(prow)
+
+        # ---- 下载进度 ----
         self.pb = ProgressBar(max=100, size_hint_y=None, height=dp(6))
         box.add_widget(self.pb)
         # 名字必须是 self.status —— set_status() 写的就是它
@@ -340,6 +393,7 @@ class LxApp(App):
         self.sp_platform.values = labels
         if labels:
             self.sp_platform.text = labels[0]
+        self._refresh_qualities()
 
         meta = info.get("meta") or {}
         self.set_status("✓ 音源: %s v%s · %d 个平台"
@@ -483,37 +537,23 @@ class LxApp(App):
             self.set_status("没有找到结果")
             return
 
-        self.hint.text = "点击任意一首开始下载（共 %d 首）" % len(self.songs)
+        self.hint.text = "点击任意一首查看详情 / 播放 / 下载（共 %d 首）" % len(self.songs)
         kw = dict(self.F)
         for i, s in enumerate(self.songs):
-            btn = Button(text="%d. %s — %s  [%s]"
-                              % (i + 1, s["name"], s["singer"], s["interval"]),
-                         size_hint_y=None, height=dp(46), halign="left",
+            btn = Button(text="%d. %s\n     %s   [%s]"
+                              % (i + 1, s["name"], s["singer"],
+                                 s.get("interval") or "--:--"),
+                         size_hint_y=None, height=dp(56), halign="left",
                          valign="middle", font_size=dp(12),
                          background_normal="", background_color=C_CARD,
                          color=C_TEXT, **kw)
             btn.bind(size=lambda b, v: setattr(b, "text_size",
                                                (v[0] - dp(12), None)))
-            btn.bind(on_release=lambda b, idx=i: self.start_download(idx))
+            btn.bind(on_release=lambda b, idx=i: self.open_song(idx))
             self.results.add_widget(btn)
-        self.set_status("找到 %d 首，点一首开始下载" % len(self.songs))
+        self.set_status("找到 %d 首，点一首查看详情" % len(self.songs))
 
-    # ---------- 下载 ----------
-    def start_download(self, idx):
-        try:
-            if idx >= len(self.songs):
-                return
-            song = self.songs[idx]
-            source = self._current_source()
-            quality = self.sp_quality.text or "320k"
-            self.pb.value = 0
-            self.set_status("准备下载: %s" % song["name"])
-            self.bg(lambda: self._download_work(song, source, quality),
-                    "download")
-        except Exception as e:
-            log_exc("start_download")
-            self.set_status("无法开始下载: %s" % e, C_ERR)
-
+    # ---------- 品质 / 格式 ----------
     def _current_source(self):
         """从「平台」下拉里取出平台代号"""
         text = self.sp_platform.text or ""
@@ -522,9 +562,236 @@ class LxApp(App):
                 return p["source"]
         return "wy"
 
-    def _download_work(self, song, source, quality):
+    def _platform_qualities(self):
+        """当前平台声明的可用品质"""
+        src = self._current_source()
+        for p in self.platforms:
+            if p["source"] == src:
+                return list(p.get("qualitys") or QUALITY_ORDER)
+        return list(QUALITY_ORDER)
+
+    def _refresh_qualities(self):
+        """按平台 + 格式偏好刷新品质下拉"""
         try:
-            # 目标目录：公共 Download 优先，不可写则回退应用私有目录
+            quals = songinfo.filter_qualities(self._platform_qualities(),
+                                              self.sp_format.text)
+            self.sp_quality.values = quals
+            if self.sp_quality.text not in quals and quals:
+                self.sp_quality.text = quals[0]
+        except Exception:
+            log_exc("_refresh_qualities")
+
+    # ---------- 歌曲详情 ----------
+    def open_song(self, idx):
+        """点搜索结果：解析直链 + 探测元信息，然后弹详情"""
+        try:
+            if idx >= len(self.songs):
+                return
+            song = self.songs[idx]
+            self._cur_song = song
+            self._cur_url = None
+            self._show_song_popup(song)
+            self.set_status("正在解析: %s …" % song["name"])
+            self.bg(lambda: self._resolve_song(song), "resolve")
+        except Exception as e:
+            log_exc("open_song")
+            self.set_status("打开歌曲失败: %s" % e, C_ERR)
+
+    def _resolve_song(self, song):
+        """后台：取直链（受限自动降品质）+ 探测格式/大小"""
+        source = self._current_source()
+        want = self.sp_quality.text or "320k"
+        info = {"id": song["id"], "name": song["name"],
+                "singer": song["singer"], "source": source,
+                "interval": song.get("interval", ""),
+                "meta": {"songId": song["id"],
+                         "albumName": song.get("album", "")}}
+
+        order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
+        url, used, err = None, want, ""
+        for q in order[:3]:
+            got, e = self.bridge.music_url(source, q, info)
+            if got and not downloader.is_restricted(got):
+                url, used = got, q
+                break
+            err = e or "该品质直链受限"
+            log("品质 %s 解析失败: %s" % (q, err))
+
+        if not url:
+            msg = err
+            self.ui(lambda: self._song_failed(msg))
+            return
+
+        meta = songinfo.probe(url)
+        self.ui(lambda: self._song_ready(song, url, used, meta))
+
+    def _song_failed(self, err):
+        if getattr(self, "_pop_info", None) is not None:
+            self._pop_info.text = "解析失败: %s\n（可能版权受限，换一首试试）" % err
+        self.set_status("解析失败: %s" % err, C_ERR)
+
+    def _song_ready(self, song, url, quality, meta):
+        self._cur_url = url
+        self._cur_ext = meta.get("format") or songinfo.format_of(quality)
+        self._cur_dur = 0.0
+        try:
+            parts = song.get("interval", "").split(":")
+            if len(parts) == 2:
+                self._cur_dur = int(parts[0]) * 60 + int(parts[1])
+        except Exception:
+            pass
+
+        if getattr(self, "_pop_info", None) is not None:
+            self._pop_info.text = (
+                "歌手: %s\n时长: %s\n品质: %s\n格式: %s\n大小: %s"
+                % (song["singer"], song.get("interval") or "--:--",
+                   songinfo.quality_label(quality),
+                   (self._cur_ext or "?").upper(),
+                   songinfo.human_size(meta.get("size"))))
+        if getattr(self, "_pop_play", None) is not None:
+            self._pop_play.disabled = False
+            self._pop_dl.disabled = False
+        self.set_status("✓ 已解析: %s（%s / %s / %s）"
+                        % (song["name"], songinfo.quality_label(quality),
+                           (self._cur_ext or "?").upper(),
+                           songinfo.human_size(meta.get("size"))), C_OK)
+
+    def _show_song_popup(self, song):
+        kw = dict(self.F)
+        content = BoxLayout(orientation="vertical", spacing=dp(8),
+                            padding=dp(12))
+
+        name = Label(text="%s — %s" % (song["name"], song["singer"]),
+                     size_hint_y=None, height=dp(44), font_size=dp(15),
+                     bold=True, color=C_TEXT, halign="left", valign="middle",
+                     **kw)
+        name.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        content.add_widget(name)
+
+        self._pop_info = Label(text="解析中…", font_size=dp(13), color=C_DIM,
+                               halign="left", valign="top", **kw)
+        self._pop_info.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        content.add_widget(self._pop_info)
+
+        btns = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        self._pop_play = Button(text="▶ 播放", font_size=dp(15),
+                                background_normal="", background_color=C_ACCENT,
+                                color=(1, 1, 1, 1), disabled=True, **kw)
+        self._pop_play.bind(on_release=lambda *_: self.play_current())
+        btns.add_widget(self._pop_play)
+
+        self._pop_dl = Button(text="⬇ 下载", font_size=dp(15),
+                              background_normal="", background_color=C_CARD,
+                              color=C_TEXT, disabled=True, **kw)
+        self._pop_dl.bind(on_release=lambda *_: self.download_current())
+        btns.add_widget(self._pop_dl)
+        content.add_widget(btns)
+
+        self._popup = Popup(title="歌曲信息", content=content,
+                            size_hint=(0.92, None), height=dp(300),
+                            title_size=dp(15))
+        self._popup.open()
+
+    # ---------- 播放 ----------
+    def play_current(self):
+        if not getattr(self, "_cur_url", None):
+            self.set_status("还没有解析出可播放的直链")
+            return
+        if self._popup:
+            self._popup.dismiss()
+        self.player.play(self._cur_url, on_event=self._on_player_event,
+                         ext=self._cur_ext or "mp3",
+                         fallback_len=self._cur_dur)
+        self.btn_play.text = "⏸"
+
+    def _on_player_event(self, kind, payload):
+        """播放器回调（后台线程）"""
+        if kind == "buffering":
+            self.ui(lambda: self._player_buffering(payload))
+        elif kind == "ready":
+            self.ui(lambda: self._player_ready(payload))
+        elif kind == "error":
+            self.ui(lambda: self._player_error(payload))
+
+    def _player_buffering(self, pct):
+        self.pb.value = pct * 100
+        self.set_status("缓冲中… %.0f%%" % (pct * 100))
+
+    def _player_ready(self, duration):
+        self.pb.value = 0
+        self._cur_duration = float(duration or 0) or float(self._cur_dur or 0)
+        self.btn_play.text = "⏸"
+        self.set_status("▶ 正在播放: %s" % (self._cur_song or {}).get("name", ""),
+                        C_OK)
+
+    def _player_error(self, msg):
+        self.btn_play.text = "▶"
+        self.set_status("播放失败: %s" % msg, C_ERR)
+
+    def toggle_play(self):
+        try:
+            if not self.player.is_active():
+                self.play_current()
+                return
+            self.player.toggle()
+            self.btn_play.text = ("⏸" if self.player.state
+                                  == player_mod.Player.PLAYING else "▶")
+        except Exception as e:
+            log_exc("toggle_play")
+            self.set_status("播放控制失败: %s" % e, C_ERR)
+
+    def _seek_down(self, slider, touch):
+        if slider.collide_point(*touch.pos):
+            self._dragging = True
+        return False
+
+    def _seek_up(self, slider, touch):
+        if self._dragging:
+            self._dragging = False
+            total = self._cur_duration or self.player.duration()
+            if total > 0:
+                self.player.seek(slider.value / 1000.0 * total)
+        return False
+
+    def _tick(self, dt):
+        """定时刷新播放进度（0.5s 一次）"""
+        try:
+            if not self.player.is_active():
+                return
+            pos = self.player.position()
+            total = self._cur_duration or self.player.duration()
+            if not self._dragging and total > 0:
+                self.slider.value = max(0, min(1000, pos / total * 1000))
+            self.lbl_time.text = "%s / %s" % (fmt_time(pos), fmt_time(total))
+            if (self.player.state == player_mod.Player.PLAYING
+                    and total > 0 and pos >= total - 0.7):
+                self.player.stop()
+                self._player_finished()
+        except Exception:
+            log_exc("_tick")
+
+    def _player_finished(self):
+        self.btn_play.text = "▶"
+        self.slider.value = 0
+        self.lbl_time.text = "00:00 / 00:00"
+        self.set_status("播放结束")
+
+    # ---------- 下载 ----------
+    def download_current(self):
+        if not getattr(self, "_cur_url", None):
+            self.set_status("还没有解析出可下载的直链")
+            return
+        if self._popup:
+            self._popup.dismiss()
+        song = self._cur_song or {}
+        url = self._cur_url
+        ext = self._cur_ext or "mp3"
+        self.pb.value = 0
+        self.set_status("准备下载: %s" % song.get("name", ""))
+        self.bg(lambda: self._download_url(song, url, ext), "download")
+
+    def _download_url(self, song, url, ext):
+        try:
             out_dir = download_dir()
             if not appenv.using_public_dir() and IS_ANDROID \
                     and not self._asked_permission:
@@ -535,44 +802,15 @@ class LxApp(App):
                 request_all_files_access()
             os.makedirs(out_dir, exist_ok=True)
 
-            info = {"id": song["id"], "name": song["name"],
-                    "singer": song["singer"], "source": source,
-                    "interval": song.get("interval", ""),
-                    "meta": {"songId": song["id"],
-                             "albumName": song.get("album", "")}}
-
-            # 受限直链会自动降音质重试
-            order = [quality] + [q for q in ("320k", "flac", "128k")
-                                 if q != quality]
-            url, last_err = None, ""
-            for q in order[:3]:
-                self.ui(lambda q=q: self.set_status("正在取直链 (%s)…" % q))
-                got, err = self.bridge.music_url(source, q, info)
-                if got and not downloader.is_restricted(got):
-                    url, quality = got, q
-                    break
-                last_err = err or "该音质直链受限"
-                log("音质 %s 取直链失败: %s" % (q, last_err))
-
-            if not url:
-                self.ui(lambda: self.set_status(
-                    "取直链失败: %s（可能版权受限，换一首试试）" % last_err,
-                    C_ERR))
-                return
-
-            ext = downloader.guess_ext(url, quality)
-            name = downloader.safe_name("%s - %s" % (song["name"],
-                                                     song["singer"]))
+            name = downloader.safe_name("%s - %s" % (song.get("name", "unknown"),
+                                                     song.get("singer", "")))
             dest = os.path.join(out_dir, "%s.%s" % (name, ext))
 
-            self.ui(lambda: self.set_status("下载中: %s" % song["name"]))
-
             def on_progress(got, total):
-                self.ui(lambda: self._progress(got, total, song["name"]))
+                self.ui(lambda: self._progress(got, total, song.get("name", "")))
 
             size = downloader.download(url, dest, on_progress=on_progress)
             self.ui(lambda: self._download_done(dest, size))
-
         except Exception as e:
             msg = str(e)
             log_exc("download")
