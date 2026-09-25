@@ -5,6 +5,7 @@
 """
 import os
 import sys
+import time
 import traceback
 
 from kivy.utils import platform
@@ -22,6 +23,28 @@ def log(*args):
     try:
         print("[lx]", *args)
         sys.stdout.flush()
+    except Exception:
+        pass
+
+
+_DIAG_LOG = None
+
+
+def diag(*args):
+    """诊断日志。
+
+    真机上用户看不到 logcat，所以关键步骤都写进文件，
+    出问题时让用户把 diag.log 发回来即可定位
+    （路径: Android/data/com.lxdl.lxdownloader/files/diag.log）
+    """
+    line = "[%s] %s" % (time.strftime("%m-%d %H:%M:%S"),
+                        " ".join(str(a) for a in args))
+    log(line)
+    if _DIAG_LOG is None:
+        return
+    try:
+        with open(_DIAG_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
     except Exception:
         pass
 
@@ -88,6 +111,7 @@ BUILTIN_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "assets", "default_source.js")
 PRIVATE_DOWNLOAD_DIR = os.path.join(APP_DIR, "downloads")
 _CRASH_LOG = os.path.join(APP_DIR, "crash.log")
+_DIAG_LOG = os.path.join(APP_DIR, "diag.log")
 
 for _d in (SOURCE_DIR, PRIVATE_DOWNLOAD_DIR):
     try:

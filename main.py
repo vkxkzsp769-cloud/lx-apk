@@ -37,8 +37,9 @@ import appenv
 import downloader
 import fonts
 import netease
-from appenv import (IS_ANDROID, SOURCE_FILE, download_dir, ensure_source,
-                    log, log_exc, request_all_files_access, save_source)
+from appenv import (IS_ANDROID, SOURCE_FILE, diag, download_dir,
+                    ensure_source, log, log_exc, request_all_files_access,
+                    save_source)
 from lxbridge import LxBridge
 
 # ============================================================
@@ -56,7 +57,8 @@ C_ERR = (0.96, 0.45, 0.45, 1)
 
 PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我",
                   "kg": "酷狗", "mg": "咪咕"}
-QUALITY_ORDER = ["128k", "192k", "320k", "flac", "flac24bit",
+# 顺序即下拉顺序，第一项是 Spinner 的默认值 —— 所以 320k 放最前
+QUALITY_ORDER = ["320k", "128k", "192k", "flac", "flac24bit",
                  "hires", "master"]
 
 
@@ -279,6 +281,7 @@ class LxApp(App):
 
     # ---------- 启动 ----------
     def _boot(self, *_):
+        diag("=== 启动 === dir=%s" % appenv.APP_DIR)
         ensure_source()
         self.set_status("正在启动 JS 引擎…")
         if IS_ANDROID:
@@ -287,10 +290,15 @@ class LxApp(App):
             # 桌面调试：没有 WebView；用假引擎跑界面（见 test_ui.py）
             self.set_status("桌面模式：仅界面可用", C_DIM)
 
-    def _on_engine_ready(self, ok):
+    def _on_engine_ready(self, ok, detail=""):
         """由 WebView 流程在后台线程回调"""
         if not ok:
-            self.set_status("WebView 引擎不可用，无法加载音源", C_ERR)
+            msg = "WebView 引擎不可用"
+            if detail:
+                msg += ": %s" % detail
+            msg += "\n（详细日志: Android/data/com.lxdl.lxdownloader/files/diag.log）"
+            self.set_status(msg, C_ERR)
+            log("引擎不可用:", detail)
             return
         self.ui(lambda: self.set_status("引擎就绪，加载音源…"))
         self.load_source(SOURCE_FILE)

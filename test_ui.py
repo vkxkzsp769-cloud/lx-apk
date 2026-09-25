@@ -249,6 +249,28 @@ def test_build_without_cn_font():
         fonts._registered_path = saved
 
 
+def test_eval_js_uses_ui_thread():
+    """回归：evaluateJavascript 必须投到 Java UI 线程执行。
+
+    历史上写成 Clock.schedule_once(...) —— 那跑在 Kivy 线程上，
+    而 WebView 是在 Java UI 线程创建的，跨线程调用会抛
+      AndroidRuntimeException: Calling WebView methods on a different
+      thread than the one it was created on
+    结果就是「WebView 引擎不可用」，音源永远加载不出来。
+    """
+    src = open(os.path.join(HERE, "lxbridge.py"), encoding="utf-8").read()
+    if "_ui_eval(" not in src:
+        raise AssertionError("没有通过 _ui_eval 调 evaluateJavascript")
+    # Clock.schedule_once 不应该再出现在 _eval 的可执行代码里
+    # （注释里提到是可以的，所以先去掉注释行）
+    body = src[src.index("def _eval("):src.index("def _eval_json(")]
+    code_lines = [l for l in body.splitlines() if not l.strip().startswith("#")]
+    if any("Clock.schedule_once" in l for l in code_lines):
+        raise AssertionError("_eval 里又用 Clock.schedule_once 调 WebView 了")
+    if "@run_on_ui_thread" not in src:
+        raise AssertionError("没有用 run_on_ui_thread")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -294,6 +316,7 @@ def main():
 
     print("[6] 静态检查")
     check("canvas_before 回归", test_static)
+    check("evaluateJavascript 走 UI 线程", test_eval_js_uses_ui_thread)
 
     print()
     if FAILS:

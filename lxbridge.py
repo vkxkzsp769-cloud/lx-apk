@@ -6,19 +6,25 @@ python-for-android 的 recipe 里没有 dukpy / quickjs / v8 这类 JS 引擎
 （都要编译 C 扩展，编不进 APK）。但 Android 系统自带 WebView，
 它本身就是一个完整的 JS 引擎 + 网络栈，所以直接拿它跑音源脚本。
 
-线程规则（整个工程只有这一条约定，务必遵守）
--------------------------------------------
-  Kivy 的事件循环 == Python 的 main thread。
-  WebView 只能在 Android UI 线程创建/调用，而 evaluateJavascript 的
-  ValueCallback 也是靠 UI 线程的 Looper 派发的。
+线程模型（这里有三个线程，别搞混）
+----------------------------------
+  1. Android UI 线程（Java）—— WebView 的宿主线程。
+     创建 WebView、调用 evaluateJavascript 都必须在它上面，
+     否则抛 AndroidRuntimeException:
+       "Calling WebView methods on a different thread
+        than the one it was created on"
+     用 @run_on_ui_thread 把活儿投上去。
 
-  所以：
-    * evaluateJavascript 用 Clock.schedule_once 投到 Kivy 线程执行；
-    * 调用方必须在「非 Kivy 线程」上阻塞等结果。
-  若在 Kivy 线程上阻塞，Looper 无法派发回调 -> 死锁 -> ANR -> 进程被杀。
+  2. Kivy / Python 主线程 —— 跑事件循环、改控件。
+     p4a SDL2 下它 **不是** Android UI 线程（两者不同！），
+     所以不能靠 Clock.schedule_once 去调 WebView。  ← 之前就栽在这
 
-  本类的对外方法都要求非 UI 线程调用；内部用 _lock 串行化，
-  避免两个线程同时发起导致回调互相串台。
+  3. 后台工作线程 —— 发起一次 JS 调用并阻塞等结果。
+
+  流程：后台线程 -> @run_on_ui_thread 投到 Java UI 线程执行
+        -> ValueCallback 在 UI 线程回调 -> 唤醒后台线程。
+
+  对外方法都要求「非 Kivy 主线程」调用；内部 _lock 串行化。
 """
 import json
 import threading
@@ -26,7 +32,7 @@ import time
 
 from kivy.clock import Clock
 
-from appenv import IS_ANDROID, log, log_exc
+from appenv import IS_ANDROID, diag, log, log_exc
 from lxhost import LX_HOST_JS
 
 
@@ -37,6 +43,7 @@ class LxBridge:
         self._keepalive = []        # 保持 Java 回调对象存活，防 GC 崩溃
         self._lock = threading.Lock()
         self._ready = False
+        self._ui_eval = None        # 投到 Java UI 线程执行 JS 的函数
 
     # ---------- 对外 ----------
     @property
@@ -52,10 +59,11 @@ class LxBridge:
         try:
             self._on_ready = on_ready
             self._create_on_ui()
-        except Exception:
+        except Exception as e:
             log_exc("LxBridge.start")
+            diag("LxBridge.start 失败: %r" % (e,))
             self._ready = False
-            on_ready(False)
+            on_ready(False, str(e))
 
     def load_source(self, code):
         """加载音源。返回 (ok, info_or_error)。必须在非 UI 线程调用。"""
@@ -96,6 +104,17 @@ class LxBridge:
         WebView = autoclass("android.webkit.WebView")
         WebViewClient = autoclass("android.webkit.WebViewClient")
         activity = autoclass("org.kivy.android.PythonActivity").mActivity
+
+        # evaluateJavascript 必须回到「创建 WebView 的那个线程」（Java UI 线程）
+        @run_on_ui_thread
+        def _eval_on_ui(wv, js, cb, on_error):
+            try:
+                wv.evaluateJavascript(js, cb)
+            except Exception as e:
+                diag("evaluateJavascript 抛异常: %s" % e)
+                on_error()
+
+        self._ui_eval = _eval_on_ui
 
         @run_on_ui_thread
         def _make():
@@ -141,36 +160,44 @@ class LxBridge:
 
                 threading.Thread(target=self._inject_and_probe,
                                  daemon=True).start()
-            except Exception:
+            except Exception as e:
                 log_exc("创建 WebView")
+                diag("创建 WebView 失败: %r" % (e,))
                 self._ready = False
-                self._on_ready(False)
+                self._on_ready(False, "创建 WebView 失败: %s" % e)
 
         _make()
 
     def _inject_and_probe(self):
         """等页面加载完 -> 注入宿主 -> 轮询 typeof lx 确认可用"""
         time.sleep(0.6)
+        diag("开始注入宿主 LX_HOST_JS (%d 字节)" % len(LX_HOST_JS))
         try:
-            self._eval(LX_HOST_JS, timeout=10)
-        except Exception:
+            r = self._eval(LX_HOST_JS, timeout=10)
+            diag("注入返回: %r" % (str(r)[:120],))
+        except Exception as e:
             log_exc("注入宿主")
+            diag("注入宿主异常: %r" % (e,))
 
+        seen = []
         for _ in range(25):                 # 最多约 8 秒
             try:
                 v = self._eval("typeof lx", timeout=3)
-            except Exception:
-                v = None
+            except Exception as e:
+                v = "EXC:%s" % e
+            seen.append(str(v))
             if v and "object" in str(v):
                 self._ready = True
+                diag("宿主就绪, typeof lx = %s" % v)
                 log("WebView 宿主就绪")
                 self._on_ready(True)
                 return
             time.sleep(0.2)
 
+        diag("宿主未就绪, typeof lx 采样: %s" % (seen[:6],))
         log("WebView 宿主未就绪（typeof lx 一直不是 object）")
         self._ready = False
-        self._on_ready(False)
+        self._on_ready(False, "宿主注入后 typeof lx = %s" % (seen[0] if seen else "无响应"))
 
     # ---------- 执行 JS ----------
     @staticmethod
@@ -204,14 +231,9 @@ class LxBridge:
             cb = _CB()
             self._keepalive.append(cb)      # 防 GC：被回收会导致 native 崩溃
 
-            def _run(dt):
-                try:
-                    self._wv.evaluateJavascript(js, cb)
-                except Exception:
-                    log_exc("evaluateJavascript")
-                    done.set()
-
-            Clock.schedule_once(_run, 0)
+            # 注意：不能用 Clock.schedule_once —— 那跑在 Kivy 线程上，
+            # 而 WebView 是在 Java UI 线程创建的，跨线程调用会抛异常
+            self._ui_eval(self._wv, js, cb, done.set)
             finished = done.wait(timeout)
 
             try:
