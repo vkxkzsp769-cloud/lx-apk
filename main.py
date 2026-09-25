@@ -46,6 +46,73 @@ from kivy.uix.progressbar import ProgressBar
 IS_ANDROID = platform == "android"
 
 # ============================================================
+#  中文字体
+# ============================================================
+# Kivy 默认字体是 Roboto，不含中文字形 → 中文会显示成空方块（口口口）。
+# 解决：注册 Android 系统自带的中文字体。
+CN_FONT_NAME = "CNFont"
+CN_FONT_PATH = []   # 实际选中的字体路径（排查用）
+
+
+def register_cn_font():
+    """注册中文字体，返回可用于 font_name 的名字；失败返回 None"""
+    candidates = []
+    if IS_ANDROID:
+        # 顺序很重要：先 .otf/.ttf（纯简体字形），
+        # .ttc 是字体集合，face0 通常是日文变体，中文会显示成日文字形
+        candidates = [
+            "/system/fonts/NotoSansSC-Regular.otf",
+            "/system/fonts/NotoSansHans-Regular.otf",
+            "/system/fonts/DroidSansFallbackFull.ttf",
+            "/system/fonts/DroidSansFallback.ttf",
+            "/system/fonts/MiSans-Regular.ttf",
+            "/system/fonts/MiSans-Normal.ttf",
+            "/system/fonts/HarmonyOS_Sans_SC_Regular.ttf",
+            "/system/fonts/HarmonyOS_SansSC_Regular.ttf",
+            "/system/fonts/NotoSansCJK-Regular.ttc",   # 最后才用 .ttc
+        ]
+    else:
+        candidates = [
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/System/Library/Fonts/PingFang.ttc",
+        ]
+    # 再兜底：扫一遍字体目录找 CJK/中文相关的
+    try:
+        for d in ("/system/fonts", "/system/font"):
+            if os.path.isdir(d):
+                hits = []
+                for fn in sorted(os.listdir(d)):
+                    low = fn.lower()
+                    if any(k in low for k in ("notosanssc", "notosanshans",
+                                              "droidsansfallback", "misans",
+                                              "harmony", "sourcehansans")):
+                        hits.append(os.path.join(d, fn))
+                # .otf/.ttf 排前面，.ttc 排后面
+                hits.sort(key=lambda x: x.lower().endswith(".ttc"))
+                candidates.extend(hits)
+    except Exception:
+        pass
+
+    try:
+        from kivy.core.text import LabelBase
+    except Exception:
+        return None
+
+    for path in candidates:
+        try:
+            if path and os.path.exists(path) and os.path.getsize(path) > 10000:
+                LabelBase.register(name=CN_FONT_NAME, fn_regular=path)
+                print("已注册中文字体:", path)
+                CN_FONT_PATH.append(path)
+                return CN_FONT_NAME
+        except Exception as e:
+            print("注册字体失败", path, e)
+    print("警告: 未找到中文字体，中文可能显示为方块")
+    return None
+
+
+# ============================================================
 #  路径
 # ============================================================
 def app_dir():
@@ -178,6 +245,61 @@ function lxPoll() { return JSON.stringify(__RESULT || {done:false,url:'',error:n
 """
 
 
+
+# ============================================================
+#  安全回调包装：Kivy 不会捕获 Clock 回调里的异常，
+#  未捕获异常会直接终止 App（闪退）。全部包起来。
+# ============================================================
+def safe_cb(fn):
+    def _wrapper(*a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception:
+            print("UI 回调异常:", traceback.format_exc())
+    return _wrapper
+
+
+# ============================================================
+#  自定义控件：让下拉菜单也支持中文字体
+# ============================================================
+from kivy.properties import StringProperty, ListProperty  # noqa: E402
+
+
+class CNButton(Button):
+    """带字体的按钮（用于下拉菜单项）"""
+    font_name = StringProperty(None)
+
+
+class CNSpinner(Spinner):
+    """修复：Kivy 原生 Spinner 的下拉列表项不会继承 font_name，
+    导致下拉菜单里的中文显示成方块。这里在创建下拉时统一套上字体。"""
+
+    font_name = StringProperty(None)
+
+    def _create_dropdown(self, *largs):
+        super()._create_dropdown(*largs)
+        try:
+            self._apply_font_to_dropdown()
+        except Exception as e:
+            print("下拉菜单字体修复失败:", e)
+
+    def _apply_font_to_dropdown(self):
+        dd = getattr(self, "_dropdown", None)
+        if dd is None or not self.font_name:
+            return
+        try:
+            container = dd.container
+            for child in container.children:
+                if hasattr(child, "font_name"):
+                    child.font_name = self.font_name
+                    if hasattr(child, "text_size"):
+                        child.halign = "left"
+            # 下拉项每次打开都会重建，绑定 values 变化时重新套用
+            dd.bind(on_open=lambda *_: self._apply_font_to_dropdown())
+        except Exception:
+            pass
+
+
 class WebViewEngine:
     """在 Android WebView 里跑音源 JS"""
 
@@ -186,6 +308,7 @@ class WebViewEngine:
         self.ready = False
         self._result_box = {}
         self._lock = threading.Lock()
+        self._keepalive = []   # 保持 Java 回调对象存活，防止 GC 导致 native 崩溃
 
     def start(self, on_ready=None):
         """在 UI 线程创建隐藏 WebView"""
@@ -212,8 +335,30 @@ class WebViewEngine:
                         ws.setMixedContentMode(0)
                     except Exception:
                         pass
+                    # 关键：允许 file/http 页面发起跨域 XHR，
+                    # 否则宿主页面调 music.163.com 等会被 CORS 拦掉
+                    try:
+                        ws.setAllowUniversalAccessFromFileURLs(True)
+                    except Exception:
+                        pass
+                    try:
+                        ws.setAllowFileAccessFromFileURLs(True)
+                    except Exception:
+                        pass
+                    try:
+                        ws.setAllowFileAccess(True)
+                    except Exception:
+                        pass
+                    # 关掉缓存，避免音源 API 返回旧数据
+                    try:
+                        ws.setCacheMode(2)   # LOAD_NO_CACHE
+                    except Exception:
+                        pass
                     wv.setWebViewClient(WebViewClient())
-                    wv.loadDataWithBaseURL("https://localhost/",
+                    # 用 http://localhost/ 作 base：
+                    #  - 页面本身不是 https，就不触发 mixed-content 拦截
+                    #  - 配合 AllowUniversalAccessFromFileURLs 让跨域 XHR 可用
+                    wv.loadDataWithBaseURL("http://localhost/",
                                            "<html><body></body></html>",
                                            "text/html", "utf-8", None)
 
@@ -242,7 +387,7 @@ class WebViewEngine:
                             if on_ready:
                                 on_ready(False)
 
-                    Clock.schedule_once(_inject, 1.2)
+                    Clock.schedule_once(safe_cb(_inject), 1.2)
                 except Exception as e:
                     print("创建 WebView 失败:", e)
                     if on_ready:
@@ -254,27 +399,71 @@ class WebViewEngine:
             self.ready = False
 
     def _eval_sync(self, js, timeout=3.0):
-        """执行 JS 并把结果同步取回（evaluateJavascript 是异步的，用回调收集）"""
+        """执行 JS 并把结果同步取回。
+        evaluateJavascript 是异步的，且必须在 UI 线程调用；
+        用 threading.Event 等 Java 回调返回结果。
+
+        注意：
+        - 回调对象必须保持引用（否则被 GC 回收 → native 崩溃）
+        - 加锁避免多线程同时调用导致回调串台
+        - 主线程调用时不能用 done.wait() 阻塞（会死锁，UI 线程无法执行 JS）
+        """
         if not self.wv:
             return None
-        box = {}
-        done = threading.Event()
 
-        from jnius import autoclass, PythonJavaClass, java_method
+        with self._lock:
+            box = {}
+            done = threading.Event()
 
-        class _CB(PythonJavaClass):
-            __javainterfaces__ = ["android/webkit/ValueCallback"]
-            __javacontext__ = "app"
+            from jnius import autoclass, PythonJavaClass, java_method
 
-            @java_method("(Ljava/lang/Object;)V")
-            def onReceiveValue(self, value):
-                box["v"] = value
-                done.set()
+            class _CB(PythonJavaClass):
+                __javainterfaces__ = ["android/webkit/ValueCallback"]
+                __javacontext__ = "app"
 
-        cb = _CB()
-        Clock.schedule_once(lambda dt: self.wv.evaluateJavascript(js, cb), 0)
-        done.wait(timeout)
-        return box.get("v")
+                @java_method("(Ljava/lang/Object;)V")
+                def onReceiveValue(self, value):
+                    try:
+                        box["v"] = value
+                    except Exception:
+                        box["v"] = None
+                    finally:
+                        done.set()
+
+            cb = _CB()
+            # 保活，防止回调对象被 GC（否则 native 层回调野指针 → SIGSEGV 闪退）
+            self._keepalive.append(cb)
+
+            def _run(dt):
+                try:
+                    self.wv.evaluateJavascript(js, cb)
+                except Exception as e:
+                    print("evaluateJavascript 失败:", e)
+                    done.set()
+
+            # 关键：如果已经在 UI 线程，绝对不能 done.wait()！
+            # 因为 evaluateJavascript 的 ValueCallback 是通过 UI 线程的
+            # Looper 派发的，阻塞 UI 线程 = 回调永远送不到 = ANR/闪退。
+            if threading.current_thread() is threading.main_thread():
+                try:
+                    self.wv.evaluateJavascript(js, cb)
+                except Exception as e:
+                    print("evaluateJavascript 失败:", e)
+                try:
+                    self._keepalive.remove(cb)
+                except ValueError:
+                    pass
+                # 不等待，立即返回 None；调用方会走异步/兜底路径
+                return None
+            Clock.schedule_once(safe_cb(_run), 0)
+            if not done.wait(timeout):
+                print("evaluateJavascript 超时")
+
+            try:
+                self._keepalive.remove(cb)
+            except ValueError:
+                pass
+            return box.get("v")
 
     def load_source(self, code):
         """加载音源，返回 (ok, info_or_error)"""
@@ -299,9 +488,45 @@ class WebViewEngine:
             return False, "解析失败"
 
     def get_url(self, source, quality, music_info, timeout=60):
-        """取直链"""
-        if not self.ready:
+        """取直链。返回 (url_or_None, error_or_None)"""
+        # WebView 未就绪 → 用纯 Python 引擎兜底
+        if not self.ready or self.wv is None:
             return self._get_url_via_python(source, quality, music_info)
+
+        # ---- WebView 路径 ----
+        args = "%s, %s, %s" % (json.dumps(source), json.dumps(quality),
+                               json.dumps(json.dumps(music_info, ensure_ascii=False)))
+        raw = self._eval_sync("lxGetUrl(%s)" % args, timeout=8)
+        if raw is None:
+            # WebView 没响应，退回纯 Python 引擎再试一次
+            url, err = self._get_url_via_python(source, quality, music_info)
+            if url:
+                return url, None
+            return None, err or "WebView 无响应"
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            poll = self._eval_sync("lxPoll()", timeout=5)
+            if poll is None:
+                time.sleep(0.3)
+                continue
+            try:
+                s = json.loads(poll)
+                if isinstance(s, str):
+                    s = json.loads(s)
+            except Exception:
+                time.sleep(0.3)
+                continue
+            if isinstance(s, dict) and s.get("done"):
+                if s.get("error"):
+                    return None, s["error"]
+                return s.get("url") or None, None
+            time.sleep(0.3)
+        # 超时也兜底试一次纯 Python
+        url, err = self._get_url_via_python(source, quality, music_info)
+        if url:
+            return url, None
+        return None, "超时"
 
     # ---------- 纯 Python 引擎回退（桌面调试 / WebView 异常时） ----------
     def _load_via_python(self, code):
@@ -327,27 +552,6 @@ class WebViewEngine:
             return eng.music_url(source, quality, music_info), None
         except Exception as e:
             return None, str(e)
-        args = "%s, %s, %s" % (json.dumps(source), json.dumps(quality),
-                               json.dumps(json.dumps(music_info, ensure_ascii=False)))
-        self._eval_sync("lxGetUrl(%s)" % args, timeout=5)
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            raw = self._eval_sync("lxPoll()", timeout=3)
-            if raw is None:
-                time.sleep(0.25); continue
-            try:
-                s = json.loads(raw)
-                if isinstance(s, str):
-                    s = json.loads(s)
-            except Exception:
-                time.sleep(0.25); continue
-            if s.get("done"):
-                if s.get("error"):
-                    return None, s["error"]
-                return s.get("url") or None, None
-            time.sleep(0.3)
-        return None, "超时"
 
 
 # ============================================================
@@ -448,6 +652,14 @@ def safe_name(s):
 #  界面
 # ============================================================
 PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我", "kg": "酷狗", "mg": "咪咕"}
+
+# 深色主题配色
+C_BG_HEADER = (0.13, 0.15, 0.20, 1)
+C_CARD = (0.17, 0.19, 0.25, 1)
+C_CTRL = (0.24, 0.27, 0.34, 1)
+C_ACCENT = (0.26, 0.55, 0.96, 1)
+C_TEXT = (0.93, 0.95, 0.98, 1)
+C_DIM = (0.62, 0.67, 0.75, 1)
 QUALITY_ORDER = ["128k", "192k", "320k", "flac", "flac24bit", "hires", "master"]
 
 
@@ -458,76 +670,182 @@ class DownloaderApp(App):
         self.engine = WebViewEngine()
         self.sources = []
         self.song_list = []
+        self.busy = False
 
-        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        # 注册中文字体（必须在创建控件前），否则中文显示成空方块
+        self.cn_font = register_cn_font()
+        F = {"font_name": self.cn_font} if self.cn_font else {}
 
-        # ---- 标题 ----
-        self.status = Label(text="正在启动 JS 引擎...", size_hint_y=None, height=dp(30),
-                            font_size=dp(13))
-        root.add_widget(self.status)
+        root = BoxLayout(orientation="vertical")
 
-        # ---- 音源行 ----
-        row1 = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
-        self.sp_source = Spinner(text="音源: 加载中", values=[], size_hint_x=0.7)
-        btn_pick = Button(text="换音源", size_hint_x=0.3)
-        btn_pick.bind(on_release=self.pick_source_file)
-        row1.add_widget(self.sp_source)
-        row1.add_widget(btn_pick)
-        root.add_widget(row1)
+        # ══════════════════════════════════════════
+        #  顶部标题栏
+        # ══════════════════════════════════════════
+        header = BoxLayout(size_hint_y=None, height=dp(52),
+                           padding=(dp(14), dp(8)), spacing=dp(8),
+                           canvas_before=self._bg(C_BG_HEADER))
+        title = Label(text="落雪音源下载器", bold=True, font_size=dp(18),
+                      halign="left", valign="middle", color=C_TEXT, **F)
+        title.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        header.add_widget(title)
+        root.add_widget(header)
 
-        # ---- 平台/音质 ----
-        row2 = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
-        self.sp_platform = Spinner(text="网易云", values=["网易云"], size_hint_x=0.5)
-        self.sp_quality = Spinner(text="320k", values=QUALITY_ORDER, size_hint_x=0.5)
-        row2.add_widget(self.sp_platform)
-        row2.add_widget(self.sp_quality)
-        root.add_widget(row2)
+        # ══════════════════════════════════════════
+        #  控制区（卡片）
+        # ══════════════════════════════════════════
+        panel = BoxLayout(orientation="vertical", size_hint_y=None,
+                          padding=(dp(14), dp(12)), spacing=dp(10),
+                          canvas_before=self._bg(C_CARD))
+        panel.bind(minimum_height=panel.setter("height"))
 
-        # ---- 搜索框 ----
-        row3 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
-        self.ti_search = TextInput(hint_text="输入歌名或歌手，例如：海阔天空",
-                                   multiline=False, size_hint_x=0.75)
-        btn_search = Button(text="搜索", size_hint_x=0.25)
-        btn_search.bind(on_release=self.do_search)
+        # --- 第一行：音源 ---
+        r1 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        r1.add_widget(self._field_label("音源", F))
+        self.sp_source = CNSpinner(text="加载中…", values=[], size_hint_x=None,
+                                 width=dp(150), font_size=dp(14), **F)
+        self.sp_source.background_color = C_CTRL
+        r1.add_widget(self.sp_source)
+        self.btn_pick = Button(text="更换", size_hint_x=None, width=dp(72),
+                               font_size=dp(14), background_color=C_ACCENT,
+                               background_normal="", color=(1, 1, 1, 1), **F)
+        self.btn_pick.bind(on_release=self.pick_source_file)
+        r1.add_widget(self.btn_pick)
+        panel.add_widget(r1)
+
+        # --- 第二行：平台 + 音质 ---
+        r2 = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        r2.add_widget(self._field_label("平台", F))
+        self.sp_platform = CNSpinner(text="网易云", values=["网易云"], size_hint_x=None,
+                                   width=dp(105), font_size=dp(14), **F)
+        self.sp_platform.background_color = C_CTRL
+        r2.add_widget(self.sp_platform)
+        r2.add_widget(self._field_label("音质", F))
+        self.sp_quality = CNSpinner(text="320k", values=QUALITY_ORDER, size_hint_x=None,
+                                  width=dp(105), font_size=dp(14), **F)
+        self.sp_quality.background_color = C_CTRL
+        r2.add_widget(self.sp_quality)
+        panel.add_widget(r2)
+
+        # --- 第三行：搜索 ---
+        r3 = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        self.ti_search = TextInput(hint_text="输入歌名或歌手", multiline=False,
+                                   size_hint_x=1, font_size=dp(15),
+                                   padding=(dp(10), dp(12)),
+                                   background_color=C_CTRL, foreground_color=C_TEXT,
+                                   hint_text_color=(0.55, 0.6, 0.68, 1), **F)
         self.ti_search.bind(on_text_validate=self.do_search)
-        row3.add_widget(self.ti_search)
-        row3.add_widget(btn_search)
-        root.add_widget(row3)
+        r3.add_widget(self.ti_search)
+        self.btn_search = Button(text="搜索", size_hint_x=None, width=dp(78),
+                                 font_size=dp(15), bold=True,
+                                 background_color=C_ACCENT, background_normal="",
+                                 color=(1, 1, 1, 1), **F)
+        self.btn_search.bind(on_release=self.do_search)
+        r3.add_widget(self.btn_search)
+        panel.add_widget(r3)
+        root.add_widget(panel)
 
-        # ---- 结果列表 ----
-        self.sv = ScrollView()
+        # ══════════════════════════════════════════
+        #  结果列表（占满剩余空间）
+        # ══════════════════════════════════════════
+        list_wrap = BoxLayout(orientation="vertical", padding=(dp(8), dp(4)))
+
+        self.hint = Label(text="搜索后点结果即可下载", size_hint_y=None, height=dp(30),
+                          font_size=dp(13), color=C_DIM, **F)
+        list_wrap.add_widget(self.hint)
+
+        self.sv = ScrollView(bar_width=dp(3), bar_color=(0.4, 0.45, 0.55, 1),
+                             bar_inactive_color=(0.3, 0.33, 0.4, 1))
         self.results_box = BoxLayout(orientation="vertical", size_hint_y=None,
-                                     spacing=dp(4))
+                                     spacing=dp(6), padding=(0, dp(2)))
         self.results_box.bind(minimum_height=self.results_box.setter("height"))
         self.sv.add_widget(self.results_box)
-        root.add_widget(self.sv)
+        list_wrap.add_widget(self.sv)
+        root.add_widget(list_wrap)
 
-        # ---- 进度 ----
-        self.pb = ProgressBar(max=100, size_hint_y=None, height=dp(14))
-        root.add_widget(self.pb)
-        self.log = Label(text="", size_hint_y=None, height=dp(38), font_size=dp(11))
-        root.add_widget(self.log)
+        # ══════════════════════════════════════════
+        #  底部状态栏
+        # ══════════════════════════════════════════
+        footer = BoxLayout(orientation="vertical", size_hint_y=None,
+                           padding=(dp(14), dp(8)), spacing=dp(6),
+                           canvas_before=self._bg(C_BG_HEADER))
+        footer.bind(minimum_height=footer.setter("height"))
 
-        Clock.schedule_once(self._boot, 0.3)
+        self.pb = ProgressBar(max=100, size_hint_y=None, height=dp(6))
+        footer.add_widget(self.pb)
+
+        self.log = Label(text="正在启动…", size_hint_y=None, height=dp(34),
+                         font_size=dp(12), color=C_DIM,
+                         halign="left", valign="middle", **F)
+        self.log.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        footer.add_widget(self.log)
+        root.add_widget(footer)
+
+        Clock.schedule_once(safe_cb(self._boot), 0.3)
         return root
+
+    # ---------- UI 小工具 ----------
+    def _bg(self, color):
+        """生成一个纯色矩形作为背景"""
+        from kivy.graphics import Color, Rectangle
+
+        def _draw(widget, *_):
+            widget.canvas.before.clear()
+            with widget.canvas.before:
+                Color(*color)
+                Rectangle(pos=widget.pos, size=widget.size)
+        return _draw
+
+    def _field_label(self, text, F):
+        """表单左侧的小标签，固定宽度保证各行对齐"""
+        lb = Label(text=text, size_hint_x=None, width=dp(44),
+                   font_size=dp(14), color=C_DIM,
+                   halign="left", valign="middle", **F)
+        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        return lb
 
     # ---------- 启动 ----------
     def _boot(self, dt):
-        extract_default_source()
-        if IS_ANDROID:
-            self.engine.start(on_ready=self._on_engine_ready)
-        else:
-            # 桌面调试：用内置的 dukpy 引擎
-            self._on_engine_ready(True)
+        try:
+            extract_default_source()
+            if IS_ANDROID:
+                self.engine.start(on_ready=self._on_engine_ready)
+            else:
+                # 桌面调试：用内置的 dukpy 引擎
+                self._on_engine_ready(True)
+        except Exception as e:
+            self.set_status("启动失败: %s" % e)
+            print("_boot 异常:", traceback.format_exc())
 
     def _on_engine_ready(self, ok):
-        if not ok:
-            self.set_status("JS 引擎启动失败")
-            return
-        self.set_status("引擎就绪，加载音源...")
-        self.load_source(DEFAULT_SCRIPT)
+        # 这个回调从 UI 线程的 WebView 流程里调过来，必须全包住
+        try:
+            if not ok:
+                # WebView 失败 → 放后台线程试纯 Python 引擎，别卡死 UI
+                self.set_status("WebView 不可用，尝试备用引擎...")
+
+                def _bg():
+                    try:
+                        self.load_source(DEFAULT_SCRIPT)
+                    except Exception as e:
+                        print("备用引擎失败:", e)
+                        Clock.schedule_once(safe_cb(lambda dt: self.set_status("引擎不可用: %s" % e)), 0)
+
+                threading.Thread(target=_bg, daemon=True).start()
+                return
+            self.set_status("引擎就绪，加载音源...")
+            self.load_source(DEFAULT_SCRIPT)
+        except Exception as e:
+            self.set_status("引擎初始化出错: %s" % e)
+            print("_on_engine_ready 异常:", traceback.format_exc())
 
     def load_source(self, path):
+        try:
+            self._load_source_inner(path)
+        except Exception as e:
+            self.set_status("音源加载异常: %s" % e)
+            print("load_source 异常:", traceback.format_exc())
+
+    def _load_source_inner(self, path):
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 code = f.read()
@@ -538,9 +856,13 @@ class DownloaderApp(App):
         if not ok:
             self.set_status("音源加载失败: %s" % info)
             return
+        if not isinstance(info, dict):
+            self.set_status("音源返回数据异常")
+            return
         self.sources = []
         labels = []
         for key, v in (info.get("sources") or {}).items():
+            v = v or {}
             self.sources.append({"source": key, "name": v.get("name", key),
                                  "qualitys": v.get("qualitys") or []})
             labels.append("%s (%s)" % (PLATFORM_LABEL.get(key, key), key))
@@ -581,12 +903,10 @@ class DownloaderApp(App):
                             raise RuntimeError("文件内容过短，可能不是音源")
                         with open(DEFAULT_SCRIPT, "w", encoding="utf-8") as f:
                             f.write(code)
-                        Clock.schedule_once(
-                            lambda dt: app.load_source(DEFAULT_SCRIPT), 0)
+                        Clock.schedule_once(safe_cb(lambda dt: app.load_source(DEFAULT_SCRIPT)), 0)
                     except Exception as e:
                         msg = str(e)
-                        Clock.schedule_once(
-                            lambda dt: app.set_status("读取音源失败: %s" % msg), 0)
+                        Clock.schedule_once(safe_cb(lambda dt: app.set_status("读取音源失败: %s" % msg)), 0)
 
             self._picker = _Picker()
             android_activity.bind(on_activity_result=self._picker.onActivityResult)
@@ -618,40 +938,77 @@ class DownloaderApp(App):
 
     # ---------- 搜索 ----------
     def do_search(self, *_):
-        kw = self.ti_search.text.strip()
-        if not kw:
-            return
-        self.set_status("搜索中: %s" % kw)
-        self.clear_results()
-        threading.Thread(target=self._search_worker, args=(kw,), daemon=True).start()
+        """点「搜索」按钮 / 回车进来。任何异常都必须被吞掉并显示，绝不能闪退。"""
+        try:
+            kw = self.ti_search.text.strip()
+            if not kw:
+                self.set_status("请先输入歌名")
+                return
+            if self.busy:
+                self.set_status("正在处理中，请稍候...")
+                return
+            self.busy = True
+            self.set_status("搜索中: %s" % kw)
+            self.clear_results()
+            threading.Thread(target=self._search_worker, args=(kw,),
+                             daemon=True).start()
+        except Exception as e:
+            self.busy = False
+            self.set_status("搜索出错: %s" % e)
+            print("do_search 异常:", traceback.format_exc())
 
     def _search_worker(self, kw):
+        """后台线程：只做网络请求，结果通过 Clock 回主线程"""
+        songs, err = [], None
         try:
             songs = search_netease(kw, 15)
         except Exception as e:
-            Clock.schedule_once(lambda dt: self.set_status("搜索失败: %s" % e), 0)
-            return
-        Clock.schedule_once(lambda dt: self._show_results(songs), 0)
+            err = str(e)
+            print("搜索网络异常:", traceback.format_exc())
+        # 统一回主线程处理，并且回调内部再包一层 try
+        Clock.schedule_once(safe_cb(lambda dt: self._after_search(songs, err)), 0)
+
+    def _after_search(self, songs, err):
+        try:
+            self.busy = False
+            if err:
+                self.set_status("搜索失败: %s" % err)
+                return
+            self._show_results(songs)
+        except Exception as e:
+            self.busy = False
+            self.set_status("显示结果出错: %s" % e)
+            print("_after_search 异常:", traceback.format_exc())
 
     def clear_results(self):
         self.results_box.clear_widgets()
 
     def _show_results(self, songs):
-        self.song_list = songs
+        self.song_list = list(songs or [])
         self.clear_results()
-        if not songs:
-            self.set_status("没有找到结果")
+        if not self.song_list:
+            self.set_status("没有找到结果，换个关键词试试")
             return
         for i, s in enumerate(songs):
+            bkw = {"font_name": self.cn_font} if self.cn_font else {}
             btn = Button(text="%d. %s — %s  [%s]" % (i + 1, s["name"], s["singer"], s["interval"]),
                          size_hint_y=None, height=dp(46), halign="left", valign="middle",
-                         font_size=dp(12))
+                         font_size=dp(12), **bkw)
+            # Kivy 的 Button 不会自动按 halign 换行，需手动把文字宽度绑到按钮宽度
+            btn.bind(size=lambda b, v: setattr(b, "text_size", (v[0] - dp(8), None)))
             btn.bind(on_release=lambda b, idx=i: self.start_download(idx))
             self.results_box.add_widget(btn)
         self.set_status("找到 %d 首，点一首开始下载" % len(songs))
 
     # ---------- 下载 ----------
     def start_download(self, idx):
+        try:
+            self._start_download_inner(idx)
+        except Exception as e:
+            self.set_status("开始下载出错: %s" % e)
+            print("start_download 异常:", traceback.format_exc())
+
+    def _start_download_inner(self, idx):
         if idx >= len(self.song_list):
             return
         song = self.song_list[idx]
@@ -677,35 +1034,34 @@ class DownloaderApp(App):
                                   if q != quality]
             url, err = None, ""
             for qi, q in enumerate(qorder[:3]):
-                Clock.schedule_once(lambda dt, qq=q: self.set_status(
-                    "向音源请求直链 (%s)..." % qq), 0)
+                Clock.schedule_once(safe_cb(lambda dt, qq=q: self.set_status(
+                    "向音源请求直链 (%s)..." % qq)), 0)
                 u, e = self.engine.get_url(plat, q, info)
                 if u and not is_restricted(u):
                     url, quality = u, q
                     break
                 err = e or "直链受限"
                 if qi < 2:
-                    Clock.schedule_once(lambda dt: self.set_status(
-                        "直链受限，降级重试..."), 0)
+                    Clock.schedule_once(safe_cb(lambda dt: self.set_status(
+                        "直链受限，降级重试...")), 0)
             if url is None:
-                Clock.schedule_once(lambda dt: self.set_status(
-                    "取直链失败: %s（该歌曲可能版权受限）" % err), 0)
+                Clock.schedule_once(safe_cb(lambda dt: self.set_status(
+                    "取直链失败: %s（该歌曲可能版权受限）" % err)), 0)
                 return
             ext = guess_ext(url, quality)
             base = safe_name("%s - %s" % (song["name"], song["singer"]))
             dest = os.path.join(DOWNLOAD_DIR, "%s.%s" % (base, ext))
 
             def prog(got, total):
-                Clock.schedule_once(
-                    lambda dt: self._update_prog(got, total, song["name"]), 0)
+                Clock.schedule_once(safe_cb(
+                    lambda dt: self._update_prog(got, total, song["name"])), 0)
 
-            Clock.schedule_once(lambda dt: self.set_status("下载中: %s" % song["name"]), 0)
+            Clock.schedule_once(safe_cb(lambda dt: self.set_status("下载中: %s" % song["name"])), 0)
             size = download_file(url, dest, on_progress=prog)
-            Clock.schedule_once(
-                lambda dt: self._done(dest, size), 0)
+            Clock.schedule_once(safe_cb(lambda dt: self._done(dest, size)), 0)
         except Exception as e:
             msg = str(e)
-            Clock.schedule_once(lambda dt: self.set_status("下载失败: %s" % msg), 0)
+            Clock.schedule_once(safe_cb(lambda dt: self.set_status("下载失败: %s" % msg)), 0)
 
     def _update_prog(self, got, total, name):
         self.pb.value = got * 100.0 / max(total, 1)
@@ -718,8 +1074,55 @@ class DownloaderApp(App):
                         % (os.path.basename(path), size / 1048576, DOWNLOAD_DIR))
 
     def set_status(self, txt):
-        self.status.text = txt
+        try:
+            self.status.text = str(txt)
+        except Exception:
+            pass
+
+
+# ============================================================
+#  兜底：把任何未捕获异常写到界面 + 日志文件，而不是直接闪退
+# ============================================================
+def _install_crash_guard():
+    import sys as _sys
+
+    log_path = os.path.join(APP_DIR, "crash.log")
+
+    def _hook(exc_type, exc, tb):
+        try:
+            text = "".join(traceback.format_exception(exc_type, exc, tb))
+        except Exception:
+            text = "%s: %s" % (exc_type, exc)
+        print(text, file=_sys.stderr)
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(text + "\n" + "-" * 50 + "\n")
+        except Exception:
+            pass
+        # Kivy 的异常发生在事件循环里时，不要把整个 App 拖死
+        try:
+            app = App.get_running_app()
+            if app is not None and hasattr(app, "set_status"):
+                first = text.strip().splitlines()[-1] if text.strip() else "未知错误"
+                app.set_status("出错了: %s" % first[:120])
+        except Exception:
+            pass
+
+    _sys.excepthook = _hook
 
 
 if __name__ == "__main__":
-    DownloaderApp().run()
+    _install_crash_guard()
+    try:
+        DownloaderApp().run()
+    except Exception:
+        import sys as _s
+        text = traceback.format_exc()
+        print(text, file=_s.stderr)
+        try:
+            with open(os.path.join(APP_DIR, "crash.log"), "a",
+                      encoding="utf-8") as f:
+                f.write(text + "\n")
+        except Exception:
+            pass
+        raise

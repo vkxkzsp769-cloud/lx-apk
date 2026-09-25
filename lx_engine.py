@@ -441,6 +441,9 @@ class LxEngine:
             if out.get("d"):
                 out = {"done": True, "value": out.get("v") or "", "error": out.get("e")}
                 break
+            # 超时检查必须在 break 分支之后、sleep 之前。
+            # （原实现放在 break 之后没问题，但若 Promise 永不落定，
+            #   必须确保这里能真正退出，避免无限空转导致 ANR）
             if time.time() > deadline:
                 raise RuntimeError(f"获取直链超时({timeout_ms}ms)")
             time.sleep(0.12)

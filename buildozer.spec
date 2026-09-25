@@ -11,7 +11,7 @@ source.include_patterns = assets/*, sources/*
 
 version = 1.0.0
 
-requirements = python3,kivy,pyjnius,android
+requirements = python3,kivy,pyjnius,android,urllib3,certifi
 
 orientation = portrait
 fullscreen = 0
@@ -20,12 +20,16 @@ fullscreen = 0
 android.api = 33
 android.minapi = 21
 android.ndk = 25b
-# 只编 64 位；如需支持老机型再改回 arm64-v8a, armeabi-v7a
-android.archs = arm64-v8a
+android.archs = arm64-v8a, armeabi-v7a
 android.allow_backup = True
 
 # 需要网络权限
-android.permissions = INTERNET, ACCESS_NETWORK_STATE, WRITE_EXTERNAL_STORAGE, READ_EXTERNAL_STORAGE
+# 只保留真正需要的：下载写的是 getExternalFilesDir()（应用私有，免权限），
+# targetSdk 33 下 WRITE/READ_EXTERNAL_STORAGE 已是空操作
+android.permissions = INTERNET, ACCESS_NETWORK_STATE
+
+# 音源里很多 API 是 http:// ，targetSdk>=28 默认禁止明文，必须显式打开
+android.uses_cleartext_traffic = True
 
 # 不开调试日志
 android.logcat_filters = *:S python:D
