@@ -67,6 +67,11 @@ PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我",
 # 顺序即下拉顺序，第一项是 Spinner 的默认值 —— 所以 320k 放最前
 QUALITY_ORDER = ["320k", "128k", "192k", "flac", "flac24bit",
                  "hires", "master"]
+# 搜索结果数量选项（None = 尽量多拿，上限见 netease.MAX_RESULTS）
+COUNT_ORDER = ["20 首", "50 首", "100 首", "200 首", "300 首", "全部"]
+COUNT_VALUE = {"20 首": 20, "50 首": 50, "100 首": 100,
+               "200 首": 200, "300 首": 300, "全部": None}
+
 TIME_FMT = "%02d:%02d"
 
 
@@ -271,14 +276,19 @@ class LxApp(App):
         row.add_widget(self.sp_quality)
         panel.add_widget(row)
 
-        # ---- 格式（筛选品质列表）----
+        # ---- 格式 + 数量 ----
         row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
         row.add_widget(self._field("格式", w=dp(40)))
         self.sp_format = CNSpinner(text="自动", values=songinfo.FORMAT_ORDER,
                                    font_size=dp(14), size_hint_x=None,
-                                   width=dp(110), **self.F)
+                                   width=dp(104), **self.F)
         self.sp_format.bind(text=lambda *_: self._refresh_qualities())
         row.add_widget(self.sp_format)
+        row.add_widget(self._field("数量", w=dp(40)))
+        self.sp_count = CNSpinner(text="100 首", values=COUNT_ORDER,
+                                  font_size=dp(14), size_hint_x=None,
+                                  width=dp(104), **self.F)
+        row.add_widget(self.sp_count)
         panel.add_widget(row)
 
         # ---- 搜索 ----
@@ -579,16 +589,21 @@ class LxApp(App):
             self.busy = True
             self.set_status("搜索中: %s" % keyword)
             self._clear_results()
-            self.bg(lambda: self._search_work(keyword), "search")
+            want = COUNT_VALUE.get(self.sp_count.text, 100)
+            self.bg(lambda: self._search_work(keyword, want), "search")
         except Exception as e:
             self.busy = False
             log_exc("do_search")
             self.set_status("搜索出错: %s" % e, C_ERR)
 
-    def _search_work(self, keyword):
+    def _search_work(self, keyword, want):
         songs, err = [], None
         try:
-            songs = netease.search(keyword, 15)
+            def prog(got, total):
+                self.ui(lambda: self.set_status(
+                    "搜索中: %s… 已获取 %d%s"
+                    % (keyword, got, ("/%d" % total) if total else "")))
+            songs = netease.search(keyword, want, on_progress=prog)
         except Exception as e:
             err = str(e)
             log_exc("search")

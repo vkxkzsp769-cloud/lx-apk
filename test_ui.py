@@ -511,6 +511,61 @@ def test_all_widgets_use_cn_font():
     print("  控件树里所有文字控件都带中文字体 ✓")
 
 
+def test_netease_paging():
+    """回归：搜索必须能分页，且要识别接口限流。
+
+    之前写死 15 条。接口单次上限是 100，
+    超过 100 会返回 {"code":406,"msg":"操作频繁"}（HTTP 还是 200），
+    不识别就会误判成「没搜到」。
+    """
+    import netease
+
+    if netease.PAGE != 100:
+        raise AssertionError("单页上限应为 100，实际 %s" % netease.PAGE)
+    if netease.MAX_RESULTS < 300:
+        raise AssertionError("上限太小: %s" % netease.MAX_RESULTS)
+
+    # 限流要能被识别
+    if not netease._is_rate_limited({"code": 406, "msg": "操作频繁，请稍候再试"}):
+        raise AssertionError("没识别出 code=406 限流")
+    if not netease._is_rate_limited({"msg": "操作频繁", "code": 406}):
+        raise AssertionError("没识别出带 msg 的限流")
+    if netease._is_rate_limited({"result": {"songs": [{"id": 1}]}}):
+        raise AssertionError("正常结果被误判成限流")
+    print("  限流识别正确 ✓")
+
+    # 分页逻辑：用假 _fetch 验证会连续取页并去重
+    pages = {
+        0:   {"result": {"songCount": 250, "songs":
+              [{"id": i, "name": "s%d" % i, "duration": 1000} for i in range(100)]}},
+        100: {"result": {"songCount": 250, "songs":
+              [{"id": i, "name": "s%d" % i, "duration": 1000} for i in range(100, 200)]}},
+        200: {"result": {"songCount": 250, "songs":
+              [{"id": i, "name": "s%d" % i, "duration": 1000} for i in range(200, 250)]}},
+    }
+    calls = []
+
+    def fake(keyword, offset, limit):
+        calls.append(offset)
+        return pages.get(offset, {"result": {"songs": []}})
+
+    real = netease._fetch
+    netease._fetch = fake
+    try:
+        got = netease.search("x", 250)
+    finally:
+        netease._fetch = real
+
+    if len(got) != 250:
+        raise AssertionError("分页取到 %d 条，应为 250" % len(got))
+    ids = [g["id"] for g in got]
+    if len(set(ids)) != 250:
+        raise AssertionError("分页结果有重复")
+    if calls != [0, 100, 200]:
+        raise AssertionError("分页 offset 不对: %s" % calls)
+    print("  分页 3 页共 250 条、无重复 ✓")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -560,6 +615,7 @@ def main():
     check("JS 结果双层 JSON 解到底", test_eval_json_unwrap)
     check("SSL 证书失败自动降级", test_ssl_fallback)
     check("所有文字控件都带中文字体", test_all_widgets_use_cn_font)
+    check("搜索分页 + 限流识别", test_netease_paging)
 
     print()
     if FAILS:
