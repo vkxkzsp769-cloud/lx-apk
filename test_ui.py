@@ -319,6 +319,63 @@ def test_eval_json_unwrap():
     print("  单层确实拿不到 dict（老 bug 可复现）✓")
 
 
+def test_ssl_fallback():
+    """回归：证书校验失败要能退回不校验模式。
+
+    真机日志里出现 32 次:
+      SSLCertVerificationError: certificate verify failed:
+      self-signed certificate in certificate chain
+    手机所在网络的代理/网关做了 SSL 拦截，严格校验必然失败，
+    搜索就会一直报错。netutil.urlopen 必须能自动降级。
+    """
+    import ssl
+    import urllib.error
+    import netutil
+
+    calls = []
+    real = netutil.urllib.request.urlopen
+
+    def fake(req, timeout=None, context=None):
+        calls.append(context)
+        if context is None:
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError(
+                    "certificate verify failed: self-signed certificate "
+                    "in certificate chain"))
+        # 第二次（带 context）应当成功
+        class _R:
+            def __enter__(self_): return self_
+            def __exit__(self_, *a): return False
+            def read(self_): return b'{"ok":true}'
+        return _R()
+
+    netutil.urllib.request.urlopen = fake
+    try:
+        data = netutil.get_json("https://music.163.com/api/search/get/web")
+        if data != {"ok": True}:
+            raise AssertionError("降级后没解析出数据: %r" % (data,))
+        if len(calls) != 2 or calls[0] is not None or calls[1] is None:
+            raise AssertionError("降级流程不对: %r" % (calls,))
+        print("  严格校验失败 -> 自动降级重试 ✓")
+    finally:
+        netutil.urllib.request.urlopen = real
+
+    # 非证书类错误不应被吞掉降级
+    def fake2(req, timeout=None, context=None):
+        raise urllib.error.URLError("connection refused")
+
+    netutil.urllib.request.urlopen = fake2
+    try:
+        try:
+            netutil.get_json("https://x/y")
+        except urllib.error.URLError:
+            print("  普通网络错误照常抛出 ✓")
+        else:
+            raise AssertionError("普通错误被错误地降级了")
+    finally:
+        netutil.urllib.request.urlopen = real
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -366,6 +423,7 @@ def main():
     check("canvas_before 回归", test_static)
     check("evaluateJavascript 走 UI 线程", test_eval_js_uses_ui_thread)
     check("JS 结果双层 JSON 解到底", test_eval_json_unwrap)
+    check("SSL 证书失败自动降级", test_ssl_fallback)
 
     print()
     if FAILS:

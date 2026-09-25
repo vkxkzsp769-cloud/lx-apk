@@ -375,8 +375,25 @@ class LxApp(App):
             intent = Intent(Intent.ACTION_GET_CONTENT)
             intent.setType("*/*")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
-            act.startActivityForResult(
-                Intent.createChooser(intent, "选择音源 .js 文件"), 0x1234)
+
+            # createChooser 的第二个参数签名是 CharSequence，
+            # 直接传 Python str 会抛:
+            #   No static methods called createChooser ...
+            #   requested: (Intent, 'str')
+            # 必须包成 java.lang.String 再 cast 成 CharSequence。
+            launcher = intent
+            try:
+                from jnius import cast
+                JString = autoclass("java.lang.String")
+                title = cast("java.lang.CharSequence",
+                             JString("选择音源 .js 文件"))
+                launcher = Intent.createChooser(intent, title)
+            except Exception as e:
+                # 拿不到选择器也没关系：系统在没有默认应用时会自己弹选择框
+                log_exc("createChooser")
+                log("退回直接 startActivityForResult:", e)
+
+            act.startActivityForResult(launcher, 0x1234)
         except Exception as e:
             log_exc("pick_source")
             self.set_status("选择文件失败: %s" % e, C_ERR)

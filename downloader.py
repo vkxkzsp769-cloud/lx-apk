@@ -1,12 +1,9 @@
 """下载音频 + 直链有效性判断。"""
 import os
 import re
-import urllib.request
 
+import netutil
 from appenv import log
-
-UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36")
 
 # 网易云版权受限时会返回这种跳转地址，下下来是网页而不是音频
 RESTRICTED_PATTERNS = ("music.163.com/song/media/outer/url", "/404", "404.mp3")
@@ -43,12 +40,13 @@ def download(url, dest, on_progress=None):
       2) 总大小 < 10KB -> 失败
       3) 文件头是 <htm 或 { -> 失败
     """
-    headers = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "identity"}
-    req = urllib.request.Request(url, headers=headers)
     tmp = dest + ".part"
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with netutil.urlopen(url,
+                             headers={"Accept": "*/*",
+                                      "Accept-Encoding": "identity"},
+                             timeout=30) as r:
             total = int(r.headers.get("Content-Length") or 0)
             ctype = (r.headers.get("Content-Type") or "").lower()
             if total and total < 4096 and ("html" in ctype or "json" in ctype):
