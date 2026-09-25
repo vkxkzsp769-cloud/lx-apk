@@ -79,3 +79,11 @@ App 里点 **换音源** → 从手机文件管理器选新的 `.js` 文件 → 
 
 仅供技术学习使用。音源内的第三方 API 均非本项目提供，
 下载的音乐版权归各平台/版权方所有，请勿用于商业用途或传播。
+
+---
+
+## 安全提示
+
+请勿在仓库/聊天中粘贴 GitHub Personal Access Token。
+本项目推送只用到 SSH 密钥（`git@github.com:...`），不需要 token。
+如果 token 曾经泄露，请到 https://github.com/settings/tokens 立即吊销重建。
