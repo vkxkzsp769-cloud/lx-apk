@@ -70,6 +70,45 @@ jobs:
           ls "$SDK/build-tools" 2>/dev/null || echo "警告: 无 build-tools"
           test -x "$SDK/tools/bin/sdkmanager" && echo "✓ sdkmanager 老路径就绪"
 
+      - name: 补丁 AndroidManifest 模板（开启明文 HTTP + 旧版存储）
+        run: |
+          # buildozer 1.5.0 的 android.extra_manifest_application_arguments
+          # 会给内容套字面双引号并转义内部引号，经 sh 直传后原样进 XML，
+          # 产生 \" 导致 ManifestMerger 解析失败。
+          # 因此直接给 p4a 的 AndroidManifest 模板打补丁。
+          #
+          # 音源含 11 个 http:// 主机，targetSdk>=28 默认禁明文，
+          # WebView 里宿主用 XMLHttpRequest 取直链会被拦掉。
+          P4A="$PWD/.buildozer/android/platform/python-for-android"
+          if [ ! -d "$P4A" ]; then
+            echo "p4a 不存在，先克隆 master（buildozer 默认分支）"
+            git clone -b master --single-branch --depth 1 \
+              https://github.com/kivy/python-for-android.git "$P4A"
+          fi
+          TMPL="$P4A/pythonforandroid/bootstraps/_sdl_common/build/templates/AndroidManifest.tmpl.xml"
+          if [ ! -f "$TMPL" ]; then
+            echo "::error::找不到 manifest 模板: $TMPL"; exit 1
+          fi
+          python3 - "$TMPL" <<'PYEOF'
+          import io, sys
+          path = sys.argv[1]
+          src = io.open(path, encoding='utf-8').read()
+          if 'usesCleartextTraffic' in src:
+              print('模板已有 usesCleartextTraffic，跳过')
+          else:
+              anchor = 'android:hardwareAccelerated="true"'
+              if anchor not in src:
+                  print('::error::模板缺少锚点，无法打补丁'); sys.exit(1)
+              add = (anchor +
+                     '\n                 android:usesCleartextTraffic="true"' +
+                     '\n                 android:requestLegacyExternalStorage="true"')
+              src = src.replace(anchor, add, 1)
+              io.open(path, 'w', encoding='utf-8').write(src)
+              print('已打补丁')
+          PYEOF
+          echo "=== 确认补丁生效 ==="
+          grep -n "usesCleartextTraffic\|requestLegacyExternalStorage" "$TMPL"
+
       - name: 编译 APK
         run: |
           # 注意：不要用 `yes | buildozer`。buildozer 正常跑完后 yes 仍写入，

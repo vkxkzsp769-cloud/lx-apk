@@ -38,12 +38,13 @@ android.allow_backup = True
 #       填内联 XML 会 FileNotFoundError 导致编译失败。
 android.permissions = INTERNET, ACCESS_NETWORK_STATE, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE, MANAGE_EXTERNAL_STORAGE
 
-# 音源里有大量 http:// 接口（y.qq.com / dl.stream.qqmusic.qq.com /
-# www.kugou.com / music.migu.cn ...）。targetSdk>=28 默认禁止明文，
-# WebView 里的 XHR 会被 network security policy 拦掉，取直链必失败。
-# 注意：这里填的是「文件路径」，buildozer 会 open() 读取其内容作为
-#       <application> 的属性；直接写内联字符串会 FileNotFoundError。
-android.extra_manifest_application_arguments = manifest_app_args.txt
+# 明文 HTTP（音源有 11 个 http:// 主机）不能靠
+# android.extra_manifest_application_arguments 配置 ——
+# buildozer 1.5.0 会给内容套上字面双引号并把内部引号转义成 \"，
+# 经 sh 直传（不走 shell 解析）后，p4a 把它原样渲染进 XML，
+# 产生 " 导致 ManifestMerger 报 Error parsing AndroidManifest.xml（实测）。
+# 改为在 workflow 里直接给 p4a 的 AndroidManifest 模板打补丁，
+# 见 .github/workflows/build.yml 的「补丁 AndroidManifest 模板」步骤。
 
 # 不开调试日志
 android.logcat_filters = *:S python:D
