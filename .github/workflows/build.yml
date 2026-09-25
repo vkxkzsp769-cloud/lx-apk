@@ -1,0 +1,48 @@
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:        # 也能在 GitHub 网页上手动点按钮编译
+
+jobs:
+  build-android:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git zip unzip openjdk-17-jdk python3-pip autoconf libtool \
+            pkg-config zlib1g-dev libncurses-dev cmake libffi-dev \
+            libssl-dev automake build-essential ccache
+
+      - name: 安装 buildozer
+        run: |
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install "buildozer==1.5.0" "cython<3.0" virtualenv
+
+      - name: 缓存 Android SDK/NDK（大幅加速二次编译）
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: 编译 APK
+        run: |
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          yes | buildozer -v android debug
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lx-downloader-apk
+          path: bin/*.apk
+          if-no-files-found: error
