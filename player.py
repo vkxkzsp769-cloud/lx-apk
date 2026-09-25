@@ -137,7 +137,11 @@ class Player:
         from jnius import autoclass, PythonJavaClass, java_method, cast
 
         MediaPlayer = autoclass("android.media.MediaPlayer")
-        AudioAttributes = autoclass("android.media.AudioAttributes")
+        # Builder 是 AudioAttributes 的「嵌套类」，pyjnius 必须用 $ 写法。
+        # 写成 "android.media.AudioAttributes" 再取 .Builder 会报
+        #   AttributeError: type object 'AudioAttributes' has no attribute 'Builder'
+        AudioAttributesBuilder = autoclass(
+            "android.media.AudioAttributes$Builder")
         player = self
 
         class _Prepared(PythonJavaClass):
@@ -185,10 +189,14 @@ class Player:
         def _build():
             try:
                 mp = MediaPlayer()
-                attrs = AudioAttributes.Builder()
-                attrs.setUsage(1)        # USAGE_MEDIA
-                attrs.setContentType(2)  # CONTENT_TYPE_MUSIC
-                mp.setAudioAttributes(attrs.build())
+                try:
+                    b = AudioAttributesBuilder()
+                    b.setUsage(1)        # USAGE_MEDIA
+                    b.setContentType(2)  # CONTENT_TYPE_MUSIC
+                    mp.setAudioAttributes(b.build())
+                except Exception as e:
+                    # 设置音频属性失败不影响播放，只是没有音频焦点
+                    diag("设置 AudioAttributes 失败（忽略）: %r" % (e,))
                 mp.setOnPreparedListener(prep)
                 mp.setOnErrorListener(err)
                 mp.setOnCompletionListener(done)

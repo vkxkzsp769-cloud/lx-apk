@@ -238,8 +238,12 @@ def ensure_source():
             stream.close()
             if buf:
                 code = bytes(buf).decode("utf-8", "replace")
-        except Exception:
-            log_exc("read asset default_source.js")
+        except Exception as e:
+            # 这里是「预期内」的失败：p4a 把 source.include_patterns 的文件
+            # 打进 assets/private.tar，而不是 APK 根 assets，
+            # 所以 getAssets().open() 必然找不到，随后会走下面的本地回退。
+            # 不要写进 crash.log，否则每次启动都刷一条假异常。
+            log("APK asset 里没有 default_source.js（正常），改用本地副本:", e)
 
     # 2) 退回项目里的 assets 目录（桌面调试用）
     if not code and os.path.exists(BUILTIN_SOURCE):

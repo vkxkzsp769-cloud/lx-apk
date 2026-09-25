@@ -620,7 +620,7 @@ class LxApp(App):
                      % (s["name"], s["singer"], s.get("interval") or "--:--"),
                 size_hint_y=None, height=dp(58), halign="left",
                 valign="middle", font_size=dp(13), color=C_TEXT,
-                bg_color=C_ITEM, radius=10)
+                bg_color=C_ITEM, radius=10, **self.F)   # 少了 **self.F 中文就是方块
             item.bind(size=lambda b, v: setattr(b, "text_size",
                                                 (v[0] - dp(24), None)))
             item.bind(on_release=lambda b, idx=i: self.open_song(idx))

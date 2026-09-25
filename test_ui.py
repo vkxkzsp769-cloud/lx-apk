@@ -37,6 +37,10 @@ Config.set("graphics", "height", "760")
 import kivy  # noqa: E402
 from kivy.core.text import Label as CoreLabel  # noqa: E402
 from kivy.clock import Clock  # noqa: E402
+from kivy.uix.button import Button  # noqa: E402
+from kivy.uix.label import Label  # noqa: E402
+from kivy.uix.spinner import Spinner  # noqa: E402
+from kivy.uix.textinput import TextInput  # noqa: E402
 
 import appenv  # noqa: E402
 import fonts  # noqa: E402
@@ -452,6 +456,61 @@ def test_player_state():
     print("  空播放器控制安全 ✓")
 
 
+def test_all_widgets_use_cn_font():
+    """回归：所有会显示文字的控件都必须带中文字体。
+
+    曾经漏传：搜索结果列表项忘写 **self.F，
+    结果「搜出来的中文全是方块」，而且比之前更严重（因为列表是主内容）。
+    这种漏传肉眼很难发现，所以遍历控件树自动守住。
+
+    （前提：本条只在成功注册到中文字体时才有意义）
+    """
+    fonts.register()
+    if not fonts._registered_path:
+        print("  [SKIP] 测试机没有中文字体")
+        return
+
+    app = M.LxApp()
+    root = app.build()
+    app._apply_source_info({
+        "meta": {"name": "t", "version": "1"},
+        "sources": {"wy": {"name": "网易云", "qualitys": ["320k"]}}})
+    app._show_results([{"id": "1", "name": "海阔天空", "singer": "Beyond",
+                        "interval": "03:59", "album": ""}])
+    app._show_song_popup({"id": "1", "name": "海阔天空", "singer": "Beyond",
+                          "interval": "03:59", "album": ""})
+
+    offenders = []
+
+    TEXTY = (Label, Button, TextInput, Spinner)
+
+    def walk(w, depth=0):
+        # 不要在这里 try/except —— 之前正是因为把 NameError 吞了，
+        # 导致这条检查一直空跑（永远通过）。
+        if isinstance(w, TEXTY):
+            txt = getattr(w, "text", "") or getattr(w, "hint_text", "")
+            fn = getattr(w, "font_name", None)
+            # 注意：Kivy 默认 font_name 是 'Roboto'（不是 None），
+            # 所以不能判「空」，必须判「是不是我们注册的那个中文字体」。
+            if txt and fn != fonts.FONT_NAME:
+                offenders.append("%s(%r) font=%r"
+                                 % (type(w).__name__, txt[:18], fn))
+        for c in getattr(w, "children", []):
+            walk(c, depth + 1)
+
+    walk(root)
+    if app._popup is not None and app._popup.content is not None:
+        walk(app._popup.content)
+    if app._popup is not None:
+        app._popup.dismiss()
+
+    if offenders:
+        raise AssertionError(
+            "以下控件没有中文字体，会显示成方块:\n      " +
+            "\n      ".join(offenders))
+    print("  控件树里所有文字控件都带中文字体 ✓")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -500,6 +559,7 @@ def main():
     check("evaluateJavascript 走 UI 线程", test_eval_js_uses_ui_thread)
     check("JS 结果双层 JSON 解到底", test_eval_json_unwrap)
     check("SSL 证书失败自动降级", test_ssl_fallback)
+    check("所有文字控件都带中文字体", test_all_widgets_use_cn_font)
 
     print()
     if FAILS:
