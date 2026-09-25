@@ -797,6 +797,7 @@ def safe_name(s):
 PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我", "kg": "酷狗", "mg": "咪咕"}
 
 # 深色主题配色
+C_BG       = (0.10, 0.12, 0.16, 1)   # 页面底色
 C_BG_HEADER = (0.13, 0.15, 0.20, 1)
 C_CARD = (0.17, 0.19, 0.25, 1)
 C_CTRL = (0.24, 0.27, 0.34, 1)
@@ -820,13 +821,14 @@ class DownloaderApp(App):
         F = {"font_name": self.cn_font} if self.cn_font else {}
 
         root = BoxLayout(orientation="vertical")
+        self._attach_bg(root, C_BG)
 
         # ══════════════════════════════════════════
         #  顶部标题栏
         # ══════════════════════════════════════════
         header = BoxLayout(size_hint_y=None, height=dp(52),
-                           padding=(dp(14), dp(8)), spacing=dp(8),
-                           canvas_before=self._bg(C_BG_HEADER))
+                           padding=(dp(14), dp(8)), spacing=dp(8))
+        self._attach_bg(header, C_BG_HEADER)
         title = Label(text="落雪音源下载器", bold=True, font_size=dp(18),
                       halign="left", valign="middle", color=C_TEXT, **F)
         title.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
@@ -837,8 +839,8 @@ class DownloaderApp(App):
         #  控制区（卡片）
         # ══════════════════════════════════════════
         panel = BoxLayout(orientation="vertical", size_hint_y=None,
-                          padding=(dp(14), dp(12)), spacing=dp(10),
-                          canvas_before=self._bg(C_CARD))
+                          padding=(dp(14), dp(12)), spacing=dp(10))
+        self._attach_bg(panel, C_CARD)
         panel.bind(minimum_height=panel.setter("height"))
 
         # --- 第一行：音源 ---
@@ -909,8 +911,8 @@ class DownloaderApp(App):
         #  底部状态栏
         # ══════════════════════════════════════════
         footer = BoxLayout(orientation="vertical", size_hint_y=None,
-                           padding=(dp(14), dp(8)), spacing=dp(6),
-                           canvas_before=self._bg(C_BG_HEADER))
+                           padding=(dp(14), dp(8)), spacing=dp(6))
+        self._attach_bg(footer, C_BG_HEADER)
         footer.bind(minimum_height=footer.setter("height"))
 
         self.pb = ProgressBar(max=100, size_hint_y=None, height=dp(6))
@@ -927,16 +929,25 @@ class DownloaderApp(App):
         return root
 
     # ---------- UI 小工具 ----------
-    def _bg(self, color):
-        """生成一个纯色矩形作为背景"""
-        from kivy.graphics import Color, Rectangle
+    def _attach_bg(self, widget, color):
+        """给控件加纯色背景。
 
-        def _draw(widget, *_):
-            widget.canvas.before.clear()
-            with widget.canvas.before:
-                Color(*color)
-                Rectangle(pos=widget.pos, size=widget.size)
-        return _draw
+        注意：Kivy 没有 `canvas_before` 这个属性，不能当构造参数传
+        （传了会 TypeError: Properties ['canvas_before'] passed to __init__
+         may not be existing property names，App 启动即崩）。
+        正确做法是建好控件后往 widget.canvas.before 里加图元。
+        """
+        from kivy.graphics import Color, Rectangle
+        with widget.canvas.before:
+            Color(*color)
+            rect = Rectangle(pos=widget.pos, size=widget.size)
+
+        def _sync(w, *_):
+            rect.pos = w.pos
+            rect.size = w.size
+
+        widget.bind(pos=_sync, size=_sync)
+        return widget
 
     def _field_label(self, text, F):
         """表单左侧的小标签，固定宽度保证各行对齐"""
