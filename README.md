@@ -65,6 +65,19 @@ python test_desktop.py "海阔天空"
 
 ---
 
+## 下载的文件在哪
+
+```
+/storage/emulated/0/Download/落雪音源/
+```
+
+即「文件管理 → 内部存储 → Download → 落雪音源」，
+卸载 App 不会丢失，可直接播放。
+
+> Android 11+ 首次启动会请求「所有文件访问」权限（写公共目录必需）。
+> 拒绝也能用，文件会退回 App 私有目录
+> `Android/data/com.lxdl.lxdownloader/files/downloads/`（卸载会清空）。
+
 ## 换音源
 
 **方式一（用户自己换，不用重编）**

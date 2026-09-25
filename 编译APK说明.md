@@ -108,9 +108,14 @@ assets/default_source.js     ← 你的音源（必须）
 
 **下载的文件在哪？**
 ```
-Android/data/com.lxdl.lxdownloader/files/downloads/
+/storage/emulated/0/Download/落雪音源/
 ```
-用手机自带的"文件管理"进去就能看到，也能直接播放。
+也就是手机「文件管理 → 内部存储 → Download → 落雪音源」，
+和别的下载放在一起，卸载 App 也不会丢，可以直接播放。
+
+> 首次启动会跳一次「所有文件访问」授权页（Android 11+ 写公共目录需要）。
+> 不授权也能用，只是文件会存到 App 私有目录：
+> `Android/data/com.lxdl.lxdownloader/files/downloads/`（卸载会清空）
 
 ### 换音源（不用重新编译 APK）
 
