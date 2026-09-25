@@ -5,10 +5,15 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+env:
+  # 关键：全局设成 Java 17，否则 sdkmanager 会报
+  # UnsupportedClassVersionError (class file version 61.0 > 55.0)
+  JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+
 jobs:
   build-android:
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -20,55 +25,64 @@ jobs:
             git zip unzip openjdk-17-jdk python3-pip autoconf libtool \
             pkg-config zlib1g-dev libncurses-dev cmake libffi-dev \
             libssl-dev automake build-essential ccache lld
+          java -version
 
       - name: 安装 buildozer
         run: |
           python3 -m pip install --upgrade pip setuptools wheel
           python3 -m pip install "buildozer==1.5.0" "cython<3.0" virtualenv
 
-      - name: 缓存 Android SDK/NDK
+      - name: 缓存 Android SDK/NDK（命中后能省 10 分钟）
         uses: actions/cache@v4
         with:
           path: |
-            ~/.buildozer
+            ~/.buildozer/android/platform
+            ~/.buildozer/cache
             .buildozer
-          key: buildozer-v2-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: android-sdk-ndk-r25b-v3
           restore-keys: |
-            buildozer-v2-${{ runner.os }}-
+            android-sdk-ndk-r25b-
 
-      - name: 确保 Android build-tools 已安装
+      - name: 预装 Android build-tools（用 Java 17）
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          PATH: /usr/lib/jvm/java-17-openjdk-amd64/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
         run: |
           SDK="$HOME/.buildozer/android/platform/android-sdk"
-          if [ ! -d "$SDK/build-tools" ]; then
-            echo "build-tools 缺失，手动安装..."
+          mkdir -p "$SDK"
+          if [ ! -d "$SDK/build-tools" ] || [ -z "$(ls -A "$SDK/build-tools" 2>/dev/null)" ]; then
+            echo "== 安装 cmdline-tools =="
+            rm -rf /tmp/cmdtools
+            curl -sSL -o /tmp/cmdtools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
             mkdir -p "$SDK/cmdline-tools"
-            if [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
-              curl -sSL -o /tmp/cmdtools.zip \
-                https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-              unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
-              mv /tmp/cmdtools/cmdline-tools "$SDK/cmdline-tools/latest"
-            fi
-            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" \
-              --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
-            "$SDK/cmdline-tools/latest/bin/sdkmanager" \
-              --sdk_root="$SDK" "build-tools;33.0.2" "platforms;android-33" || true
+            rm -rf "$SDK/cmdline-tools/latest"
+            mv /tmp/cmdtools/cmdline-tools "$SDK/cmdline-tools/latest"
+            SDKM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+            chmod +x "$SDKM"
+            echo "== 接受许可 =="
+            yes | "$SDKM" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+            echo "== 安装 build-tools + platform =="
+            "$SDKM" --sdk_root="$SDK" "build-tools;33.0.2" "platforms;android-33" || true
           fi
-          ls "$SDK/build-tools" 2>/dev/null || echo "警告: build-tools 仍不可用"
+          echo "build-tools 内容:"; ls "$SDK/build-tools" 2>/dev/null || true
 
       - name: 编译 APK
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
         run: |
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
           set -o pipefail
           yes | buildozer -v android debug 2>&1 | tee build.log
 
       - name: 失败时打印错误摘要
         if: failure()
         run: |
-          echo "=========== 编译失败，错误摘要 ==========="
-          grep -aiE "error|Traceback|Exception|No such file|failed|not found|IndexError" build.log \
-            | grep -avE "\[DEBUG\]|-Werror|-Wno-|error\.h|_error|checking " | tail -50 || true
+          echo "=========== 错误摘要 ==========="
+          grep -aiE "error|Traceback|Exception|No such file|IndexError|not found" build.log \
+            | grep -avE "\[DEBUG\]|-Werror|-Wno-|error\.h|_error|checking " | tail -40 || true
           echo "=========== Traceback 上下文 ==========="
-          grep -a -B15 "Traceback" build.log | grep -av "\[DEBUG\]" | tail -30 || true
+          grep -a -B15 "Traceback" build.log | grep -av "\[DEBUG\]" | tail -25 || true
 
       - name: 上传编译日志
         if: always()
