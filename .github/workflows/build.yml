@@ -19,7 +19,7 @@ jobs:
           sudo apt-get install -y \
             git zip unzip openjdk-17-jdk python3-pip autoconf libtool \
             pkg-config zlib1g-dev libncurses-dev cmake libffi-dev \
-            libssl-dev automake build-essential ccache
+            libssl-dev automake build-essential ccache lld
 
       - name: 安装 buildozer
         run: |
@@ -32,9 +32,28 @@ jobs:
           path: |
             ~/.buildozer
             .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-v2-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
-            buildozer-${{ runner.os }}-
+            buildozer-v2-${{ runner.os }}-
+
+      - name: 确保 Android build-tools 已安装
+        run: |
+          SDK="$HOME/.buildozer/android/platform/android-sdk"
+          if [ ! -d "$SDK/build-tools" ]; then
+            echo "build-tools 缺失，手动安装..."
+            mkdir -p "$SDK/cmdline-tools"
+            if [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
+              curl -sSL -o /tmp/cmdtools.zip \
+                https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+              unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
+              mv /tmp/cmdtools/cmdline-tools "$SDK/cmdline-tools/latest"
+            fi
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+              --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+            "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+              --sdk_root="$SDK" "build-tools;33.0.2" "platforms;android-33" || true
+          fi
+          ls "$SDK/build-tools" 2>/dev/null || echo "警告: build-tools 仍不可用"
 
       - name: 编译 APK
         run: |
@@ -46,10 +65,12 @@ jobs:
         if: failure()
         run: |
           echo "=========== 编译失败，错误摘要 ==========="
-          grep -aiE "error|Traceback|Exception|No such file|failed|not found" build.log \
-            | grep -avE "\[DEBUG\]|-Werror|-Wno-|error\.h|_error" | tail -60 || true
+          grep -aiE "error|Traceback|Exception|No such file|failed|not found|IndexError" build.log \
+            | grep -avE "\[DEBUG\]|-Werror|-Wno-|error\.h|_error|checking " | tail -50 || true
+          echo "=========== Traceback 上下文 ==========="
+          grep -a -B15 "Traceback" build.log | grep -av "\[DEBUG\]" | tail -30 || true
 
-      - name: 上传编译日志（失败时也能看）
+      - name: 上传编译日志
         if: always()
         uses: actions/upload-artifact@v4
         with:

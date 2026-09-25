@@ -11,7 +11,7 @@ source.include_patterns = assets/*, sources/*
 
 version = 1.0.0
 
-requirements = python3,kivy==2.3.0,pyjnius,android
+requirements = python3,kivy,pyjnius,android
 
 orientation = portrait
 fullscreen = 0
@@ -31,7 +31,6 @@ android.permissions = INTERNET, ACCESS_NETWORK_STATE, WRITE_EXTERNAL_STORAGE, RE
 android.logcat_filters = *:S python:D
 
 p4a.bootstrap = sdl2
-p4a.branch = develop
 android.accept_sdk_license = True
 
 [buildozer]
