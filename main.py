@@ -25,6 +25,7 @@ import traceback
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.metrics import dp
+from kivy.properties import ListProperty, NumericProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
@@ -49,15 +50,17 @@ from lxbridge import LxBridge
 # ============================================================
 #  主题
 # ============================================================
-C_BG = (0.10, 0.12, 0.16, 1)
-C_HEADER = (0.13, 0.15, 0.20, 1)
-C_CARD = (0.17, 0.19, 0.25, 1)
-C_CTRL = (0.24, 0.27, 0.34, 1)
-C_ACCENT = (0.26, 0.55, 0.96, 1)
-C_TEXT = (0.93, 0.95, 0.98, 1)
-C_DIM = (0.62, 0.67, 0.75, 1)
-C_OK = (0.33, 0.80, 0.47, 1)
-C_ERR = (0.96, 0.45, 0.45, 1)
+C_BG = (0.082, 0.094, 0.118, 1)      # 页面底色
+C_CARD = (0.129, 0.145, 0.180, 1)    # 卡片
+C_CTRL = (0.192, 0.212, 0.259, 1)    # 输入/下拉
+C_ITEM = (0.153, 0.173, 0.212, 1)    # 列表项
+C_ACCENT = (0.290, 0.560, 0.950, 1)  # 强调蓝
+C_ACCENT_D = (0.212, 0.435, 0.760, 1)
+C_TEXT = (0.937, 0.945, 0.965, 1)
+C_DIM = (0.596, 0.639, 0.710, 1)
+C_FAINT = (0.435, 0.475, 0.545, 1)
+C_OK = (0.345, 0.800, 0.502, 1)
+C_ERR = (0.949, 0.451, 0.451, 1)
 
 PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我",
                   "kg": "酷狗", "mg": "咪咕"}
@@ -79,8 +82,11 @@ def fmt_time(sec):
 #  控件
 # ============================================================
 class CNSpinner(Spinner):
-    """Spinner 的下拉列表项不会继承 font_name，中文会显示成方块。
-    这里在创建下拉后统一下发字体。
+    """下拉框。做两件事：
+
+    1) 下拉列表项不会继承 font_name，中文会显示成方块 —— 创建下拉后统一下发。
+    2) Kivy 的 Spinner 默认用灰底贴图，跟这套深色主题不搭，
+       所以关掉贴图改用纯色（background_normal=""）。
 
     注意：不要重新声明 font_name！
     Label 自己就有 font_name（默认 'Roboto'），重新声明成
@@ -90,6 +96,13 @@ class CNSpinner(Spinner):
     这个崩只在「没找到中文字体」时触发（那时不会传 font_name），
     很容易漏测。
     """
+
+    def __init__(self, **kw):
+        kw.setdefault("background_normal", "")
+        kw.setdefault("background_down", "")
+        kw.setdefault("background_color", C_CTRL)
+        kw.setdefault("color", C_TEXT)
+        super().__init__(**kw)
 
     def _create_dropdown(self, *largs):
         super()._create_dropdown(*largs)
@@ -109,23 +122,60 @@ class CNSpinner(Spinner):
             log_exc("CNSpinner 下拉字体")
 
 
-def attach_bg(widget, color):
-    """给控件加纯色背景。
+def attach_bg(widget, color, radius=0):
+    """给控件加背景（可选圆角）。
 
     Kivy 没有 canvas_before 这个属性（它是 widget.canvas.before 对象），
     当构造参数传会抛 TypeError 导致启动即崩 —— 必须建好后再加图元。
     """
-    from kivy.graphics import Color, Rectangle
+    from kivy.graphics import Color, Rectangle, RoundedRectangle
     with widget.canvas.before:
         Color(*color)
-        rect = Rectangle(pos=widget.pos, size=widget.size)
+        if radius:
+            shape = RoundedRectangle(pos=widget.pos, size=widget.size,
+                                     radius=[dp(radius)])
+        else:
+            shape = Rectangle(pos=widget.pos, size=widget.size)
 
     def _sync(w, *_):
-        rect.pos = w.pos
-        rect.size = w.size
+        shape.pos = w.pos
+        shape.size = w.size
 
     widget.bind(pos=_sync, size=_sync)
     return widget
+
+
+class FlatButton(Button):
+    """扁平圆角按钮。
+
+    背景用自绘圆角矩形，所以要把 Kivy 默认的灰色贴图关掉
+    （background_normal="" + background_color 透明）。
+    """
+    bg_color = ListProperty([0.24, 0.27, 0.34, 1])
+    radius = NumericProperty(8)
+
+    def __init__(self, **kw):
+        kw.setdefault("background_normal", "")
+        kw.setdefault("background_down", "")
+        kw.setdefault("background_color", (0, 0, 0, 0))   # 关掉默认灰底
+        super().__init__(**kw)
+        # 注意：bg_color 是通过 kwargs 设进来的，Kivy 会在 super().__init__()
+        # 里就触发 on_bg_color，那时 canvas 图元还不存在 —— 所以那里必须判空。
+        from kivy.graphics import Color, RoundedRectangle
+        with self.canvas.before:
+            self._bg_color = Color(*self.bg_color)
+            self._bg_shape = RoundedRectangle(
+                pos=self.pos, size=self.size, radius=[dp(self.radius)])
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_):
+        self._bg_shape.pos = self.pos
+        self._bg_shape.size = self.size
+
+    def on_bg_color(self, *_):
+        c = getattr(self, "_bg_color", None)
+        if c is not None:
+            c.rgba = self.bg_color
 
 
 # ============================================================
@@ -137,8 +187,7 @@ class LxApp(App):
     # ---------- 生命周期 ----------
     def build(self):
         self.bridge = LxBridge()
-        self.player = player_mod.Player(
-            os.path.join(appenv.APP_DIR, "cache"))
+        self.player = player_mod.Player()
         self.songs = []           # 搜索结果
         self.platforms = []       # [{source,name,qualitys}]
         self.busy = False
@@ -176,72 +225,91 @@ class LxApp(App):
 
     # ---------- UI 组装 ----------
     def _build_header(self):
-        box = BoxLayout(size_hint_y=None, height=dp(52),
-                        padding=(dp(14), dp(8)))
-        attach_bg(box, C_HEADER)
-        t = Label(text="落雪音源下载器", bold=True, font_size=dp(18),
+        box = BoxLayout(size_hint_y=None, height=dp(56),
+                        padding=(dp(18), dp(10)))
+        attach_bg(box, C_CARD)
+        t = Label(text="落雪音源下载器", bold=True, font_size=dp(19),
                   halign="left", valign="middle", color=C_TEXT, **self.F)
         t.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         box.add_widget(t)
+        self.lbl_sub = Label(text="", size_hint_x=None, width=dp(150),
+                             font_size=dp(11), color=C_FAINT,
+                             halign="right", valign="middle", **self.F)
+        self.lbl_sub.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        box.add_widget(self.lbl_sub)
         return box
 
     def _build_panel(self):
+        wrap = BoxLayout(size_hint_y=None, padding=(dp(10), dp(6)))
+        wrap.bind(minimum_height=wrap.setter("height"))
         panel = BoxLayout(orientation="vertical", size_hint_y=None,
-                          padding=(dp(14), dp(12)), spacing=dp(10))
-        attach_bg(panel, C_CARD)
+                          padding=(dp(14), dp(14)), spacing=dp(10))
+        attach_bg(panel, C_CARD, radius=14)
         panel.bind(minimum_height=panel.setter("height"))
+        wrap.add_widget(panel)
 
-        # 音源
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        row.add_widget(self._field("音源"))
-        self.sp_source = CNSpinner(text="加载中…", values=[], size_hint_x=None,
-                                   width=dp(148), font_size=dp(14), **self.F)
+        # ---- 音源 ----
+        panel.add_widget(self._section("音源"))
+        row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
+        self.sp_source = CNSpinner(text="加载中…", values=[], font_size=dp(14),
+                                   **self.F)
         row.add_widget(self.sp_source)
-        btn = Button(text="更换", size_hint_x=None, width=dp(74),
-                     font_size=dp(14), background_normal="",
-                     background_color=C_ACCENT, color=(1, 1, 1, 1), **self.F)
+        btn = self._btn("更换", color=C_CTRL, w=dp(72))
         btn.bind(on_release=self.pick_source)
         row.add_widget(btn)
         panel.add_widget(row)
 
-        # 平台 + 音质
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        row.add_widget(self._field("平台"))
-        self.sp_platform = CNSpinner(text="—", values=[], size_hint_x=None,
-                                     width=dp(100), font_size=dp(14), **self.F)
+        # ---- 平台 / 品质 ----
+        panel.add_widget(self._section("平台与品质"))
+        row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
+        self.sp_platform = CNSpinner(text="—", values=[], font_size=dp(14),
+                                     **self.F)
         self.sp_platform.bind(text=lambda *_: self._refresh_qualities())
         row.add_widget(self.sp_platform)
-        row.add_widget(self._field("品质"))
         self.sp_quality = CNSpinner(text="320k", values=QUALITY_ORDER,
-                                    size_hint_x=None, width=dp(100),
                                     font_size=dp(14), **self.F)
         row.add_widget(self.sp_quality)
         panel.add_widget(row)
 
-        # 格式 + 搜索
-        row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
+        # ---- 格式（筛选品质列表）----
+        row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
         row.add_widget(self._field("格式", w=dp(40)))
         self.sp_format = CNSpinner(text="自动", values=songinfo.FORMAT_ORDER,
-                                   size_hint_x=None, width=dp(92),
-                                   font_size=dp(14), **self.F)
+                                   font_size=dp(14), size_hint_x=None,
+                                   width=dp(110), **self.F)
         self.sp_format.bind(text=lambda *_: self._refresh_qualities())
         row.add_widget(self.sp_format)
+        panel.add_widget(row)
+
+        # ---- 搜索 ----
+        panel.add_widget(self._section("搜索"))
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
         self.ti_search = TextInput(hint_text="输入歌名或歌手", multiline=False,
-                                   font_size=dp(15), padding=(dp(10), dp(12)),
+                                   font_size=dp(15), padding=(dp(12), dp(12)),
                                    background_color=C_CTRL,
                                    foreground_color=C_TEXT,
-                                   hint_text_color=(0.55, 0.6, 0.68, 1),
-                                   **self.F)
+                                   hint_text_color=C_FAINT, **self.F)
         self.ti_search.bind(on_text_validate=self.do_search)
         row.add_widget(self.ti_search)
-        self.btn_search = Button(text="搜索", size_hint_x=None, width=dp(78),
-                                 font_size=dp(15), bold=True,
-                                 background_normal="", background_color=C_ACCENT,
-                                 color=(1, 1, 1, 1), **self.F)
+        self.btn_search = self._btn("搜索", color=C_ACCENT, w=dp(76),
+                                    bold=True, fs=dp(15))
         self.btn_search.bind(on_release=self.do_search)
         row.add_widget(self.btn_search)
         panel.add_widget(row)
-        return panel
+        return wrap
+
+    def _section(self, text):
+        lb = Label(text=text, size_hint_y=None, height=dp(20),
+                   font_size=dp(11), color=C_FAINT, bold=True,
+                   halign="left", valign="middle", **self.F)
+        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        return lb
+
+    def _btn(self, text, color=None, w=None, bold=False, fs=None):
+        b = FlatButton(text=text, size_hint_x=None if w else 1,
+                       width=w or 0, font_size=fs or dp(14), bold=bold,
+                       bg_color=color or C_CTRL, color=C_TEXT, **self.F)
+        return b
 
     def _field(self, text, w=None):
         lb = Label(text=text, size_hint_x=None, width=w or dp(42),
@@ -251,34 +319,41 @@ class LxApp(App):
         return lb
 
     def _build_results(self):
-        wrap = BoxLayout(orientation="vertical", padding=(dp(8), dp(4)))
-        self.hint = Label(text="搜索后点结果即可下载", size_hint_y=None,
-                          height=dp(28), font_size=dp(13), color=C_DIM,
-                          **self.F)
+        wrap = BoxLayout(orientation="vertical", padding=(dp(12), dp(4)),
+                         spacing=dp(4))
+        self.hint = Label(text="搜索后点结果即可播放或下载", size_hint_y=None,
+                          height=dp(26), font_size=dp(12), color=C_FAINT,
+                          halign="left", valign="middle", **self.F)
+        self.hint.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         wrap.add_widget(self.hint)
-        self.sv = ScrollView(bar_width=dp(3))
+        self.sv = ScrollView(bar_width=dp(2), bar_color=(0.35, 0.4, 0.5, 1),
+                             bar_inactive_color=(0.22, 0.25, 0.31, 1))
         self.results = BoxLayout(orientation="vertical", size_hint_y=None,
-                                 spacing=dp(6))
+                                 spacing=dp(8), padding=(0, dp(2)))
         self.results.bind(minimum_height=self.results.setter("height"))
         self.sv.add_widget(self.results)
         wrap.add_widget(self.sv)
         return wrap
 
     def _build_footer(self):
+        outer = BoxLayout(orientation="vertical", size_hint_y=None,
+                          padding=(dp(10), dp(6)))
+        outer.bind(minimum_height=outer.setter("height"))
         box = BoxLayout(orientation="vertical", size_hint_y=None,
-                        padding=(dp(14), dp(8)), spacing=dp(6))
-        attach_bg(box, C_HEADER)
+                        padding=(dp(14), dp(12)), spacing=dp(10))
+        attach_bg(box, C_CARD, radius=14)
+        box.bind(minimum_height=box.setter("height"))
+        outer.add_widget(box)
 
         # ---- 播放条 ----
-        prow = BoxLayout(size_hint_y=None, height=dp(38), spacing=dp(8))
-        self.btn_play = Button(text="▶", size_hint_x=None, width=dp(42),
-                               font_size=dp(16), background_normal="",
-                               background_color=C_CARD, color=C_TEXT, **self.F)
+        prow = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(10))
+        self.btn_play = self._btn("播放", color=C_ACCENT, w=dp(64), fs=dp(14))
         self.btn_play.bind(on_release=lambda *_: self.toggle_play())
         prow.add_widget(self.btn_play)
 
         self.slider = Slider(min=0, max=1000, value=0, step=1,
-                             cursor_size=(dp(16), dp(16)))
+                             cursor_size=(dp(18), dp(18)),
+                             background_width=dp(3))
         self.slider.bind(on_touch_down=self._seek_down,
                          on_touch_up=self._seek_up)
         prow.add_widget(self.slider)
@@ -291,7 +366,7 @@ class LxApp(App):
         box.add_widget(prow)
 
         # ---- 下载进度 ----
-        self.pb = ProgressBar(max=100, size_hint_y=None, height=dp(6))
+        self.pb = ProgressBar(max=100, size_hint_y=None, height=dp(4))
         box.add_widget(self.pb)
         # 名字必须是 self.status —— set_status() 写的就是它
         self.status = Label(text="正在启动…", size_hint_y=None, height=dp(34),
@@ -299,7 +374,7 @@ class LxApp(App):
                             halign="left", valign="middle", **self.F)
         self.status.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         box.add_widget(self.status)
-        return box
+        return outer
 
     # ---------- 线程工具 ----------
     def ui(self, fn):
@@ -396,7 +471,7 @@ class LxApp(App):
         self._refresh_qualities()
 
         meta = info.get("meta") or {}
-        self.set_status("✓ 音源: %s v%s · %d 个平台"
+        self.set_status("音源: %s v%s · %d 个平台"
                         % (meta.get("name", "?"), meta.get("version", "?"),
                            len(labels)), C_OK)
         if self.hint.text.startswith("搜索后"):
@@ -540,17 +615,16 @@ class LxApp(App):
         self.hint.text = "点击任意一首查看详情 / 播放 / 下载（共 %d 首）" % len(self.songs)
         kw = dict(self.F)
         for i, s in enumerate(self.songs):
-            btn = Button(text="%d. %s\n     %s   [%s]"
-                              % (i + 1, s["name"], s["singer"],
-                                 s.get("interval") or "--:--"),
-                         size_hint_y=None, height=dp(56), halign="left",
-                         valign="middle", font_size=dp(12),
-                         background_normal="", background_color=C_CARD,
-                         color=C_TEXT, **kw)
-            btn.bind(size=lambda b, v: setattr(b, "text_size",
-                                               (v[0] - dp(12), None)))
-            btn.bind(on_release=lambda b, idx=i: self.open_song(idx))
-            self.results.add_widget(btn)
+            item = FlatButton(
+                text="%s\n%s    %s"
+                     % (s["name"], s["singer"], s.get("interval") or "--:--"),
+                size_hint_y=None, height=dp(58), halign="left",
+                valign="middle", font_size=dp(13), color=C_TEXT,
+                bg_color=C_ITEM, radius=10)
+            item.bind(size=lambda b, v: setattr(b, "text_size",
+                                                (v[0] - dp(24), None)))
+            item.bind(on_release=lambda b, idx=i: self.open_song(idx))
+            self.results.add_widget(item)
         self.set_status("找到 %d 首，点一首查看详情" % len(self.songs))
 
     # ---------- 品质 / 格式 ----------
@@ -651,7 +725,7 @@ class LxApp(App):
         if getattr(self, "_pop_play", None) is not None:
             self._pop_play.disabled = False
             self._pop_dl.disabled = False
-        self.set_status("✓ 已解析: %s（%s / %s / %s）"
+        self.set_status("已解析: %s（%s / %s / %s）"
                         % (song["name"], songinfo.quality_label(quality),
                            (self._cur_ext or "?").upper(),
                            songinfo.human_size(meta.get("size"))), C_OK)
@@ -674,22 +748,22 @@ class LxApp(App):
         content.add_widget(self._pop_info)
 
         btns = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        self._pop_play = Button(text="▶ 播放", font_size=dp(15),
-                                background_normal="", background_color=C_ACCENT,
-                                color=(1, 1, 1, 1), disabled=True, **kw)
+        self._pop_play = FlatButton(text="播放", font_size=dp(15),
+                                    bg_color=C_ACCENT, color=(1, 1, 1, 1),
+                                    radius=10, disabled=True, **kw)
         self._pop_play.bind(on_release=lambda *_: self.play_current())
         btns.add_widget(self._pop_play)
 
-        self._pop_dl = Button(text="⬇ 下载", font_size=dp(15),
-                              background_normal="", background_color=C_CARD,
-                              color=C_TEXT, disabled=True, **kw)
+        self._pop_dl = FlatButton(text="下载", font_size=dp(15),
+                                  bg_color=C_CTRL, color=C_TEXT,
+                                  radius=10, disabled=True, **kw)
         self._pop_dl.bind(on_release=lambda *_: self.download_current())
         btns.add_widget(self._pop_dl)
         content.add_widget(btns)
 
         self._popup = Popup(title="歌曲信息", content=content,
-                            size_hint=(0.92, None), height=dp(300),
-                            title_size=dp(15))
+                            size_hint=(0.92, None), height=dp(310),
+                            title_size=dp(15), separator_color=C_ACCENT)
         self._popup.open()
 
     # ---------- 播放 ----------
@@ -699,10 +773,8 @@ class LxApp(App):
             return
         if self._popup:
             self._popup.dismiss()
-        self.player.play(self._cur_url, on_event=self._on_player_event,
-                         ext=self._cur_ext or "mp3",
-                         fallback_len=self._cur_dur)
-        self.btn_play.text = "⏸"
+        self.player.play(self._cur_url, on_event=self._on_player_event)
+        self.btn_play.text = "暂停"
 
     def _on_player_event(self, kind, payload):
         """播放器回调（后台线程）"""
@@ -720,12 +792,12 @@ class LxApp(App):
     def _player_ready(self, duration):
         self.pb.value = 0
         self._cur_duration = float(duration or 0) or float(self._cur_dur or 0)
-        self.btn_play.text = "⏸"
-        self.set_status("▶ 正在播放: %s" % (self._cur_song or {}).get("name", ""),
+        self.btn_play.text = "暂停"
+        self.set_status("正在播放: %s" % (self._cur_song or {}).get("name", ""),
                         C_OK)
 
     def _player_error(self, msg):
-        self.btn_play.text = "▶"
+        self.btn_play.text = "播放"
         self.set_status("播放失败: %s" % msg, C_ERR)
 
     def toggle_play(self):
@@ -734,8 +806,8 @@ class LxApp(App):
                 self.play_current()
                 return
             self.player.toggle()
-            self.btn_play.text = ("⏸" if self.player.state
-                                  == player_mod.Player.PLAYING else "▶")
+            self.btn_play.text = ("暂停" if self.player.state
+                              == player_mod.Player.PLAYING else "播放")
         except Exception as e:
             log_exc("toggle_play")
             self.set_status("播放控制失败: %s" % e, C_ERR)
@@ -771,7 +843,7 @@ class LxApp(App):
             log_exc("_tick")
 
     def _player_finished(self):
-        self.btn_play.text = "▶"
+        self.btn_play.text = "播放"
         self.slider.value = 0
         self.lbl_time.text = "00:00 / 00:00"
         self.set_status("播放结束")
@@ -824,7 +896,7 @@ class LxApp(App):
 
     def _download_done(self, path, size):
         self.pb.value = 100
-        self.set_status("✓ 完成: %s (%.1f MB)\n保存于 %s"
+        self.set_status("完成: %s (%.1f MB)\n保存于 %s"
                         % (os.path.basename(path), size / 1048576,
                            os.path.dirname(path)), C_OK)
 

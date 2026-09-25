@@ -441,11 +441,10 @@ def test_fmt_time():
 def test_player_state():
     """播放器状态机（不真的播，只验证控制逻辑不炸）"""
     import player as P
-    import tempfile
-    pl = P.Player(tempfile.mkdtemp())
+    pl = P.Player()
     if pl.is_active():
         raise AssertionError("初始不该是活动状态")
-    pl.seek(10)        # 没有 sound 时也不能抛
+    pl.seek(10)        # 还没开始播时也不能抛
     pl.toggle()
     pl.stop()
     if pl.position() != 0.0 or pl.duration() < 0:

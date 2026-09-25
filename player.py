@@ -1,186 +1,283 @@
-"""在线播放（缓冲 + 播放 + 进度/拖动）。
+"""在线播放。
 
-为什么先缓冲成文件再播
-----------------------
-SDL_mixer（Kivy 的 audio_sdl2 后端）需要一个「可 seek」的音源，
-直接把 HTTP 流喂给它不可靠：解析 mp3/flac 头就要来回 seek。
-所以策略是：
-    后台把音频下到缓存文件（边下边报进度）
-    -> 用 SoundLoader 打开本地文件
-    -> 正常播放 / 拖动进度条
-一首 320k 的歌大约 8MB，缓冲几秒，之后拖动进度完全流畅。
+Android 上用 MediaPlayer（真·流式 + 真·可拖动）
+---------------------------------------------
+之前用 Kivy 的 SoundLoader + 「先整首下完再播」，有两个硬伤：
+  1. 不算在线播放 —— 必须等整首下完
+  2. seek 基本没用 —— SDL_mixer 的定位不可靠，而且 Kivy 的
+     SoundSDL2.seek() 会先校验 self.length，mp3 拿不到长度就直接
+     抛 ValueError，被吞掉后表现就是「拖了没反应」
 
-对外用回调把状态抛给界面，播放器本身不碰任何 Kivy 控件。
+所以改回 Android 自己的 MediaPlayer：
+  * setDataSource(url) 直接吃 http(s) 链接，边下边播
+  * seekTo(ms) / getCurrentPosition() / getDuration() 都是原生能力
+  * 缓冲、解码、格式支持都由系统负责
+
+MediaPlayer 的回调（onPrepared/onError/onCompletion）需要一个带
+Looper 的线程，所以整个 MediaPlayer 在 Android UI 线程上创建和操作
+（跟 WebView 一个道理，用 @run_on_ui_thread）。
+
+非 Android（桌面跑测试）时退回 Kivy SoundLoader，保证测试能跑。
 """
 import os
 import threading
-import time
 
-from appenv import diag, log, log_exc
+from appenv import IS_ANDROID, diag, log, log_exc
 
 
 class Player:
-    # 状态
     IDLE = "idle"
     BUFFERING = "buffering"
     PLAYING = "playing"
     PAUSED = "paused"
 
-    def __init__(self, cache_dir):
-        self.cache_dir = cache_dir
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-        except OSError:
-            pass
-        self._sound = None
-        self._path = None
+    def __init__(self):
+        self._mp = None            # android.media.MediaPlayer
+        self._sound = None         # 桌面兜底
         self._state = self.IDLE
-        self._cancel = False
-        self._fallback_len = 0.0     # 音源给的时长，SDL 拿不到时用它
-        self._lock = threading.Lock()
-        try:
-            from kivy.core.audio import SoundLoader
-            self._loader = SoundLoader
-        except Exception:
-            self._loader = None
-            log_exc("import SoundLoader")
+        self._duration = 0.0
+        self._ui = None            # 投到 UI 线程执行用的函数
+        self._listeners = []       # 保持 Java 回调对象存活（防 GC 崩溃）
+        self._on_event = None
+        if IS_ANDROID:
+            self._prepare_ui()
 
-    # ---------- 查询 ----------
+    # ---------- 状态查询 ----------
     @property
     def state(self):
         return self._state
 
     def is_active(self):
-        return self._state in (self.BUFFERING, self.PLAYING, self.PAUSED)
+        return self._state != self.IDLE
 
     def position(self):
-        s = self._sound
-        if s is None:
-            return 0.0
         try:
-            return float(s.get_pos() or 0.0)
+            if self._mp is not None:
+                return max(0.0, self._mp.getCurrentPosition() / 1000.0)
+            if self._sound is not None:
+                return float(self._sound.get_pos() or 0.0)
         except Exception:
-            return 0.0
+            pass
+        return 0.0
 
     def duration(self):
-        s = self._sound
-        if s is not None:
-            try:
-                n = float(s.length or 0.0)
+        try:
+            if self._mp is not None:
+                d = self._mp.getDuration() / 1000.0     # 未准备好时返回 -1
+                if d > 0:
+                    return d
+            if self._sound is not None:
+                n = float(self._sound.length or 0.0)
                 if n > 0:
                     return n
-            except Exception:
-                pass
-        return self._fallback_len
+        except Exception:
+            pass
+        return self._duration
 
-    # ---------- 控制 ----------
+    # ---------- 创建 / 销毁 ----------
+    def _prepare_ui(self):
+        """准备一个「投到 Android UI 线程执行」的函数"""
+        from android.runnable import run_on_ui_thread
+
+        @run_on_ui_thread
+        def _run(fn):
+            try:
+                fn()
+            except Exception as e:
+                diag("MediaPlayer UI 调用失败: %r" % (e,))
+                log_exc("MediaPlayer UI")
+
+        self._ui = _run
+
     def stop(self):
-        self._cancel = True
-        with self._lock:
-            if self._sound is not None:
-                try:
-                    self._sound.stop()
-                    self._sound.unload()
-                except Exception:
-                    log_exc("player.stop")
-                self._sound = None
-            self._state = self.IDLE
-        self._cleanup_cache()
-
-    def toggle(self):
-        s = self._sound
-        if s is None:
-            return
         try:
-            if self._state == self.PLAYING:
-                s.stop()                 # SDL2 的 pause 不可靠，用 stop+seek 代替
-                self._resume_at = self.position()
-                self._state = self.PAUSED
-            else:
-                pos = getattr(self, "_resume_at", 0.0)
-                s.play()
-                if pos > 0:
-                    s.seek(pos)
+            if self._mp is not None and self._ui is not None:
+                mp = self._mp
+                self._mp = None
+
+                @self._ui
+                def _do():
+                    try:
+                        mp.stop()
+                    except Exception:
+                        pass
+                    try:
+                        mp.reset()
+                        mp.release()
+                    except Exception:
+                        pass
+            if self._sound is not None:
+                self._sound.stop()
+                self._sound.unload()
+                self._sound = None
+        except Exception:
+            log_exc("player.stop")
+        finally:
+            self._state = self.IDLE
+            self._listeners = []
+
+    # ---------- 播放 ----------
+    def play(self, url, on_event):
+        """开始播放。on_event(kind, payload) 会在「主线程之外」被调用。
+
+        kind: "buffering"(无 payload) / "ready"(时长秒) /
+              "error"(文本) / "ended"(无)
+        界面记得用 ui() 转回主线程。
+        """
+        self.stop()
+        self._on_event = on_event
+        self._state = self.BUFFERING
+        if IS_ANDROID:
+            self._play_android(url)
+        else:
+            self._play_desktop(url)
+
+    # ---- Android ----
+    def _play_android(self, url):
+        from jnius import autoclass, PythonJavaClass, java_method, cast
+
+        MediaPlayer = autoclass("android.media.MediaPlayer")
+        AudioAttributes = autoclass("android.media.AudioAttributes")
+        player = self
+
+        class _Prepared(PythonJavaClass):
+            __javainterfaces__ = [
+                "android/media/MediaPlayer$OnPreparedListener"]
+            __javacontext__ = "app"
+
+            @java_method("(Landroid/media/MediaPlayer;)V")
+            def onPrepared(self, mp):
+                try:
+                    player._duration = max(0.0, mp.getDuration() / 1000.0)
+                    mp.start()
+                    player._state = player.PLAYING
+                    diag("MediaPlayer 就绪，时长=%.1fs" % player._duration)
+                    player._emit("ready", player._duration)
+                except Exception:
+                    log_exc("onPrepared")
+
+        class _Error(PythonJavaClass):
+            __javainterfaces__ = [
+                "android/media/MediaPlayer$OnErrorListener"]
+            __javacontext__ = "app"
+
+            @java_method("(Landroid/media/MediaPlayer;II)Z")
+            def onError(self, mp, what, extra):
+                diag("MediaPlayer 错误 what=%s extra=%s" % (what, extra))
+                player._state = player.IDLE
+                player._emit("error", "播放器错误(%s/%s)，可能是直链失效或格式不支持"
+                             % (what, extra))
+                return True
+
+        class _Done(PythonJavaClass):
+            __javainterfaces__ = [
+                "android/media/MediaPlayer$OnCompletionListener"]
+            __javacontext__ = "app"
+
+            @java_method("(Landroid/media/MediaPlayer;)V")
+            def onCompletion(self, mp):
+                player._state = player.IDLE
+                player._emit("ended", None)
+
+        prep, err, done = _Prepared(), _Error(), _Done()
+        self._listeners = [prep, err, done]     # 保活，防 GC
+
+        def _build():
+            try:
+                mp = MediaPlayer()
+                attrs = AudioAttributes.Builder()
+                attrs.setUsage(1)        # USAGE_MEDIA
+                attrs.setContentType(2)  # CONTENT_TYPE_MUSIC
+                mp.setAudioAttributes(attrs.build())
+                mp.setOnPreparedListener(prep)
+                mp.setOnErrorListener(err)
+                mp.setOnCompletionListener(done)
+                mp.setDataSource(url)
+                mp.prepareAsync()
+                self._mp = mp
+                diag("MediaPlayer 已创建并 prepareAsync: %s" % url[:80])
+            except Exception as e:
+                log_exc("MediaPlayer 创建")
+                self._state = self.IDLE
+                self._emit("error", "无法开始播放: %s" % e)
+
+        if self._ui is None:
+            self._emit("error", "设备不支持播放")
+            return
+        self._ui(_build)
+
+    # ---- 桌面兜底 ----
+    def _play_desktop(self, url):
+        """桌面没有 MediaPlayer：缓冲成文件再用 SoundLoader 播（仅供测试）"""
+        import tempfile
+
+        def _work():
+            import downloader
+            try:
+                path = os.path.join(tempfile.gettempdir(), "lx_test_audio")
+                downloader.download(url, path)
+                from kivy.core.audio import SoundLoader
+                snd = SoundLoader.load(path)
+                if snd is None:
+                    self._emit("error", "无法解码")
+                    return
+                self._sound = snd
+                snd.play()
                 self._state = self.PLAYING
+                self._duration = float(snd.length or 0)
+                self._emit("ready", self._duration)
+            except Exception as e:
+                self._state = self.IDLE
+                self._emit("error", str(e))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    # ---- 控制 ----
+    def toggle(self):
+        try:
+            if self._mp is not None and self._ui is not None:
+                mp = self._mp
+
+                def _do():
+                    if self._state == self.PLAYING:
+                        mp.pause()
+                        self._state = self.PAUSED
+                    else:
+                        mp.start()
+                        self._state = self.PLAYING
+                self._ui(_do)
+            elif self._sound is not None:
+                if self._state == self.PLAYING:
+                    self._sound.stop()
+                    self._state = self.PAUSED
+                else:
+                    self._sound.play()
+                    self._state = self.PLAYING
         except Exception:
             log_exc("player.toggle")
 
     def seek(self, seconds):
-        s = self._sound
-        if s is None:
-            return
+        """跳到指定秒数（真 seek，MediaPlayer 原生支持）"""
         try:
-            total = self.duration()
-            seconds = max(0.0, min(float(seconds), total or seconds))
-            s.seek(seconds)
-            self._resume_at = seconds
+            seconds = max(0.0, float(seconds))
+            if self._mp is not None and self._ui is not None:
+                mp = self._mp
+                ms = int(seconds * 1000)
+
+                def _do():
+                    mp.seekTo(ms)
+                self._ui(_do)
+                diag("seek -> %.1fs" % seconds)
+            elif self._sound is not None:
+                self._sound.seek(seconds)
         except Exception:
             log_exc("player.seek")
 
-    # ---------- 播放 ----------
-    def play(self, url, on_event, ext="mp3", fallback_len=0.0):
-        """缓冲并播放。
-
-        on_event(kind, payload) 会在后台线程被调用，kind 取:
-            "buffering" -> payload 为 0..1 的进度
-            "ready"     -> payload 为时长(秒)
-            "error"     -> payload 为错误文本
-        界面里记得用 ui() 转回主线程。
-        """
-        self.stop()
-        self._cancel = False
-        self._fallback_len = float(fallback_len or 0)
-        self._state = self.BUFFERING
-        t = threading.Thread(target=self._work, args=(url, on_event, ext),
-                             name="player", daemon=True)
-        t.start()
-
-    def _cache_path(self, ext):
-        return os.path.join(self.cache_dir, "playing.%s" % (ext or "mp3"))
-
-    def _cleanup_cache(self):
-        p = self._path
-        if p and os.path.exists(p):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-
-    def _work(self, url, on_event, ext):
-        import downloader
-        path = self._cache_path(ext)
+    def _emit(self, kind, payload):
+        cb = self._on_event
+        if cb is None:
+            return
         try:
-            def prog(got, total):
-                if self._cancel:
-                    raise RuntimeError("已取消")
-                if total:
-                    on_event("buffering", got / float(total))
-
-            downloader.download(url, path, on_progress=prog)
-            if self._cancel:
-                return
-            self._path = path
-
-            if self._loader is None:
-                on_event("error", "设备不支持音频播放")
-                return
-
-            sound = self._loader.load(path)
-            if sound is None:
-                on_event("error", "无法解码该音频（格式可能不受支持）")
-                return
-
-            with self._lock:
-                self._sound = sound
-                self._resume_at = 0.0
-            sound.play()
-            self._state = self.PLAYING
-            dur = self.duration()
-            diag("开始播放 %s 时长=%.1fs" % (os.path.basename(path), dur))
-            on_event("ready", dur)
-        except Exception as e:
-            if self._cancel:
-                return
-            log_exc("player._work")
-            self._state = self.IDLE
-            on_event("error", str(e))
+            cb(kind, payload)
+        except Exception:
+            log_exc("player 回调")
