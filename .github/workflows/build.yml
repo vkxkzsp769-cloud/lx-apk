@@ -109,6 +109,18 @@ jobs:
           echo "=== 确认补丁生效 ==="
           grep -n "usesCleartextTraffic\|requestLegacyExternalStorage" "$TMPL"
 
+          # 关键：模板只在 p4a 的 create 步骤渲染。
+          # 若 dist 已存在（缓存命中），create 会被跳过 ——
+          # 实测此时权限会就地更新，但模板改动不会生效。
+          # 所以必须删掉旧 dist，强制重新渲染 manifest。
+          for d in .buildozer/android/platform/build-*/dists/lxdownloader; do
+            if [ -d "$d" ]; then
+              echo "删除旧 dist 以强制重渲染 manifest: $d"
+              rm -rf "$d"
+            fi
+          done
+          echo "dist 清理完成"
+
       - name: 编译 APK
         run: |
           # 注意：不要用 `yes | buildozer`。buildozer 正常跑完后 yes 仍写入，

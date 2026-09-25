@@ -203,33 +203,39 @@ def _public_download_dir():
 APP_DIR = app_dir()
 SCRIPT_DIR = os.path.join(APP_DIR, "sources")
 
-# 下载目录：默认公共同步目录，用户可在「文件管理」里直接看到
-DOWNLOAD_DIR = _public_download_dir()
+# 公共目录（优先）/ 应用私有目录（兜底）
+PUBLIC_DOWNLOAD_DIR = os.path.join(_public_download_dir(), "落雪音源")
+PRIVATE_DOWNLOAD_DIR = os.path.join(APP_DIR, "downloads")
 
-# 如果公共目录不可写（个别机型/未授权），退回应用私有目录，保证还能下载
-def _pick_writable_download_dir(preferred):
-    """检查目录是否真的可写，不可写就退回私有目录"""
+
+def _is_writable(path):
+    """真正写一个临时文件来验证可写性（只看 isdir 会误判）"""
     try:
-        os.makedirs(preferred, exist_ok=True)
-        probe = os.path.join(preferred, ".lx_write_test")
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".lx_write_test")
         with open(probe, "w") as f:
             f.write("ok")
         os.remove(probe)
-        return preferred
-    except Exception as e:
-        print("公共下载目录不可写(%s)，改用应用私有目录: %s" % (e, preferred))
-        fallback = os.path.join(APP_DIR, "downloads")
-        try:
-            os.makedirs(fallback, exist_ok=True)
-        except OSError:
-            pass
-        return fallback
+        return True
+    except Exception:
+        return False
 
 
-if IS_ANDROID:
-    # 放在公共 Downloads 下的子目录，避免和手机里其它下载混在一起
-    DOWNLOAD_DIR = os.path.join(_pick_writable_download_dir(DOWNLOAD_DIR),
-                                "落雪音源")
+def get_download_dir():
+    """每次下载时都重新判定一次。
+
+    这样用户在授权页给了「所有文件访问」之后，
+    不用重启 App 就能直接下到公共 Download 目录。
+    """
+    if _is_writable(PUBLIC_DOWNLOAD_DIR):
+        return PUBLIC_DOWNLOAD_DIR
+    if _is_writable(PRIVATE_DOWNLOAD_DIR):
+        return PRIVATE_DOWNLOAD_DIR
+    return PRIVATE_DOWNLOAD_DIR
+
+
+# 启动时先解析一次（界面上显示用；实际下载会再调一次 get_download_dir）
+DOWNLOAD_DIR = get_download_dir()
 
 for d in (SCRIPT_DIR, DOWNLOAD_DIR):
     try:
@@ -1153,7 +1159,12 @@ class DownloaderApp(App):
                 return
             ext = guess_ext(url, quality)
             base = safe_name("%s - %s" % (song["name"], song["singer"]))
-            dest = os.path.join(DOWNLOAD_DIR, "%s.%s" % (base, ext))
+            out_dir = get_download_dir()
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except OSError:
+                pass
+            dest = os.path.join(out_dir, "%s.%s" % (base, ext))
 
             def prog(got, total):
                 Clock.schedule_once(safe_cb(
@@ -1174,7 +1185,8 @@ class DownloaderApp(App):
     def _done(self, path, size):
         self.pb.value = 100
         self.set_status("✓ 完成: %s (%.1f MB)\n保存于 %s"
-                        % (os.path.basename(path), size / 1048576, DOWNLOAD_DIR))
+                        % (os.path.basename(path), size / 1048576,
+                           os.path.dirname(path)))
 
     def set_status(self, txt):
         try:
