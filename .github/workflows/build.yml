@@ -172,6 +172,41 @@ jobs:
           path: build.log
           if-no-files-found: ignore
 
+      - name: 自动发布到 Releases
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 构建产物直接在 runner 上发布，不需要任何人把 APK 下载回来
+          VER=$(grep -E '^version *=' buildozer.spec | head -1 | sed 's/.*= *//' | tr -d ' ')
+          TAG="v$VER"
+          APK=$(ls bin/*.apk 2>/dev/null | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::没找到 APK，无法发布"; exit 1
+          fi
+          echo "版本: $VER   标签: $TAG   文件: $APK"
+
+          # 重命名成不带 -debug 的正式名字
+          OUT="lxdownloader-$VER-arm64-v8a.apk"
+          cp "$APK" "$OUT"
+
+          NOTES="自动构建发布（版本 $VER）。
+
+          - 下载 $OUT 安装即可
+          - 仅支持 arm64-v8a（2017 年后的手机基本都是）
+          - 详细说明见仓库 README 与 编译APK说明.md
+          - 提交: $GITHUB_SHA"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖上传"
+            gh release upload "$TAG" "$OUT" --clobber
+          else
+            gh release create "$TAG" "$OUT" \
+              --title "落雪音源下载器 $TAG" \
+              --notes "$NOTES"
+          fi
+          echo "✓ 已发布: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+
       - name: 上传 APK
         if: success()
         uses: actions/upload-artifact@v4
