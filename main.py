@@ -350,42 +350,27 @@ class LxApp(App):
 
     # ---------- 换音源 ----------
     def pick_source(self, *_):
+        """从手机里选一个新的音源 .js 文件"""
         if not IS_ANDROID:
             self.set_status("桌面端请直接替换 sources/default.js")
             return
         try:
-            from jnius import autoclass, PythonJavaClass, java_method
+            from jnius import autoclass
             from android import activity as android_activity
 
             Intent = autoclass("android.content.Intent")
             act = autoclass("org.kivy.android.PythonActivity").mActivity
-            app = self
 
-            class _Picker(PythonJavaClass):
-                __javainterfaces__ = [
-                    "org/kivy/android/activity/ActivityResultListener"]
-                __javacontext__ = "app"
-
-                def onActivityResult(self, requestCode, resultCode, data):
-                    if resultCode != -1 or data is None:
-                        return
-                    uri = data.getData()
-                    if uri is None:
-                        return
-                    try:
-                        text = app._read_uri(uri)
-                        if not text or len(text) < 200:
-                            raise RuntimeError("文件内容过短，可能不是音源")
-                        save_source(text)
-                        app.ui(lambda: app.set_status("音源已保存，正在加载…"))
-                        app.load_source(SOURCE_FILE)
-                    except Exception as e:
-                        msg = str(e)
-                        app.ui(lambda: app.set_status("读取音源失败: %s" % msg,
-                                                      C_ERR))
-
-            self._picker = _Picker()
-            android_activity.bind(on_activity_result=self._picker.onActivityResult)
+            # 只用 p4a 自带的 activity 回调机制：它内部已经注册好了 Java 侧的
+            # listener，这里传一个普通 Python 函数即可。
+            # 千万不要自己写 PythonJavaClass + __javainterfaces__ =
+            # ["org/kivy/android/activity/ActivityResultListener"] ——
+            # 那个类名在 APK 的 dex 里根本不存在，会抛
+            #   ClassNotFoundException: Didn't find class
+            #   "org.kivy.android.activity.ActivityResultListener"
+            if not getattr(self, "_picker_bound", False):
+                android_activity.bind(on_activity_result=self._on_picked)
+                self._picker_bound = True
 
             intent = Intent(Intent.ACTION_GET_CONTENT)
             intent.setType("*/*")
@@ -395,6 +380,30 @@ class LxApp(App):
         except Exception as e:
             log_exc("pick_source")
             self.set_status("选择文件失败: %s" % e, C_ERR)
+
+    def _on_picked(self, request_code, result_code, intent):
+        """选完文件回调（p4a 的 activity 在 UI 线程派发）"""
+        try:
+            if request_code != 0x1234:
+                return
+            if result_code != -1 or intent is None:
+                self.set_status("已取消选择")
+                return
+            uri = intent.getData()
+            if uri is None:
+                self.set_status("没有拿到文件")
+                return
+            text = self._read_uri(uri)
+            if not text or len(text) < 200:
+                self.set_status("文件内容过短，可能不是音源", C_ERR)
+                return
+            save_source(text)
+            self.set_status("音源已保存，正在加载…")
+            self.load_source(SOURCE_FILE)
+        except Exception as e:
+            log_exc("_on_picked")
+            msg = str(e)
+            self.set_status("读取音源失败: %s" % msg, C_ERR)
 
     def _read_uri(self, uri):
         """Android 文件选择器返回的是 content:// URI，要用 ContentResolver 读"""

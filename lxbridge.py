@@ -247,12 +247,25 @@ class LxBridge:
             return box.get("v")
 
     def _eval_json(self, js, timeout=3.0):
-        """执行 JS 并把结果当 JSON 解析（evaluateJavascript 返回的是 JSON 编码串）"""
+        """执行 JS 并把结果当 JSON 解析。
+
+        这里有「两层」JSON，别只解一层：
+          evaluateJavascript 会把返回值再做一次 JSON 编码
+          （所以拿到的字符串形如 "\"{...}\"")；
+          而 lxInit()/lxPoll() 返回的本身就是一个 JSON 字符串。
+        所以要连续解两次，直到拿到的不是字符串为止。
+        实测症状：只解一层会得到 str，于是报「音源返回了意外数据」。
+        """
         raw = self._eval(js, timeout=timeout)
         if raw is None:
             return None
-        s = str(raw)
-        try:
-            return json.loads(s)
-        except Exception:
-            return s
+
+        value = str(raw)
+        for _ in range(3):
+            if not isinstance(value, str):
+                break
+            try:
+                value = json.loads(value)
+            except Exception:
+                break
+        return value

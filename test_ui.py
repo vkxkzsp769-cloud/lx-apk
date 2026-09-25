@@ -271,6 +271,54 @@ def test_eval_js_uses_ui_thread():
         raise AssertionError("没有用 run_on_ui_thread")
 
 
+def test_eval_json_unwrap():
+    """回归：JS 结果有两层 JSON，必须解到底。
+
+    evaluateJavascript 会把返回值再做一次 JSON 编码，
+    而 lxInit()/lxPoll() 返回的本身就是 JSON 字符串 —— 所以要解两次。
+    只解一层会得到 str，真机上症状是：
+      「音源加载失败：音源返回了意外数据：{...}"
+    """
+    import json
+    from lxbridge import LxBridge
+
+    info = {"meta": {"name": "K×H测试", "version": "1.7.17"},
+            "sources": {"wy": {"name": "网易云", "qualitys": ["320k"]}}}
+
+    b = LxBridge()
+
+    # ① 双层：JS 返回 JSON 字符串，evaluateJavascript 再包一层
+    raw = json.dumps(json.dumps(info))
+    b._eval = lambda js, timeout=3.0: raw
+    got = b._eval_json("lxInit(x)")
+    if not isinstance(got, dict):
+        raise AssertionError("双层没解开，得到 %r" % (got,))
+    if got["meta"]["version"] != "1.7.17":
+        raise AssertionError("内容不对: %r" % (got,))
+    print("  双层 -> dict ✓")
+
+    # ② 单层：typeof lx 这种普通字符串返回值
+    b._eval = lambda js, timeout=3.0: json.dumps("object")
+    got = b._eval_json("typeof lx")
+    if got != "object":
+        raise AssertionError("单层解错: %r" % (got,))
+    print("  单层 -> 'object' ✓")
+
+    # ③ 非 JSON 也不能炸
+    b._eval = lambda js, timeout=3.0: "not-json"
+    got = b._eval_json("x")
+    if got != "not-json":
+        raise AssertionError("非 JSON 处理错了: %r" % (got,))
+    print("  非 JSON 原样返回 ✓")
+
+    # ④ 老实现（只解一层）应当失败 —— 证明这个测试确实在守东西
+    raw = json.dumps(json.dumps(info))
+    one = json.loads(raw)
+    if isinstance(one, dict):
+        raise AssertionError("测试前提不成立：单层竟然解成了 dict")
+    print("  单层确实拿不到 dict（老 bug 可复现）✓")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -317,6 +365,7 @@ def main():
     print("[6] 静态检查")
     check("canvas_before 回归", test_static)
     check("evaluateJavascript 走 UI 线程", test_eval_js_uses_ui_thread)
+    check("JS 结果双层 JSON 解到底", test_eval_json_unwrap)
 
     print()
     if FAILS:
