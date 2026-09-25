@@ -116,7 +116,7 @@ def register_cn_font():
 #  路径
 # ============================================================
 def app_dir():
-    """可写目录（音源、下载）"""
+    """应用私有可写目录（音源、崩溃日志放这里，卸载即清）"""
     if IS_ANDROID:
         from jnius import autoclass
         ctx = autoclass("org.kivy.android.PythonActivity").mActivity
@@ -126,9 +126,111 @@ def app_dir():
         p = os.path.dirname(os.path.abspath(__file__))
     return p
 
+
+def request_storage_permission():
+    """Android 11+ 写公共 Downloads 需要 MANAGE_EXTERNAL_STORAGE（所有文件访问）。
+    这里申请一下；用户拒绝也不影响下载（会退回私有目录）。"""
+    if not IS_ANDROID:
+        return
+    try:
+        from jnius import autoclass
+        from android.permissions import request_permissions, Permission
+        Build = autoclass("android.os.Build$VERSION")
+        if Build.SDK_INT >= 30:
+            # Android 11+：跳系统「所有文件访问」设置页
+            try:
+                Environment = autoclass("android.os.Environment")
+                if Environment.isExternalStorageManager():
+                    print("已有所有文件访问权限")
+                    return
+                Intent = autoclass("android.content.Intent")
+                Settings = autoclass("android.provider.Settings")
+                Uri = autoclass("android.net.Uri")
+                act = autoclass("org.kivy.android.PythonActivity").mActivity
+                intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                intent.setData(Uri.parse("package:" + act.getPackageName()))
+                act.startActivity(intent)
+                print("已跳转申请所有文件访问权限")
+            except Exception as e:
+                print("申请所有文件访问失败:", e)
+        else:
+            request_permissions([Permission.WRITE_EXTERNAL_STORAGE,
+                                 Permission.READ_EXTERNAL_STORAGE])
+    except Exception as e:
+        print("请求存储权限失败:", e)
+
+
+def _public_download_dir():
+    """公共同步下载目录，让文件在「文件管理 → Downloads」里能直接看到。
+
+    优先用 Android 官方 API 取（Environment.getExternalStoragePublicDirectory
+    或 MediaStore.Downloads），拿不到再退回硬编码路径。
+    """
+    if not IS_ANDROID:
+        p = os.path.join(os.path.expanduser("~"), "Downloads")
+        try:
+            os.makedirs(p, exist_ok=True)
+        except OSError:
+            pass
+        return p
+
+    # 1) 先试 MediaStore.Downloads（API 29+，最标准的做法）
+    try:
+        from jnius import autoclass
+        Build = autoclass("android.os.Build$VERSION")
+        if Build.SDK_INT >= 29:
+            Environment = autoclass("android.os.Environment")
+            # 这个 API 从 API 29 起废弃，但取 Downloads 仍然可用且免权限
+            d = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DOWNLOADS)
+            if d is not None:
+                p = d.getAbsolutePath()
+                if p:
+                    return p
+    except Exception as e:
+        print("取公共下载目录失败(API):", e)
+
+    # 2) 退回标准硬编码路径
+    for p in ("/storage/emulated/0/Download",
+              "/storage/emulated/0/Downloads",
+              "/sdcard/Download",
+              "/sdcard/Downloads"):
+        if os.path.isdir(p):
+            return p
+    return "/storage/emulated/0/Download"
+
+
 APP_DIR = app_dir()
 SCRIPT_DIR = os.path.join(APP_DIR, "sources")
-DOWNLOAD_DIR = os.path.join(APP_DIR, "downloads")
+
+# 下载目录：默认公共同步目录，用户可在「文件管理」里直接看到
+DOWNLOAD_DIR = _public_download_dir()
+
+# 如果公共目录不可写（个别机型/未授权），退回应用私有目录，保证还能下载
+def _pick_writable_download_dir(preferred):
+    """检查目录是否真的可写，不可写就退回私有目录"""
+    try:
+        os.makedirs(preferred, exist_ok=True)
+        probe = os.path.join(preferred, ".lx_write_test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return preferred
+    except Exception as e:
+        print("公共下载目录不可写(%s)，改用应用私有目录: %s" % (e, preferred))
+        fallback = os.path.join(APP_DIR, "downloads")
+        try:
+            os.makedirs(fallback, exist_ok=True)
+        except OSError:
+            pass
+        return fallback
+
+
+if IS_ANDROID:
+    # 放在公共 Downloads 下的子目录，避免和手机里其它下载混在一起
+    DOWNLOAD_DIR = os.path.join(_pick_writable_download_dir(DOWNLOAD_DIR),
+                                "落雪音源")
+
 for d in (SCRIPT_DIR, DOWNLOAD_DIR):
     try:
         os.makedirs(d, exist_ok=True)
@@ -806,6 +908,7 @@ class DownloaderApp(App):
     # ---------- 启动 ----------
     def _boot(self, dt):
         try:
+            request_storage_permission()
             extract_default_source()
             if IS_ANDROID:
                 self.engine.start(on_ready=self._on_engine_ready)

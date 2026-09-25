@@ -27,13 +27,23 @@ android.ndk = 25b
 android.archs = arm64-v8a
 android.allow_backup = True
 
-# 需要网络权限
-# 只保留真正需要的：下载写的是 getExternalFilesDir()（应用私有，免权限），
-# targetSdk 33 下 WRITE/READ_EXTERNAL_STORAGE 已是空操作
-android.permissions = INTERNET, ACCESS_NETWORK_STATE
+# 网络 + 存储权限
+# 下载目标为公共 Downloads/落雪音源：
+#   Android 10 及以下：WRITE/READ_EXTERNAL_STORAGE
+#   Android 11+：MANAGE_EXTERNAL_STORAGE（所有文件访问）
+#                首次启动会跳系统授权页，见 request_storage_permission()
+# 注意：MANAGE_EXTERNAL_STORAGE 会被展开成
+#       android.permission.MANAGE_EXTERNAL_STORAGE，正是官方权限名，可直接用。
+#       不要用 android.extra_manifest_xml —— buildozer 把它当「文件路径」open()，
+#       填内联 XML 会 FileNotFoundError 导致编译失败。
+android.permissions = INTERNET, ACCESS_NETWORK_STATE, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE, MANAGE_EXTERNAL_STORAGE
 
-# 音源里很多 API 是 http:// ，targetSdk>=28 默认禁止明文，必须显式打开
-android.uses_cleartext_traffic = True
+# 音源里有大量 http:// 接口（y.qq.com / dl.stream.qqmusic.qq.com /
+# www.kugou.com / music.migu.cn ...）。targetSdk>=28 默认禁止明文，
+# WebView 里的 XHR 会被 network security policy 拦掉，取直链必失败。
+# 注意：这里填的是「文件路径」，buildozer 会 open() 读取其内容作为
+#       <application> 的属性；直接写内联字符串会 FileNotFoundError。
+android.extra_manifest_application_arguments = manifest_app_args.txt
 
 # 不开调试日志
 android.logcat_filters = *:S python:D
