@@ -518,19 +518,40 @@ class WebViewEngine:
                     self._cb = _Callback()
                     self.wv = wv
 
-                    # 等页面加载完再注入宿主
+                    # 等页面加载完再注入宿主。
+                    # 关键：注入后不能直接认为就绪 —— 要在后台线程里真正去问
+                    # WebView「lx 存在吗」，确认宿主可用再回调。
+                    # 而且 on_ready 也必须在后台线程触发：后续 load_source 需要
+                    # 同步等 JS 结果，在 UI 线程等会死锁（见 _eval_sync 说明）。
+                    def _verify_host():
+                        for _ in range(30):          # 最多约 9 秒
+                            try:
+                                v = self._eval_sync("typeof lx", timeout=3)
+                            except Exception:
+                                v = None
+                            if v and "object" in str(v):
+                                self.ready = True
+                                print("WebView 宿主就绪")
+                                if on_ready:
+                                    on_ready(True)
+                                return
+                            time.sleep(0.3)
+                        print("WebView 宿主未就绪（typeof lx 一直不是 object）")
+                        self.ready = False
+                        if on_ready:
+                            on_ready(False)
+
                     def _inject(dt):
                         try:
                             self.wv.evaluateJavascript(LX_HOST_JS, self._cb)
-                            self.ready = True
-                            if on_ready:
-                                on_ready(True)
                         except Exception as e:
                             print("注入宿主失败:", e)
                             if on_ready:
                                 on_ready(False)
+                            return
+                        threading.Thread(target=_verify_host, daemon=True).start()
 
-                    Clock.schedule_once(safe_cb(_inject), 1.2)
+                    Clock.schedule_once(safe_cb(_inject), 1.0)
                 except Exception as e:
                     print("创建 WebView 失败:", e)
                     if on_ready:
@@ -918,11 +939,15 @@ class DownloaderApp(App):
         self.pb = ProgressBar(max=100, size_hint_y=None, height=dp(6))
         footer.add_widget(self.pb)
 
-        self.log = Label(text="正在启动…", size_hint_y=None, height=dp(34),
-                         font_size=dp(12), color=C_DIM,
-                         halign="left", valign="middle", **F)
-        self.log.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
-        footer.add_widget(self.log)
+        # 状态栏标签。注意：它必须叫 self.status —— set_status() 写的是这个名字。
+        # （之前重做界面时命名成 self.log，导致 set_status 静默失败，
+        #   界面上永远显示"正在启动…"，看起来就像卡死了。）
+        self.status = Label(text="正在启动…", size_hint_y=None, height=dp(34),
+                            font_size=dp(12), color=C_DIM,
+                            halign="left", valign="middle", **F)
+        self.status.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        self.log = self.status        # 兼容旧命名
+        footer.add_widget(self.status)
         root.add_widget(footer)
 
         Clock.schedule_once(safe_cb(self._boot), 0.3)
@@ -960,38 +985,48 @@ class DownloaderApp(App):
     # ---------- 启动 ----------
     def _boot(self, dt):
         try:
-            request_storage_permission()
+            # 注意：不要在这里请求「所有文件访问」—— 那会跳系统设置页，
+            # 用户会以为 App 卡住了。改到真正要下载时再请求（见 _ensure_dir）。
+            self.set_status("正在启动 JS 引擎...")
             extract_default_source()
             if IS_ANDROID:
                 self.engine.start(on_ready=self._on_engine_ready)
             else:
                 # 桌面调试：用内置的 dukpy 引擎
-                self._on_engine_ready(True)
+                threading.Thread(
+                    target=lambda: self._on_engine_ready(True),
+                    daemon=True).start()
         except Exception as e:
             self.set_status("启动失败: %s" % e)
             print("_boot 异常:", traceback.format_exc())
 
     def _on_engine_ready(self, ok):
-        # 这个回调从 UI 线程的 WebView 流程里调过来，必须全包住
+        """引擎就绪回调。
+
+        不管 ok 与否，加载音源都必须在「后台线程」做 —— 因为
+        WebViewEngine.load_source 要同步等 JS 结果（_eval_sync），
+        在主线程等会把事件循环堵死（历史上就是点搜索闪退的原因）。
+        """
         try:
             if not ok:
-                # WebView 失败 → 放后台线程试纯 Python 引擎，别卡死 UI
                 self.set_status("WebView 不可用，尝试备用引擎...")
-
-                def _bg():
-                    try:
-                        self.load_source(DEFAULT_SCRIPT)
-                    except Exception as e:
-                        print("备用引擎失败:", e)
-                        Clock.schedule_once(safe_cb(lambda dt: self.set_status("引擎不可用: %s" % e)), 0)
-
-                threading.Thread(target=_bg, daemon=True).start()
-                return
-            self.set_status("引擎就绪，加载音源...")
-            self.load_source(DEFAULT_SCRIPT)
+            else:
+                self.set_status("引擎就绪，加载音源...")
+            self.load_source_async(DEFAULT_SCRIPT)
         except Exception as e:
             self.set_status("引擎初始化出错: %s" % e)
             print("_on_engine_ready 异常:", traceback.format_exc())
+
+    def load_source_async(self, path):
+        """在后台线程加载音源（界面更新由 load_source 内部转回主线程）"""
+        def _bg():
+            try:
+                self.load_source(path)
+            except Exception as e:
+                print("加载音源失败:", e)
+                Clock.schedule_once(
+                    safe_cb(lambda dt: self.set_status("加载音源失败: %s" % e)), 0)
+        threading.Thread(target=_bg, daemon=True).start()
 
     def load_source(self, path):
         try:
@@ -1021,12 +1056,25 @@ class DownloaderApp(App):
             self.sources.append({"source": key, "name": v.get("name", key),
                                  "qualitys": v.get("qualitys") or []})
             labels.append("%s (%s)" % (PLATFORM_LABEL.get(key, key), key))
-        self.sp_source.values = labels
-        if labels:
-            self.sp_source.text = labels[0]
         meta = info.get("meta") or {}
-        self.set_status("✓ 音源: %s v%s · %d 个平台"
-                        % (meta.get("name", "?"), meta.get("version", "?"), len(labels)))
+        ctx = {
+            "name": meta.get("name", "?"),
+            "version": meta.get("version", "?"),
+            "n": len(labels),
+        }
+
+        def _apply(dt):
+            # Kivy 控件只能在主线程碰，这里从后台线程转回来
+            try:
+                self.sp_source.values = labels
+                if labels:
+                    self.sp_source.text = labels[0]
+                self.set_status("✓ 音源: %s v%s · %d 个平台"
+                                % (ctx["name"], ctx["version"], ctx["n"]))
+            except Exception as e:
+                print("刷新平台列表失败:", e)
+
+        Clock.schedule_once(safe_cb(_apply), 0)
 
     def pick_source_file(self, *_):
         """从手机里选新的音源 .js 文件"""
@@ -1058,7 +1106,9 @@ class DownloaderApp(App):
                             raise RuntimeError("文件内容过短，可能不是音源")
                         with open(DEFAULT_SCRIPT, "w", encoding="utf-8") as f:
                             f.write(code)
-                        Clock.schedule_once(safe_cb(lambda dt: app.load_source(DEFAULT_SCRIPT)), 0)
+                        # 同样必须在后台线程加载（要同步等 JS 结果）
+                        app.set_status("音源已保存，正在加载...")
+                        app.load_source_async(DEFAULT_SCRIPT)
                     except Exception as e:
                         msg = str(e)
                         Clock.schedule_once(safe_cb(lambda dt: app.set_status("读取音源失败: %s" % msg)), 0)
@@ -1206,6 +1256,16 @@ class DownloaderApp(App):
             ext = guess_ext(url, quality)
             base = safe_name("%s - %s" % (song["name"], song["singer"]))
             out_dir = get_download_dir()
+            if out_dir == PRIVATE_DOWNLOAD_DIR and IS_ANDROID \
+                    and not getattr(self, "_asked_perm", False):
+                # 公共目录不可写 -> 只在「真的要下载」时申请一次权限，
+                # 避免一启动就跳系统设置页（用户会以为 App 卡死）
+                self._asked_perm = True
+                Clock.schedule_once(safe_cb(lambda dt: (
+                    self.set_status("提示：授权「所有文件访问」后，"
+                                    "文件会存到 Download/落雪音源；"
+                                    "不授权也能下，只是存到 App 私有目录"),
+                    request_storage_permission())), 0)
             try:
                 os.makedirs(out_dir, exist_ok=True)
             except OSError:
@@ -1235,8 +1295,21 @@ class DownloaderApp(App):
                            os.path.dirname(path)))
 
     def set_status(self, txt):
+        """线程安全：从后台线程调用时自动转回主线程再改 Label"""
+        txt = str(txt)
+
+        def _set(dt):
+            try:
+                self.status.text = txt
+            except Exception as e:
+                # 不要静默吞掉：命名写错时状态栏会永远不更新，极难排查
+                print("set_status 失败（状态栏未更新）:", e)
+
         try:
-            self.status.text = str(txt)
+            if threading.current_thread() is threading.main_thread():
+                _set(0)
+            else:
+                Clock.schedule_once(safe_cb(_set), 0)
         except Exception:
             pass
 

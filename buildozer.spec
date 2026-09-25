@@ -9,7 +9,7 @@ source.include_exts = py,png,jpg,kv,atlas,js,json
 # 内置默认音源（用户也能在 App 里换）
 source.include_patterns = assets/*, sources/*
 
-version = 1.0.2
+version = 1.0.3
 
 # 只用 kivy（不锁版本）。锁 kivy==2.3.x 会拉 thorvg 依赖，
 # 其 recipe 在 NDK r25b 下 glob() 返回空 -> IndexError 导致编译失败。

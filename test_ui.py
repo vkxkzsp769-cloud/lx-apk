@@ -14,6 +14,8 @@
 """
 import os
 import sys
+import threading
+import time
 import traceback
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
@@ -101,6 +103,92 @@ def test_runtime(app):
     check("get_download_dir", lambda: print("         -> %s" % M.get_download_dir()))
 
 
+def test_threading_contract():
+    """回归：加载音源必须在后台线程跑。
+
+    WebViewEngine.load_source 内部要同步等 JS 结果（_eval_sync），
+    在主线程调用会把 Kivy 事件循环堵死 —— 这正是「音源一直加载不出来」
+    和历史上「点搜索闪退」的根因。
+    """
+    app = M.DownloaderApp()
+    app.build()
+
+    rec = {}
+
+    class FakeEngine:
+        def load_source(self, code):
+            rec["thread"] = threading.current_thread().name
+            rec["is_main"] = (threading.current_thread()
+                              is threading.main_thread())
+            return True, {
+                "meta": {"name": "测试音源", "version": "9.9"},
+                "sources": {"wy": {"name": "网易云", "qualitys": ["320k"]}},
+            }
+
+    app.engine = FakeEngine()
+
+    tmp = os.path.join(HERE, "_threadtest.js")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("// 占位音源\n")
+
+    done = threading.Event()
+    inner = app.load_source
+
+    def wrapped(path):
+        try:
+            inner(path)
+        finally:
+            done.set()
+
+    app.load_source = wrapped
+    app.load_source_async(tmp)
+    ok = done.wait(10)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+
+    if not ok:
+        raise AssertionError("load_source 10 秒内没跑完")
+    print("  实际执行线程: %s (主线程=%s)"
+          % (rec.get("thread"), rec.get("is_main")))
+    if rec.get("is_main"):
+        raise AssertionError("load_source 在主线程执行了！会堵死事件循环")
+
+    # 让 Clock 回调跑一下，确认平台列表真的刷新了
+    try:
+        Clock.tick()
+    except Exception:
+        pass
+    print("  平台下拉 = %s" % (app.sp_source.values,))
+    if app.sp_source.values != ["网易云 (wy)"]:
+        raise AssertionError("平台列表没刷新: %s" % (app.sp_source.values,))
+
+
+def test_worker_status_safe():
+    """回归：从后台线程调 set_status 不能抛异常。"""
+    app = M.DownloaderApp()
+    app.build()
+    err = []
+
+    def work():
+        try:
+            app.set_status("来自后台线程的消息")
+        except Exception as e:
+            err.append(e)
+
+    t = threading.Thread(target=work)
+    t.start()
+    t.join(5)
+    if err:
+        raise AssertionError("后台线程调用 set_status 抛异常: %s" % err[0])
+    try:
+        Clock.tick()
+    except Exception:
+        pass
+    print("  状态栏 = %r" % app.status.text)
+
+
 def test_no_invalid_kwargs():
     """回归：canvas_before 不是 Kivy 属性，当构造参数传会导致启动即崩。"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -139,7 +227,11 @@ def main():
     else:
         print("  [SKIP] build 失败")
 
-    print("[4] 静态检查")
+    print("[4] 线程契约（音源加载不能在主线程）")
+    check("load_source 在后台线程执行", test_threading_contract)
+    check("后台线程 set_status 安全", test_worker_status_safe)
+
+    print("[5] 静态检查")
     check("canvas_before 回归", test_no_invalid_kwargs)
 
     print()
