@@ -158,6 +158,22 @@ jobs:
 
       - name: 编译 APK
         run: |
+          # ---- 固定签名密钥：让每个版本的 APK 签名一致，才能覆盖安装 ----
+          # 密钥随仓库走（signing/keystore.b64），不依赖 Secret。
+          # 必须走 release 构建：只有 release 才用 p4a 的 P4A_RELEASE_*
+          # 这套显式密钥（见 p4a 源码 pythonforandroid/build.py 里
+          # --keystore/--signkey/--keystorepw/--signkeypw 的映射）。
+          # debug 构建用的是 AGP 自动生成的 debug 钥匙，CI 每次全新环境都会
+          # 重新生成 —— 实测两次构建的 CERT.RSA sha256 不同、连长度都不同
+          # （1019B vs 1015B），Android 因此只允许先卸载再装。
+          KS="$RUNNER_TEMP/lx-sign.keystore"
+          base64 -d signing/keystore.b64 > "$KS"
+          export P4A_RELEASE_KEYSTORE="$KS"
+          export P4A_RELEASE_KEYALIAS=lxsign
+          export P4A_RELEASE_KEYSTORE_PASSWD=android
+          export P4A_RELEASE_KEYALIAS_PASSWD=android
+          keytool -list -keystore "$KS" -storepass android -alias lxsign | tail -3
+
           # 注意：不要用 `yes | buildozer`。buildozer 正常跑完后 yes 仍写入，
           # 触发 SIGPIPE 让管道返回 1，步骤被判失败（尽管 APK 已生成）。
           set +e
