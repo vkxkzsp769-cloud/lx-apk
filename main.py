@@ -37,6 +37,7 @@ from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.textinput import TextInput
 
 import appenv
+import bgfx
 import downloader
 import fonts
 import searchers
@@ -54,7 +55,7 @@ from lxbridge import LxBridge
 #  主题
 # ============================================================
 C_BG = (0.082, 0.094, 0.118, 1)      # 页面底色
-C_CARD = (0.129, 0.145, 0.180, 1)    # 卡片
+C_CARD = (0.129, 0.145, 0.180, 0.86)  # 卡片（半透明，让动态背景透出来）
 C_CTRL = (0.192, 0.212, 0.259, 1)    # 输入/下拉
 C_ITEM = (0.153, 0.173, 0.212, 1)    # 列表项
 C_ACCENT = (0.290, 0.560, 0.950, 1)  # 强调蓝
@@ -196,10 +197,21 @@ class FlatButton(Button):
         self._bg_shape.pos = self.pos
         self._bg_shape.size = self.size
 
-    def on_bg_color(self, *_):
+    def _apply_bg(self):
         c = getattr(self, "_bg_color", None)
-        if c is not None:
-            c.rgba = self.bg_color
+        if c is None:
+            return
+        r, g, b, a = self.bg_color
+        # 按下时压暗一点。原来 background_normal/down 都设成空串，
+        # 于是按钮**完全没有触摸反馈**，点下去像没反应。
+        k = 0.78 if self.state == "down" else 1.0
+        c.rgba = (r * k, g * k, b * k, a)
+
+    def on_bg_color(self, *_):
+        self._apply_bg()
+
+    def on_state(self, *_):
+        self._apply_bg()
 
 
 class SearchInput(TextInput):
@@ -254,6 +266,14 @@ class LxApp(App):
 
         root = BoxLayout(orientation="vertical")
         attach_bg(root, C_BG)
+        # 动态背景必须在 attach_bg 之后建：canvas.before 里按插入顺序绘制，
+        # 光斑要压在底色之上、卡片之下（卡片半透明，光斑会透出来）。
+        # 兜底：背景只是装饰，建不起来也绝不能拦住 App 启动。
+        try:
+            self.bgfx = bgfx.MusicBackground(root)
+        except Exception:
+            log_exc("创建动态背景")
+            self.bgfx = None
 
         root.add_widget(self._build_header())
         root.add_widget(self._build_panel())
@@ -945,8 +965,9 @@ class LxApp(App):
             row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(6))
             # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
             song_btn = FlatButton(
-                text="%s\n%s    %s"
-                     % (s["name"], s["singer"], s.get("interval") or "--:--"),
+                text="%d. %s\n%s    %s"
+                     % (i + 1, s["name"], s["singer"],
+                        s.get("interval") or "--:--"),
                 halign="left", valign="middle", font_size=dp(13),
                 color=C_TEXT, bg_color=C_ITEM, radius=10, **self.F)
             song_btn.bind(size=lambda b, v: setattr(b, "text_size",
@@ -1305,6 +1326,17 @@ class LxApp(App):
             self._popup.dismiss()
         self.player.play(self._cur_url, on_event=self._on_player_event)
         self.btn_play.text = "暂停"
+        self._bg_playing(True)
+
+    def _bg_playing(self, on):
+        """把播放状态同步给动态背景（没建背景时静默跳过）"""
+        fx = getattr(self, "bgfx", None)
+        if fx is None:
+            return
+        try:
+            fx.set_playing(on)
+        except Exception:
+            log_exc("bgfx.set_playing")
 
     def _on_player_event(self, kind, payload):
         """播放器回调（后台线程）"""
@@ -1328,6 +1360,7 @@ class LxApp(App):
 
     def _player_error(self, msg):
         self.btn_play.text = "播放"
+        self._bg_playing(False)
         self.set_status("播放失败: %s" % msg, C_ERR)
 
     def toggle_play(self):
@@ -1336,8 +1369,9 @@ class LxApp(App):
                 self.play_current()
                 return
             self.player.toggle()
-            self.btn_play.text = ("暂停" if self.player.state
-                              == player_mod.Player.PLAYING else "播放")
+            playing = self.player.state == player_mod.Player.PLAYING
+            self.btn_play.text = "暂停" if playing else "播放"
+            self._bg_playing(playing)
         except Exception as e:
             log_exc("toggle_play")
             self.set_status("播放控制失败: %s" % e, C_ERR)
@@ -1374,6 +1408,7 @@ class LxApp(App):
 
     def _player_finished(self):
         self.btn_play.text = "播放"
+        self._bg_playing(False)
         self.slider.value = 0
         self.lbl_time.text = "00:00 / 00:00"
         self.set_status("播放结束")

@@ -894,6 +894,34 @@ def test_download_unique_path():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_bgfx_wired_with_fallback():
+    """动态背景：模块接口齐全，且**建不起来也不能拦住 App 启动**。
+
+    这里没法真建它（要 Kivy 画布/窗口），但至少要守住三件事：
+      * bgfx 模块能导入（import 写错会在真机启动时直接炸）
+      * MusicBackground 的接口还在（播放状态同步靠 set_playing）
+      * main.build() 里创建背景那段有 try/except 兜底 ——
+        背景只是装饰，绝不能因为它让整个 App 起不来
+    """
+    import bgfx
+
+    if not hasattr(bgfx, "MusicBackground"):
+        raise AssertionError("bgfx.MusicBackground 不存在")
+    for name in ("set_playing", "_step", "_place", "_layout", "_start", "_stop"):
+        if not hasattr(bgfx.MusicBackground, name):
+            raise AssertionError("MusicBackground 缺方法 %s" % name)
+
+    src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
+    if "bgfx.MusicBackground(" not in src:
+        raise AssertionError("main.py 没接上动态背景")
+    if "创建动态背景" not in src:
+        raise AssertionError("main.py 没给创建背景加兜底 —— "
+                             "背景建不起来会直接把 App 拖死")
+    if "def _bg_playing" not in src:
+        raise AssertionError("没有把播放状态同步给背景的入口")
+    print("  bgfx 接口齐全 + build 有兜底 + 播放状态已接线 ✓")
+
+
 def test_netease_paging():
     """回归：搜索必须能分页，且要识别接口限流。
 
@@ -1442,6 +1470,7 @@ def main():
     check("下载不被 exists/remove 不一致搞挂", test_download_survives_exists_lie)
     check("同名文件自动顺延不覆盖", test_download_unique_path)
     check("播放器瞬时错误延后确认", test_player_transient_error_deferred)
+    check("动态背景接线 + 启动兜底", test_bgfx_wired_with_fallback)
     check("搜索分页 + 限流识别", test_netease_paging)
     check("内置多个音源", test_bundled_sources)
     check("5 个平台搜索都注册", test_searchers_registry)
