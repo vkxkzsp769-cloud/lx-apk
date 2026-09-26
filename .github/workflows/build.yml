@@ -161,7 +161,7 @@ jobs:
           # 注意：不要用 `yes | buildozer`。buildozer 正常跑完后 yes 仍写入，
           # 触发 SIGPIPE 让管道返回 1，步骤被判失败（尽管 APK 已生成）。
           set +e
-          buildozer -v android debug > build.log 2>&1
+          buildozer -v android release > build.log 2>&1
           RC=$?
           tail -50 build.log
           echo "buildozer 退出码: $RC"
