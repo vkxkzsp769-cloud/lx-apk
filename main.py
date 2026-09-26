@@ -235,6 +235,34 @@ def attach_bg(widget, color, radius=0):
     return widget
 
 
+def grad_buffer(c1, c2, size=64, horizontal=True):
+    """按 colorfmt='rgb' 生成渐变像素缓冲。
+
+    抽出来是为了能**在没有 GL 的机器上验证字节数** ——
+    贴图本身要 Texture.create（要 GL），但缓冲区长度对不对是纯算术。
+
+    ⚠ 这里踩过一个坑：colorfmt="rgb" 是**每像素 3 字节**，
+    但最初写成 `bytes(px + (255,))` 往每像素塞了 4 字节 ——
+    长度对不上，纹理读进去就是错位数据，整片渐变色乱掉
+    （用户看到的就是「界面颜色乱了」）。所以断言里要卡死字节数。
+    """
+    per_px = 3
+    out = bytearray()
+    for i in range(size):
+        t = i / float(size - 1)
+        px = bytes(int(255 * (c1[k] + (c2[k] - c1[k]) * t)) for k in range(3))
+        if len(px) != per_px:                     # 自检，防止再写回 4 字节
+            raise AssertionError("每像素必须是 %d 字节，实际 %d" % (per_px, len(px)))
+        # 横向贴图是 size×1（每行 1 像素，共 size 个像素）；
+        # 竖向贴图是 1×size（每行也只有 1 个像素，共 size 行）——
+        # 两种情况**都是** size 个像素，所以都是直接追加一个像素，不能乘 size。
+        out += px
+    expect = (size * 1 if horizontal else 1 * size) * per_px
+    if len(out) != expect:
+        raise AssertionError("缓冲长度 %d 不等于 w*h*3=%d" % (len(out), expect))
+    return bytes(out)
+
+
 def make_grad_texture(c1, c2, size=64, horizontal=True):
     """生成两端渐变的贴图（供胶囊按钮 / 进度条用）。
 
@@ -242,18 +270,10 @@ def make_grad_texture(c1, c2, size=64, horizontal=True):
     自己算一张小贴图拉伸，是唯一能做出渐变的路子。
     """
     from kivy.graphics.texture import Texture
-    buf = bytearray()
-    for i in range(size):
-        t = i / float(size - 1)
-        px = tuple(int(255 * (c1[k] + (c2[k] - c1[k]) * t)) for k in range(3))
-        if horizontal:
-            buf += bytes(px + (255,))
-        else:
-            # 竖着来：每行同色，重复 size 次构成方阵
-            buf += bytes(px + (255,)) * size
-    tex = Texture.create(size=(size, 1) if horizontal else (1, size),
-                         colorfmt="rgb")
-    tex.blit_buffer(bytes(buf), colorfmt="rgb", bufferfmt="ubyte")
+    dims = (size, 1) if horizontal else (1, size)
+    tex = Texture.create(size=dims, colorfmt="rgb")
+    tex.blit_buffer(grad_buffer(c1, c2, size, horizontal),
+                    colorfmt="rgb", bufferfmt="ubyte")
     tex.wrap = "clamp_to_edge"
     tex.mag_filter = "linear"
     tex.min_filter = "linear"
@@ -367,6 +387,11 @@ class FlatButton(Button):
     def _apply_bg(self):
         c = getattr(self, "_bg_color", None)
         if c is None:
+            return
+        # 渐变按钮：纯色底已经被 attach_gradient 压成全透明，
+        # 这里**不能**再按 bg_color 画回来 —— 否则一按下去就会冒出一块
+        # 灰蓝纯色盖住渐变（用户反馈「颜色乱了」的原因之一）。
+        if getattr(self, "_grad_shape", None) is not None:
             return
         r, g, b, a = self.bg_color
         # 按下时压暗一点。原来 background_normal/down 都设成空串，

@@ -966,6 +966,56 @@ def test_bgfx_wired_with_fallback():
           % (mid, worst))
 
 
+def test_gradient_buffer_size():
+    """回归：渐变缓冲必须按 colorfmt='rgb' 的 3 字节/像素打包。
+
+    用户反馈「界面和文字颜色乱了」。查到一个确凿根因：
+    make_grad_texture 把贴图声明成 colorfmt="rgb"（每像素 3 字节），
+    却往缓冲区塞了 4 字节/像素（`bytes(px + (255,))`）——
+    长度对不上，纹理读进去就是错位数据，**整片渐变色乱掉**。
+    搜索键是界面里唯一用渐变的地方。
+
+    贴图本身要 GL 建不出来，但缓冲区长度的算术是纯 Python，这里能卡死。
+    """
+    import main as M
+
+    for horizontal in (True, False):
+        for size in (16, 64):
+            buf = M.grad_buffer((0.1, 0.2, 0.3), (0.9, 0.8, 0.7), size, horizontal)
+            expect = size * 3
+            if len(buf) != expect:
+                raise AssertionError(
+                    "horizontal=%s size=%d 缓冲长度 %d ≠ w*h*3=%d"
+                    % (horizontal, size, len(buf), expect))
+
+    # 顺带证明这条测试是有意义的：老写法（4 字节/像素）必然对不上
+    size = 64
+    old_len = size * 4
+    if old_len == size * 3:
+        raise AssertionError("前提不成立：两种打包长度竟然相等")
+    print("  渐变缓冲 %d 字节/行（rgb 3 字节/像素）✓  老写法会多出 %d 字节"
+          % (size * 3, old_len - size * 3))
+
+
+def test_theme_palette_consistent():
+    """回归：背景渐变底必须和主主题同一色系，别一个发蓝一个发灰。
+
+    上一版把主题换成了中性深灰 #0F0F11，但 bgfx 的渐变底还是旧的偏蓝配色
+    (0.055,0.065,0.090) —— 背景发蓝、卡片发灰，看起来就是「颜色乱了」。
+    这里卡住：背景渐变的两个端点都必须是中性的（R≈G≈B）。
+    """
+    import bgfx
+    for name in ("BG_TOP", "BG_BOTTOM"):
+        c = getattr(bgfx.MusicBackground, name)
+        r, g, b = c[0], c[1], c[2]
+        # 中性灰的判据：通道间差异极小（旧的偏蓝配色 B-R ≈ 0.035，会被抓到）
+        drift = max(r, g, b) - min(r, g, b)
+        if drift > 0.02:
+            raise AssertionError(
+                "%s=%s 不是中性灰（通道差 %.3f），会和主主题撞色" % (name, c[:3], drift))
+    print("  背景渐变底是中性灰，与主题一致 ✓")
+
+
 def test_netease_paging():
     """回归：搜索必须能分页，且要识别接口限流。
 
@@ -1515,6 +1565,8 @@ def main():
     check("同名文件自动顺延不覆盖", test_download_unique_path)
     check("播放器瞬时错误延后确认", test_player_transient_error_deferred)
     check("动态背景接线 + 启动兜底", test_bgfx_wired_with_fallback)
+    check("渐变缓冲字节数", test_gradient_buffer_size)
+    check("背景与主题同色系", test_theme_palette_consistent)
     check("搜索分页 + 限流识别", test_netease_paging)
     check("内置多个音源", test_bundled_sources)
     check("5 个平台搜索都注册", test_searchers_registry)

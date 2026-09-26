@@ -12,7 +12,7 @@ source.include_patterns = assets/*, assets/sources/*, assets/fonts/*, sources/*
 # 桌面专用的调试工具不进 APK（它们依赖 dukpy，Android 上没有这个 recipe）
 source.exclude_patterns = test_desktop.py, lx_engine.py, test_ui.py, tests/*
 
-version = 2.7.0
+version = 2.7.1
 
 # release 模式打包成 apk 而不是 aab。
 # buildozer 官方默认 `android.release_artifact = aab`（见 buildozer/
