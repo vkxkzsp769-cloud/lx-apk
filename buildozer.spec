@@ -4,15 +4,15 @@ package.name = lxdownloader
 package.domain = com.lxdl
 
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,js,json
+source.include_exts = py,png,jpg,kv,atlas,js,json,otf,ttf
 
 # 内置默认音源（用户也能在 App 里换）
-source.include_patterns = assets/*, assets/sources/*, sources/*
+source.include_patterns = assets/*, assets/sources/*, assets/fonts/*, sources/*
 
 # 桌面专用的调试工具不进 APK（它们依赖 dukpy，Android 上没有这个 recipe）
 source.exclude_patterns = test_desktop.py, lx_engine.py, test_ui.py, tests/*
 
-version = 2.3.1
+version = 2.4.0
 
 # 只用 kivy（不锁版本）。锁 kivy==2.3.x 会拉 thorvg 依赖，
 # 其 recipe 在 NDK r25b 下 glob() 返回空 -> IndexError 导致编译失败。

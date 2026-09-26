@@ -641,6 +641,65 @@ def test_source_dropdown_lists_files():
     print("  音源/平台两个下拉各司其职 ✓")
 
 
+def test_bundled_font_preferred():
+    """回归：必须优先用自带的简体中文字体。
+
+    很多机器的 /system/fonts/NotoSansCJK-Regular.ttc 里
+    face[0] 是 Noto Sans CJK **JP**（日文），而 Kivy 的 SDL_ttf
+    只会打开 face 0 -> 中文用日文字形渲染，就是「中文字符显示错误」。
+    （实测该 ttc 有 10 个 face，SC 在 face[2]。）
+    所以 APK 自带一份裁剪过的 SC 字体（1.5MB），并优先使用。
+    """
+    import fonts
+    path = fonts.BUNDLED_FONT
+    if not os.path.exists(path):
+        raise AssertionError("自带字体不存在: %s" % path)
+    size = os.path.getsize(path)
+    print("  自带字体: %s (%.2f MB)" % (os.path.basename(path), size / 1048576))
+    if size > 4 * 1024 * 1024:
+        raise AssertionError("自带字体太大（%.1f MB），会明显撑大 APK"
+                             % (size / 1048576))
+
+    fonts._registered_path = None
+    if not fonts.register():
+        raise AssertionError("字体注册失败")
+    if fonts._registered_path != path:
+        raise AssertionError("没有优先用自带字体，实际用了 %s"
+                             % fonts._registered_path)
+    print("  优先选用自带字体 ✓")
+
+
+def test_download_referer():
+    """回归：下载要带平台 Referer。
+
+    症状：QQ音乐能在线播放（播放器自带来源），但下载失败 ——
+    CDN 缺 Referer 会返回 403/空内容。现在会带 Referer，
+    失败还会换一组头重试。
+    """
+    import downloader as D
+    cases = [
+        ("https://dl.stream.qqmusic.qq.com/x.mp3", "tx", "https://y.qq.com/"),
+        ("http://car-er.kuwo.cn/x.mp3", "kg", "https://www.kugou.com/"),
+        ("https://iot102.music.126.net/x.mp3", None, "https://music.163.com/"),
+        ("https://x.migu.cn/a.mp3", None, "https://music.migu.cn/"),
+    ]
+    for url, plat, want in cases:
+        got = D._referer_for(url, plat)
+        if got != want:
+            raise AssertionError("%s(%s) -> %s，应为 %s"
+                                 % (url[:30], plat, got, want))
+    if D._referer_for("https://unknown.cdn/a.mp3") is not None:
+        raise AssertionError("未知主机不该硬塞 Referer")
+    # 带 Referer 的头要真的出现在请求头里
+    h = D._headers_for("https://dl.stream.qqmusic.qq.com/x.mp3", "tx")
+    if h.get("Referer") != "https://y.qq.com/":
+        raise AssertionError("请求头里没有 Referer: %s" % h)
+    # 无 Referer 的一组也要能构造出来（用于重试）
+    if "Referer" in D._plain_headers():
+        raise AssertionError("备用头不该带 Referer")
+    print("  平台/主机 Referer 推断 + 备用头 ✓")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -694,6 +753,8 @@ def main():
     check("内置多个音源", test_bundled_sources)
     check("5 个平台搜索都注册", test_searchers_registry)
     check("音源下拉列出文件", test_source_dropdown_lists_files)
+    check("优先用自带简体字体", test_bundled_font_preferred)
+    check("下载带平台 Referer", test_download_referer)
 
     print()
     if FAILS:

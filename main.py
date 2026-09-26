@@ -938,9 +938,10 @@ class LxApp(App):
         ext = self._cur_ext or "mp3"
         self.pb.value = 0
         self.set_status("准备下载: %s" % song.get("name", ""))
-        self.bg(lambda: self._download_url(song, url, ext), "download")
+        plat = (self._cur_song or {}).get("platform") or self._current_source()
+        self.bg(lambda: self._download_url(song, url, ext, plat), "download")
 
-    def _download_url(self, song, url, ext):
+    def _download_url(self, song, url, ext, platform=None):
         try:
             out_dir = download_dir()
             if not appenv.using_public_dir() and IS_ANDROID \
@@ -959,7 +960,8 @@ class LxApp(App):
             def on_progress(got, total):
                 self.ui(lambda: self._progress(got, total, song.get("name", "")))
 
-            size = downloader.download(url, dest, on_progress=on_progress)
+            size = downloader.download(url, dest, on_progress=on_progress,
+                                       platform=platform)
             self.ui(lambda: self._download_done(dest, size))
         except Exception as e:
             msg = str(e)
