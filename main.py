@@ -33,6 +33,7 @@ from kivy.uix.popup import Popup
 from kivy.uix.progressbar import ProgressBar
 from kivy.uix.slider import Slider
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.dropdown import DropDown
 from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.textinput import TextInput
 
@@ -93,23 +94,63 @@ def fmt_time(sec):
 class CNSpinnerOption(SpinnerOption):
     """下拉列表项。
 
-    Spinner 的选项项默认**不带** font_name，展开后中文会显示成方块。
-    在创建时就把字体传进去最稳 —— 之前在 _create_dropdown 之后
-    再遍历容器补字体，时机并不可靠（选项可能是稍后才填进容器的，
-    那时遍历到的是空容器，等于没补）。
+    Spinner 的选项项默认是 Kivy 自带的灰底渐变按钮 —— 就是用户说的
+    「像老安卓」。这里换成和界面一致的深色圆角行 + 中文字体 + 左对齐。
+
+    两个坑：
+      * 选项项**不会**继承 Spinner 的字体，不传就是方块
+      * Spinner._update_dropdown_size 会把每项高度强制设成 Spinner 的高度，
+        所以高度不用自己定，但 size_hint_y 必须是 None
+
+    背景用 attach_bg() 而不是继承 FlatButton —— 后者定义在本类之后，
+    写在基类位置上会在 import 时就 NameError。
     """
 
     def __init__(self, **kw):
         for k, v in fonts.font_kwargs().items():
             kw.setdefault(k, v)
+        kw.setdefault("background_normal", "")      # 关掉默认灰底贴图
+        kw.setdefault("background_down", "")
+        kw.setdefault("background_color", (0, 0, 0, 0))
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("halign", "left")
+        kw.setdefault("valign", "middle")
+        kw.setdefault("font_size", dp(14))
+        kw.setdefault("color", C_TEXT)
         super().__init__(**kw)
+        attach_bg(self, C_ITEM, radius=9)
+        self.bind(size=lambda b, v: setattr(b, "text_size", (v[0] - dp(22), None)))
+
+
+class CNDropdown(DropDown):
+    """下拉框本体。
+
+    默认 DropDown 是个裸 ScrollView + 裸 GridLayout：没有背景、没有留白、
+    还带一条滚动条，拉开就是一列灰色方块。这里给它铺上深色圆角底、
+    加内边距、隐藏滚动条，并限制最大高度（否则长列表会铺满整屏）。
+    """
+
+    def __init__(self, **kw):
+        kw.setdefault("max_height", dp(340))
+        kw.setdefault("bar_width", 0)          # 隐藏滚动条，靠留白区分
+        super().__init__(**kw)
+        try:
+            c = self.container
+            if c is not None:
+                c.padding = (dp(6), dp(6))
+                c.spacing = dp(2)
+                attach_bg(c, C_CARD, radius=12)
+        except Exception:
+            log_exc("CNDropdown 背景")
 
 
 class CNSpinner(Spinner):
-    """下拉框。做两件事：
+    """下拉框。做三件事：
 
-    1) 下拉列表项不会继承 font_name，中文会显示成方块 —— 创建下拉后统一下发。
-    2) Kivy 的 Spinner 默认用灰底贴图，跟这套深色主题不搭，
+    1) 下拉列表项不会继承 font_name，中文会显示成方块 —— 用 option_cls
+       在创建时就带上字体。
+    2) 默认的下拉外观是「老安卓」风格 —— 换成 dropdown_cls + 深色圆角。
+    3) Kivy 的 Spinner 默认用灰底贴图，跟这套深色主题不搭，
        所以关掉贴图改用纯色（background_normal=""）。
 
     注意：不要重新声明 font_name！
@@ -126,25 +167,9 @@ class CNSpinner(Spinner):
         kw.setdefault("background_down", "")
         kw.setdefault("background_color", C_CTRL)
         kw.setdefault("color", C_TEXT)
-        kw.setdefault("option_cls", CNSpinnerOption)   # 下拉项在创建时就带中文字体
+        kw.setdefault("option_cls", CNSpinnerOption)   # 下拉项：深色圆角 + 中文字体
+        kw.setdefault("dropdown_cls", CNDropdown)      # 下拉框：深色圆角 + 留白
         super().__init__(**kw)
-
-    def _create_dropdown(self, *largs):
-        super()._create_dropdown(*largs)
-        self._apply_font()
-
-    def _apply_font(self):
-        dd = getattr(self, "_dropdown", None)
-        if dd is None or not self.font_name:
-            return
-        try:
-            for child in dd.container.children:
-                if hasattr(child, "font_name"):
-                    child.font_name = self.font_name
-                    if hasattr(child, "halign"):
-                        child.halign = "left"
-        except Exception:
-            log_exc("CNSpinner 下拉字体")
 
 
 def attach_bg(widget, color, radius=0):

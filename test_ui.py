@@ -541,10 +541,17 @@ def test_all_widgets_use_cn_font():
 
 
 def test_spinner_dropdown_font():
-    """回归：Spinner **展开后**的列表项也要带中文字体。
+    """回归：Spinner **展开后**的列表项也要带中文字体 + 深色样式。
 
-    SpinnerOption 默认没有 font_name —— 收起时显示正常，一展开全是方块，
-    所以肉眼很容易漏。现在通过 option_cls 在创建时就带上字体。
+    这个坑很隐蔽，记一下来龙去脉：
+      * SpinnerOption 默认不带 font_name —— 收起时正常，一展开全是方块
+      * 原来的「修法」是重写 Spinner._create_dropdown 往选项上补字体，
+        但 **Kivy 的 Spinner 根本没有 _create_dropdown 这个方法** ——
+        那段代码从来没被执行过，等于没修（死代码）
+      * 现在改用 option_cls 在创建时就带上，走的是 Kivy 真正会调用的路径
+
+    所以这里**不能**再去调 _create_dropdown（那只是自欺欺人），
+    必须走 Kivy 真实的构建路径 _build_dropdown()。
     """
     fonts.register()
     if not fonts._registered_path:
@@ -559,29 +566,33 @@ def test_spinner_dropdown_font():
                     "tx": {"name": "QQ音乐", "qualitys": ["128k"]}}})
 
     sp = app.sp_platform
-    create = getattr(sp, "_create_dropdown", None)
-    if create is None:
-        print("  [SKIP] 该 Kivy 版本没有 _create_dropdown")
-        return
-    create()
-    dd = getattr(sp, "_dropdown", None)
-    if dd is None:
-        raise AssertionError("下拉没建起来")
+    if getattr(sp, "_dropdown", None) is None:
+        raise AssertionError("Spinner 没有建出下拉对象")
+    # 走真实路径重建一次，确保拿到的是实际会显示的那批选项
+    sp._build_dropdown()
+    dd = sp._dropdown
+    kids = list(getattr(dd.container, "children", []))
+    if not kids:
+        raise AssertionError("下拉里一个选项都没有，检查没意义")
 
     bad = []
-    kids = list(getattr(dd.container, "children", []))
     for child in kids:
         fn = getattr(child, "font_name", None)
         if fn != fonts.FONT_NAME:
             bad.append("%s(%r) font=%r"
-                       % (type(child).__name__,
-                          getattr(child, "text", ""), fn))
-    if not kids:
-        raise AssertionError("下拉里一个选项都没有，检查没意义")
+                       % (type(child).__name__, getattr(child, "text", ""), fn))
     if bad:
         raise AssertionError("下拉项没带中文字体，展开会是方块:\n      "
                              + "\n      ".join(bad))
-    print("  下拉 %d 个选项都带中文字体 ✓" % len(kids))
+
+    # 样式：不能再是 Kivy 默认的灰底贴图（那是「老安卓」观感的来源）
+    sample = kids[0]
+    if getattr(sample, "background_normal", None):
+        raise AssertionError("下拉项还在用默认灰色贴图: %r"
+                             % sample.background_normal)
+    if type(dd).__name__ != "CNDropdown":
+        raise AssertionError("下拉框没换成 CNDropdown: %s" % type(dd).__name__)
+    print("  下拉 %d 项都带中文字体 + 已换深色样式 ✓" % len(kids))
 
 
 def test_download_dir_setting():
