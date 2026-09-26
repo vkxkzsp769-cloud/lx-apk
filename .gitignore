@@ -12,6 +12,14 @@ bin/
 *.apk
 *.aab
 
+# 运行时产物（appenv 生成：内置音源解包目录 / 日志 / 设置 / 用户代理列表）
+# 这些是跑起来就地生成的，不进仓库 —— 否则跑一次测试就脏一次工作区。
+builtin_sources/
+diag.log
+crash.log
+settings.json
+qq_proxies.txt
+
 # 测试产物
 downloads/
 sources/_active.js

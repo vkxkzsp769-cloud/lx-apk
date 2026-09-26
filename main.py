@@ -556,6 +556,13 @@ class IconButton(SpringButton):
             dia = dp(40)
         kw.setdefault("size_hint", (None, None))
         kw.setdefault("size", (dia, dia))
+        # 图标必须自己声明垂直居中：Kivy 的 BoxLayout 在交叉轴（竖直方向）
+        # **不会**居中固定尺寸的子控件，而是把它贴到内容区底部 ——
+        # 于是图标高/矮于同行文字时就错位：
+        #   头部「设置」图标 42px，内容区只有 34px → 中心偏高 4px
+        #   抽屉「关闭」图标 34px，行高 44px      → 中心偏低 5px
+        # （搜索框的放大镜当初手写了 pos_hint，这两处漏了）
+        kw.setdefault("pos_hint", {"center_y": 0.5})
         kw.setdefault("bg_color", bg)
         kw.setdefault("color", (0, 0, 0, 0))   # 不显示文字
         super().__init__(**kw)
@@ -817,7 +824,8 @@ class LxApp(App):
         panel.add_widget(row)
 
         panel.add_widget(self._section("QQ 代理（失效时可自己换）"))
-        self.btn_proxy = self._btn("选择代理文件(.txt)", color=C_CTRL, fs=dp(13))
+        self.btn_proxy = self._btn("选择代理文件(.txt)", color=C_CTRL, fs=dp(13),
+                                   h=dp(44))
         self.btn_proxy.bind(on_release=self.pick_proxies)
         panel.add_widget(self.btn_proxy)
         return panel
@@ -848,10 +856,16 @@ class LxApp(App):
         lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         return lb
 
-    def _btn(self, text, color=None, w=None, bold=False, fs=None):
+    def _btn(self, text, color=None, w=None, bold=False, fs=None, h=None):
         b = FlatButton(text=text, size_hint_x=None if w else 1,
                        width=w or 0, font_size=fs or dp(14), bold=bold,
                        bg_color=color or C_CTRL, color=C_TEXT, **self.F)
+        if h:
+            # 直接加进竖向 BoxLayout 时必须给固定高度：那类面板的高度是
+            # minimum_height（由子控件撑开），size_hint_y=1 的控件在那里会被
+            # 算成 0 ——「选择代理文件」按钮就是这样塌成 0 高、整条看不见的。
+            b.size_hint_y = None
+            b.height = h
         return b
 
     def _field(self, text, w=None):
