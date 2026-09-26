@@ -147,13 +147,6 @@ jobs:
           echo "=== 补丁完成 ==="
 
       - name: 编译 APK（release + 固定密钥签名）
-        env:
-          # 固定签名密钥：base64 的 PKCS12，存在仓库 Secret 里。
-          # 用 env 传值、在脚本里判空 —— 不要写成 step 级 if 引用 secrets。
-          KS_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
-          P4A_RELEASE_KEYALIAS: androiddebugkey
-          P4A_RELEASE_KEYALIAS_PASSWD: android
-          P4A_RELEASE_KEYSTORE_PASSWD: android
         run: |
           # ---- 固定签名，让 APK 能覆盖安装 ----
           # 为什么要走 release 构建：只有 release 才用 p4a 的 P4A_RELEASE_*
@@ -162,11 +155,17 @@ jobs:
           # debug 构建用的是 AGP 自动生成的 debug 钥匙，在 CI 的全新环境里
           # 每次都会重新生成 —— 实测两次构建的 CERT.RSA sha256 不同、
           # 连长度都不同（1019B vs 1015B），Android 因此只允许先卸载再装。
+          #
+          # 密钥值直接内联在 run 里（不要放 step 级 env —— 实测那样会让
+          # 整个 workflow 变成 startup_failure，一个 job 都不启动）。
+          KS_B64='${{ secrets.DEBUG_KEYSTORE_B64 }}'
           if [ -n "$KS_B64" ]; then
             KS="$RUNNER_TEMP/lx-sign.keystore"
             printf '%s' "$KS_B64" | base64 -d > "$KS"
             export P4A_RELEASE_KEYSTORE="$KS"
-            # 先读一次：密钥不对就在这里失败，别拖到签名那步才报
+            export P4A_RELEASE_KEYALIAS=androiddebugkey
+            export P4A_RELEASE_KEYSTORE_PASSWD=android
+            export P4A_RELEASE_KEYALIAS_PASSWD=android
             keytool -list -keystore "$KS" -storepass android \
               -alias androiddebugkey | tail -3
           else
