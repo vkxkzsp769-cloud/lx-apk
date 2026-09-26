@@ -930,7 +930,40 @@ def test_bgfx_wired_with_fallback():
                              "背景建不起来会直接把 App 拖死")
     if "def _bg_playing" not in src:
         raise AssertionError("没有把播放状态同步给背景的入口")
-    print("  bgfx 接口齐全 + build 有兜底 + 播放状态已接线 ✓")
+
+    # 光晕必须是**渐变**，不能是实心圆。
+    # 用户反馈过「背景太劣质」——根源就是原来用 graphics.Ellipse 画半透明
+    # 实心圆，那是硬边的，看起来就是几个圆圈。现在改成径向渐变贴图。
+    if not hasattr(bgfx, "glow_alpha"):
+        raise AssertionError("bgfx 没有 glow_alpha（渐变衰减应抽成纯函数以便验证）")
+    # 只查**真实使用**（import 行或调用），不查注释/文档字符串 ——
+    # 注释里正解释「为什么不用 Ellipse」，按字符串匹配会误报。
+    import re as _re
+    for path in (os.path.join(HERE, "bgfx.py"), os.path.join(HERE, "main.py")):
+        for i, line in enumerate(open(path, encoding="utf-8").read().splitlines(), 1):
+            if _re.search(r"import[^\n]*\bEllipse\b", line) or "Ellipse(" in line:
+                raise AssertionError("%s:%d 还在用 Ellipse 画实心圆 —— "
+                                     "那正是「劣质感」的来源" % (path, i))
+
+    size = bgfx.GLOW_PX
+    c = int((size - 1) / 2)
+    mid = bgfx.glow_alpha(c, c, size)
+    if mid < 230:
+        raise AssertionError("光晕中心不够亮: %d" % mid)
+    if bgfx.glow_alpha(0, 0, size) != 0:
+        raise AssertionError("光晕角落应为全透明")
+    prev, worst = 999, 0
+    for r in range(0, c + 1):
+        a = bgfx.glow_alpha(c + r, c, size)
+        if a > prev:
+            raise AssertionError("光晕衰减不单调（半径 %d: %d -> %d）" % (r, prev, a))
+        if r:
+            worst = max(worst, abs(prev - a))
+        prev = a
+    if worst > 20:
+        raise AssertionError("光晕衰减有硬边：相邻像素跳变 %d" % worst)
+    print("  bgfx 接口齐全 + 渐变光晕(中心%d/角落0/最大跳变%d) + 动效保险丝 ✓"
+          % (mid, worst))
 
 
 def test_netease_paging():

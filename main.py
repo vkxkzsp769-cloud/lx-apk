@@ -23,6 +23,7 @@ import threading
 import traceback
 
 from kivy.app import App
+from kivy.animation import Animation
 from kivy.clock import Clock
 from kivy.metrics import dp
 from kivy.properties import ListProperty, NumericProperty
@@ -307,6 +308,14 @@ class LxApp(App):
 
         Clock.schedule_once(self._guard(self._boot), 0.2)
         Clock.schedule_interval(self._guard(self._tick), 0.5)
+
+        # 启动淡入：界面从透明浮出来，比「啪」一下出现柔和得多。
+        # 保险丝：1.5s 后无条件把 opacity 拉回 1 —— 万一动画没跑起来，
+        # 整个界面会是全透明的，那比没有动效糟得多（而且我看不到真机）。
+        root.opacity = 0.0
+        Clock.schedule_once(
+            lambda *_: Animation(opacity=1.0, d=0.28, t="out_quad").start(root), 0.05)
+        Clock.schedule_once(lambda *_: setattr(root, "opacity", 1.0), 1.5)
         return root
 
     def _guard(self, fn):
@@ -986,6 +995,8 @@ class LxApp(App):
             return
 
         self.hint.text = "点歌名直接播放，点右侧「下载」保存（共 %d 首）" % len(self.songs)
+        # 只给前几首做入场动效：几百首全做会明显卡，而且看不到那么远
+        STAGGER = 10
         for i, s in enumerate(self.songs):
             row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(6))
             # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
@@ -1006,6 +1017,29 @@ class LxApp(App):
             dl.bind(on_release=lambda b, idx=i: self.download_song(idx))
             row.add_widget(dl)
             self.results.add_widget(row)
+
+            if i < STAGGER:
+                # 错峰进场：淡入 + 高度展开，列表像「长」出来而不是一次砸下来
+                row.opacity = 0.0
+                row.height = 0
+                anim = Animation(opacity=1.0, height=dp(58), duration=0.22,
+                                 t="out_quad")
+                Clock.schedule_once(
+                    lambda *_, r=row, a=anim: a.start(r), 0.03 * i)
+
+        # 保险丝：万一入场动画没跑起来，列表会停在全透明/零高度，
+        # 那比没有动效糟得多 —— 到点无条件把最终状态写回去。
+        if self.songs:
+            def _settle(*_):
+                try:
+                    for w in self.results.children:
+                        w.opacity = 1.0
+                        if w.height < dp(58):
+                            w.height = dp(58)
+                except Exception:
+                    log_exc("列表入场收尾")
+            Clock.schedule_once(_settle, 0.03 * min(len(self.songs), STAGGER) + 0.6)
+
         self.set_status("找到 %d 首：点歌名播放，点「下载」保存" % len(self.songs))
 
     # ---------- 列表上的直接操作 ----------
@@ -1340,7 +1374,11 @@ class LxApp(App):
                             size_hint=(0.92, None), height=dp(310),
                             title_size=dp(15), separator_color=C_ACCENT,
                             **self.P)
+        # 淡入。刻意从 0.86 而不是 0 起 —— 万一动画没跑起来，
+        # 弹窗至少是「几乎全可见」，不会变成一个看不见却挡住点击的遮罩。
+        self._popup.opacity = 0.86
         self._popup.open()
+        Animation(opacity=1.0, duration=0.18, t="out_quad").start(self._popup)
 
     # ---------- 播放 ----------
     def play_current(self):
