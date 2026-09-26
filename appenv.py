@@ -218,48 +218,77 @@ def request_all_files_access():
 # ============================================================
 #  内置音源
 # ============================================================
-def ensure_source():
-    """确保 SOURCE_FILE 存在；返回路径。首次启动从 APK assets 释放。"""
-    if os.path.exists(SOURCE_FILE) and os.path.getsize(SOURCE_FILE) > 1000:
-        return SOURCE_FILE
+# 项目自带的音源目录（打包进 APK，也在桌面调试时用）
+BUNDLED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "assets", "sources")
+# 多个内置音源都释放到这里
+BUILTIN_DIR = os.path.join(APP_DIR, "builtin_sources")
 
-    code = None
-    # 1) 优先从 APK assets 读（这是打包进去的那份）
-    if IS_ANDROID:
-        try:
-            from jnius import autoclass
-            act = autoclass("org.kivy.android.PythonActivity").mActivity
-            stream = act.getAssets().open("default_source.js")
-            buf = bytearray()
-            chunk = stream.read(8192)
-            while chunk != -1 and chunk is not None:
-                buf.extend(chunk)
-                chunk = stream.read(8192)
-            stream.close()
-            if buf:
-                code = bytes(buf).decode("utf-8", "replace")
-        except Exception as e:
-            # 这里是「预期内」的失败：p4a 把 source.include_patterns 的文件
-            # 打进 assets/private.tar，而不是 APK 根 assets，
-            # 所以 getAssets().open() 必然找不到，随后会走下面的本地回退。
-            # 不要写进 crash.log，否则每次启动都刷一条假异常。
-            log("APK asset 里没有 default_source.js（正常），改用本地副本:", e)
+# 默认用哪个：聚合音源 特供版 实测 5 个平台全部可取直链
+DEFAULT_SOURCE_NAME = "01_聚合音源_特供版.js"
 
-    # 2) 退回项目里的 assets 目录（桌面调试用）
-    if not code and os.path.exists(BUILTIN_SOURCE):
-        try:
-            with open(BUILTIN_SOURCE, encoding="utf-8", errors="replace") as f:
-                code = f.read()
-        except Exception:
-            log_exc("read BUILTIN_SOURCE")
 
-    if not code or len(code) < 200:
-        raise RuntimeError("找不到内置音源（APK assets 里没有 default_source.js）")
+def _copy_file(src, dst):
+    with open(src, "rb") as f:
+        data = f.read()
+    with open(dst, "wb") as f:
+        f.write(data)
+    return len(data)
 
-    with open(SOURCE_FILE, "w", encoding="utf-8") as f:
-        f.write(code)
-    log("已释放内置音源 %d 字节 -> %s" % (len(code), SOURCE_FILE))
+
+def extract_bundled_sources():
+    """把内置的多个音源释放到可写目录。返回 [(显示名, 路径)]。
+
+    音源放在 assets/sources/ 下：
+      * 桌面调试时就在项目目录里，直接读
+      * 打包进 APK 后由 p4a 收进 assets/private.tar，
+        启动时已经解到应用私有目录，所以 <app_dir>/assets/sources 也能读到
+    """
+    os.makedirs(BUILTIN_DIR, exist_ok=True)
+
+    candidates = [BUNDLED_DIR,
+                  os.path.join(APP_DIR, "assets", "sources")]
+    out = []
+    for d in candidates:
+        if not os.path.isdir(d):
+            continue
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".js"):
+                continue
+            dst = os.path.join(BUILTIN_DIR, fn)
+            try:
+                if (not os.path.exists(dst)
+                        or os.path.getsize(dst) != os.path.getsize(
+                            os.path.join(d, fn))):
+                    _copy_file(os.path.join(d, fn), dst)
+                out.append((fn, dst))
+            except Exception:
+                log_exc("释放内置音源 %s" % fn)
+        if out:
+            break
+
+    log("内置音源 %d 个 -> %s" % (len(out), BUILTIN_DIR))
+    return out
+
+
+def default_source_path():
+    """默认音源路径（找不到就退回第一个）"""
+    p = os.path.join(BUILTIN_DIR, DEFAULT_SOURCE_NAME)
+    if os.path.exists(p):
+        return p
+    for fn, path in extract_bundled_sources():
+        return path
     return SOURCE_FILE
+
+
+def ensure_source():
+    """确保有一个可用音源：释放内置音源，返回默认那个的路径。"""
+    items = extract_bundled_sources()
+    if not items:
+        raise RuntimeError("APK 里没有内置音源（assets/sources 为空）")
+    path = default_source_path()
+    log("默认音源:", os.path.basename(path))
+    return path
 
 
 def save_source(text):

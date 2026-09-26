@@ -5,7 +5,7 @@
   appenv      运行环境：日志、路径、存储权限、内置音源
   fonts       中文字体注册
   lxbridge    WebView JS 引擎（跑落雪音源 .js，取音频直链）
-  netease     按歌名搜索（音源本身不含搜索）
+  searchers   多平台搜索（wy/tx/kw/kg/mg，音源本身不含搜索）
   downloader  下载音频 + 直链有效性校验
   main        界面与业务编排（本文件）
 
@@ -39,12 +39,12 @@ from kivy.uix.textinput import TextInput
 import appenv
 import downloader
 import fonts
-import netease
+import searchers
 import player as player_mod
 import songinfo
-from appenv import (IS_ANDROID, SOURCE_FILE, diag, download_dir,
-                    ensure_source, log, log_exc, request_all_files_access,
-                    save_source)
+from appenv import (IS_ANDROID, SOURCE_FILE, default_source_path, diag,
+                    download_dir, ensure_source, extract_bundled_sources, log,
+                    log_exc, request_all_files_access, save_source)
 from lxbridge import LxBridge
 
 # ============================================================
@@ -63,11 +63,11 @@ C_OK = (0.345, 0.800, 0.502, 1)
 C_ERR = (0.949, 0.451, 0.451, 1)
 
 PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我",
-                  "kg": "酷狗", "mg": "咪咕"}
+                  "kg": "酷狗", "mg": "咪咕", "qsvip": "企鹅SVIP"}
 # 顺序即下拉顺序，第一项是 Spinner 的默认值 —— 所以 320k 放最前
 QUALITY_ORDER = ["320k", "128k", "192k", "flac", "flac24bit",
                  "hires", "master"]
-# 搜索结果数量选项（None = 尽量多拿，上限见 netease.MAX_RESULTS）
+# 搜索结果数量选项（None = 尽量多拿，上限见 searchers.MAX_RESULTS）
 COUNT_ORDER = ["20 首", "50 首", "100 首", "200 首", "300 首", "全部"]
 COUNT_VALUE = {"20 首": 20, "50 首": 50, "100 首": 100,
                "200 首": 200, "300 首": 300, "全部": None}
@@ -253,11 +253,12 @@ class LxApp(App):
         panel.bind(minimum_height=panel.setter("height"))
         wrap.add_widget(panel)
 
-        # ---- 音源 ----
+        # ---- 音源文件（内置多个，可切换）----
         panel.add_widget(self._section("音源"))
         row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.sp_source = CNSpinner(text="加载中…", values=[], font_size=dp(14),
+        self.sp_source = CNSpinner(text="加载中…", values=[], font_size=dp(13),
                                    **self.F)
+        self.sp_source.bind(on_text=self._on_source_picked)
         row.add_widget(self.sp_source)
         btn = self._btn("更换", color=C_CTRL, w=dp(72))
         btn.bind(on_release=self.pick_source)
@@ -420,7 +421,19 @@ class LxApp(App):
     # ---------- 启动 ----------
     def _boot(self, *_):
         diag("=== 启动 === dir=%s" % appenv.APP_DIR)
-        ensure_source()
+        try:
+            self.builtin = extract_bundled_sources()
+        except Exception:
+            log_exc("释放内置音源")
+            self.builtin = []
+        self.source_paths = {name: path for name, path in self.builtin}
+        if self.builtin:
+            names = [n for n, _ in self.builtin]
+            self.sp_source.values = names
+            self.sp_source.text = names[0]
+            diag("内置音源 %d 个: %s" % (len(names), names[:3]))
+        else:
+            self.sp_source.text = "无内置音源"
         self.set_status("正在启动 JS 引擎…")
         if IS_ANDROID:
             self.bridge.start(on_ready=self._on_engine_ready)
@@ -439,10 +452,42 @@ class LxApp(App):
             log("引擎不可用:", detail)
             return
         self.ui(lambda: self.set_status("引擎就绪，加载音源…"))
-        self.load_source(SOURCE_FILE)
+        self.load_source(self._selected_source_path())
+
+    def _selected_source_path(self):
+        """当前下拉里选中的内置音源路径"""
+        name = (self.sp_source.text or "").strip()
+        path = getattr(self, "source_paths", {}).get(name)
+        if path and os.path.exists(path):
+            return path
+        try:
+            p = default_source_path()
+            if os.path.exists(p):
+                return p
+        except Exception:
+            log_exc("default_source_path")
+        return SOURCE_FILE
+
+    def _on_source_picked(self, spinner, text):
+        """用户在内置音源下拉里换了源"""
+        try:
+            if not getattr(self, "source_paths", None):
+                return
+            path = self.source_paths.get((text or "").strip())
+            if not path or not os.path.exists(path):
+                return
+            if getattr(self, "_loading_source", None) == path:
+                return
+            self._loading_source = path
+            self.set_status("切换音源: %s …" % os.path.basename(path))
+            self.load_source(path)
+        except Exception:
+            log_exc("_on_source_picked")
 
     def load_source(self, path):
         """加载音源（后台线程）。LxBridge 的 JS 调用不能在主线程做。"""
+        self._loading_source = path      # 供状态栏显示是哪个音源
+
         def _work():
             self.ui(lambda: self.set_status("正在读取音源…"))
             try:
@@ -472,18 +517,23 @@ class LxApp(App):
             })
             labels.append("%s (%s)" % (PLATFORM_LABEL.get(key, key), key))
 
-        self.sp_source.values = labels
-        if labels:
-            self.sp_source.text = labels[0]
+        # 注意：sp_source 是「音源文件」下拉，不要覆盖成平台列表
         self.sp_platform.values = labels
         if labels:
             self.sp_platform.text = labels[0]
         self._refresh_qualities()
 
         meta = info.get("meta") or {}
-        self.set_status("音源: %s v%s · %d 个平台"
-                        % (meta.get("name", "?"), meta.get("version", "?"),
-                           len(labels)), C_OK)
+        # 有些音源 meta 里没有 name/version，用文件名兜底，别显示 "?"
+        src_name = os.path.basename(getattr(self, "_loading_source", "") or "")
+        ctx = {
+            "name": meta.get("name") or src_name or "音源",
+            "version": meta.get("version") or "",
+        }
+        ver = (" v%s" % ctx["version"]) if ctx["version"] else ""
+        self.lbl_sub.text = "%d 个平台" % len(labels)
+        self.set_status("音源: %s%s · %d 个平台"
+                        % (ctx["name"], ver, len(labels)), C_OK)
         if self.hint.text.startswith("搜索后"):
             self.hint.text = "搜索后点结果即可下载"
 
@@ -590,26 +640,32 @@ class LxApp(App):
             self.set_status("搜索中: %s" % keyword)
             self._clear_results()
             want = COUNT_VALUE.get(self.sp_count.text, 100)
-            self.bg(lambda: self._search_work(keyword, want), "search")
+            plat = self._current_source()
+            self.bg(lambda: self._search_work(keyword, want, plat), "search")
         except Exception as e:
             self.busy = False
             log_exc("do_search")
             self.set_status("搜索出错: %s" % e, C_ERR)
 
-    def _search_work(self, keyword, want):
+    def _search_work(self, keyword, want, platform):
         songs, err = [], None
         try:
             def prog(got, total):
                 self.ui(lambda: self.set_status(
-                    "搜索中: %s… 已获取 %d%s"
-                    % (keyword, got, ("/%d" % total) if total else "")))
-            songs = netease.search(keyword, want, on_progress=prog)
+                    "在 %s 搜索: %s… 已获取 %d%s"
+                    % (PLATFORM_LABEL.get(platform, platform), keyword, got,
+                       ("/%d" % total) if total else "")))
+            songs = searchers.search(platform, keyword, want, on_progress=prog)
+            if not songs:
+                err = "该平台没有找到结果"
+        except KeyError:
+            err = "该平台暂不支持搜索（可手动输入歌曲 ID）"
         except Exception as e:
             err = str(e)
             log_exc("search")
-        self.ui(lambda: self._after_search(songs, err))
+        self.ui(lambda: self._after_search(songs, err, platform))
 
-    def _after_search(self, songs, err):
+    def _after_search(self, songs, err, platform="wy"):
         self.busy = False
         if err:
             self.set_status("搜索失败: %s" % err, C_ERR)
@@ -695,6 +751,13 @@ class LxApp(App):
                 "interval": song.get("interval", ""),
                 "meta": {"songId": song["id"],
                          "albumName": song.get("album", "")}}
+        # 各平台取直链需要的专属字段（tx: songmid/strMediaMid，
+        # kg: hash，mg: copyrightId ...），搜索时就一并带回来了
+        extra = song.get("extra") or {}
+        for k, v in extra.items():
+            if v:
+                info[k] = v
+                info["meta"].setdefault(k, v)
 
         order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
         url, used, err = None, want, ""

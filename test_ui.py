@@ -518,7 +518,7 @@ def test_netease_paging():
     超过 100 会返回 {"code":406,"msg":"操作频繁"}（HTTP 还是 200），
     不识别就会误判成「没搜到」。
     """
-    import netease
+    import searchers as netease
 
     if netease.PAGE != 100:
         raise AssertionError("单页上限应为 100，实际 %s" % netease.PAGE)
@@ -549,12 +549,12 @@ def test_netease_paging():
         calls.append(offset)
         return pages.get(offset, {"result": {"songs": []}})
 
-    real = netease._fetch
-    netease._fetch = fake
+    real = netease._wy_fetch
+    netease._wy_fetch = fake
     try:
-        got = netease.search("x", 250)
+        got = netease.search_netease("x", 250)
     finally:
-        netease._fetch = real
+        netease._wy_fetch = real
 
     if len(got) != 250:
         raise AssertionError("分页取到 %d 条，应为 250" % len(got))
@@ -564,6 +564,75 @@ def test_netease_paging():
     if calls != [0, 100, 200]:
         raise AssertionError("分页 offset 不对: %s" % calls)
     print("  分页 3 页共 250 条、无重复 ✓")
+
+
+def test_bundled_sources():
+    """回归：APK 要内置多个音源，并能列出/切换。
+
+    之前只内置 1 个（K×H），而它在 tx/mg 上取不到直链，
+    用户就以为「其他平台不好用」。实测「聚合音源 特供版」5 个平台全通，
+    所以内置了多个并设为默认。
+    """
+    items = appenv.extract_bundled_sources()
+    if len(items) < 3:
+        raise AssertionError("内置音源只有 %d 个，太少了" % len(items))
+    names = [n for n, _ in items]
+    print("  内置 %d 个: %s" % (len(names), [n[:18] for n in names[:3]]))
+    for n, pth in items:
+        if not os.path.exists(pth) or os.path.getsize(pth) < 500:
+            raise AssertionError("音源文件异常: %s" % n)
+
+    default = appenv.default_source_path()
+    if not os.path.exists(default):
+        raise AssertionError("默认音源不存在: %s" % default)
+    print("  默认: %s" % os.path.basename(default))
+    if "聚合" not in os.path.basename(default):
+        print("  提示: 默认音源不是「聚合音源 特供版」"
+              "（实测它 5 个平台都能取直链）")
+
+
+def test_searchers_registry():
+    """5 个平台的搜索都要注册上（否则那些平台搜不到歌 -> 没法用）"""
+    import searchers
+    want = {"wy", "tx", "kw", "kg", "mg"}
+    got = set(searchers.platforms())
+    if got != want:
+        raise AssertionError("平台不全: 缺 %s" % (want - got))
+    for p, (name, fn) in searchers.SEARCHERS.items():
+        if not callable(fn):
+            raise AssertionError("%s 的搜索函数不可调用" % p)
+        if not name:
+            raise AssertionError("%s 没有中文名" % p)
+    print("  5 个平台都注册了: %s" % " ".join(
+        "%s=%s" % (p, searchers.SEARCHERS[p][0]) for p in sorted(got)))
+
+
+def test_source_dropdown_lists_files():
+    """音源下拉要列出「音源文件」，不能被平台列表覆盖。
+
+    这两个下拉曾经是重复的（都显示平台），改成：
+      音源 = 内置音源文件；平台 = 该音源声明的平台。
+    """
+    app = M.LxApp()
+    root = app.build()
+    app._boot()          # 触发释放内置音源
+    vals = list(app.sp_source.values)
+    print("  音源下拉 = %s" % [v[:16] for v in vals[:3]])
+    if not vals:
+        raise AssertionError("音源下拉是空的")
+    if any("(" in v and ")" in v for v in vals):
+        raise AssertionError("音源下拉里混进了平台项: %s" % vals)
+
+    # 应用音源信息后，音源下拉不应被平台覆盖
+    app._apply_source_info({
+        "meta": {"name": "t", "version": "1"},
+        "sources": {"wy": {"name": "网易云", "qualitys": ["320k"]},
+                    "tx": {"name": "QQ音乐", "qualitys": ["320k"]}}})
+    if list(app.sp_source.values) != vals:
+        raise AssertionError("音源下拉被平台列表覆盖了")
+    if list(app.sp_platform.values) != ["网易云 (wy)", "QQ音乐 (tx)"]:
+        raise AssertionError("平台下拉不对: %s" % (app.sp_platform.values,))
+    print("  音源/平台两个下拉各司其职 ✓")
 
 
 def test_static():
@@ -616,6 +685,9 @@ def main():
     check("SSL 证书失败自动降级", test_ssl_fallback)
     check("所有文字控件都带中文字体", test_all_widgets_use_cn_font)
     check("搜索分页 + 限流识别", test_netease_paging)
+    check("内置多个音源", test_bundled_sources)
+    check("5 个平台搜索都注册", test_searchers_registry)
+    check("音源下拉列出文件", test_source_dropdown_lists_files)
 
     print()
     if FAILS:
