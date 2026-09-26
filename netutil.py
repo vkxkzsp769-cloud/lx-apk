@@ -14,6 +14,7 @@
 import json
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from appenv import diag, log
@@ -24,6 +25,14 @@ UA = ("Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
 # 懒加载，避免启动时就去建 SSL context
 _UNVERIFIED = None
 _cert_problem_hosts = set()
+
+
+def _host_of(req):
+    try:
+        return getattr(req, "host", None) or urllib.parse.urlsplit(
+            req.full_url).hostname or ""
+    except Exception:
+        return ""
 
 
 def _unverified_ctx():
@@ -43,13 +52,21 @@ def urlopen(url_or_req, headers=None, timeout=20):
     else:
         req = url_or_req
 
+    # 这个主机之前证书校验失败过 —— 直接走不校验，省掉一次注定失败的握手。
+    # 在有 SSL 拦截的网络里，这次失败的握手要等 10 秒以上，
+    # 每次请求都白等一遍会让「获取歌曲」慢得没法用。
+    host_key = _host_of(req)
+    if host_key in _cert_problem_hosts:
+        return urllib.request.urlopen(req, timeout=timeout,
+                                      context=_unverified_ctx())
+
     try:
         return urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.URLError as e:
         if not isinstance(getattr(e, "reason", None), ssl.SSLError) and \
                 "CERTIFICATE_VERIFY_FAILED" not in str(e):
             raise
-        host = getattr(req, "host", "") or getattr(req, "full_url", "")
+        host = _host_of(req)
         if host not in _cert_problem_hosts:
             _cert_problem_hosts.add(host)
             diag("SSL 证书校验失败，改用不校验模式重试: %s" % host)

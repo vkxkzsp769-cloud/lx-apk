@@ -1,9 +1,10 @@
 """下载音频 + 直链有效性判断。"""
 import os
 import re
+import urllib.request          # 构造带自定义请求头的 Request
 
 import netutil
-from appenv import log
+from appenv import diag, log   # diag: 把每次尝试的 status/类型写进 diag.log
 
 # 网易云版权受限时会返回这种跳转地址，下下来是网页而不是音频
 RESTRICTED_PATTERNS = ("music.163.com/song/media/outer/url", "/404", "404.mp3")

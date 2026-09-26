@@ -752,9 +752,19 @@ def test_qq_resolver():
             raise AssertionError("代理模板缺少 {id}: %s" % tpl)
     print("  level 映射正确，%d 个备用代理 ✓" % len(qqresolve.QQ_PROXIES))
 
-    u, info = qqresolve.resolve("", "320k")
+    u, info, meta = qqresolve.resolve("", "320k")
     if u is not None:
         raise AssertionError("空 songmid 不该返回地址")
+    if meta is not None:
+        raise AssertionError("失败时不该返回 meta")
+
+    # 回退顺序必须是「优先降级」，不能把 128k 悄悄换成 320k
+    order = ["standard", "exhigh", "lossless"]
+    lv = qqresolve.LEVEL_BY_QUALITY["128k"]
+    idx = order.index(lv)
+    if idx != 0:
+        raise AssertionError("128k 应该优先 standard，实际 %s" % lv)
+    print("  回退顺序优先降级 ✓")
     print("  空 songmid 被正确拒绝 ✓")
 
 
@@ -774,6 +784,71 @@ def test_no_silent_platform_switch():
     if "_switch_platform" not in src:
         raise AssertionError("没有提供「用户主动换平台」的入口")
     print("  _resolve_song 不会自动换平台，且保留了用户主动切换入口 ✓")
+
+
+def test_download_no_nameerror():
+    """回归：下载函数里不能有未导入的名字。
+
+    真实事故：改用 netutil 时删掉了 `import urllib.request`，
+    但新的重试逻辑又用了 `urllib.request.Request` ——
+    于是**所有平台都下载失败**，报 NameError。
+    在真机上表现为「能在线听、不能下载」，很难联想到是 import 缺失。
+    """
+    import ast as _ast
+    import downloader as D
+
+    if not hasattr(D, "urllib"):
+        raise AssertionError("downloader 没有导入 urllib")
+    if not hasattr(D, "diag"):
+        raise AssertionError("downloader 没有导入 diag")
+
+    # 静态扫一遍：所有模块里「用了 X. 却没 import X」都要抓出来
+    import os as _os
+    bad = []
+    for f in sorted(_os.listdir(HERE)):
+        if not f.endswith(".py"):
+            continue
+        raw = open(_os.path.join(HERE, f), encoding="utf-8").read()
+        tree = _ast.parse(raw)
+        # 扫描时去掉注释行 —— 否则注释里写个 "time." 也会被当成缺 import
+        src = "\n".join(l for l in raw.splitlines()
+                        if not l.strip().startswith("#"))
+        names = set()
+        for n in _ast.walk(tree):
+            if isinstance(n, _ast.Import):
+                for a in n.names:
+                    names.add((a.asname or a.name).split(".")[0])
+            elif isinstance(n, _ast.ImportFrom):
+                for a in n.names:
+                    names.add(a.asname or a.name)
+        for n in tree.body:
+            if isinstance(n, (_ast.FunctionDef, _ast.ClassDef)):
+                names.add(n.name)
+            elif isinstance(n, _ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, _ast.Name):
+                        names.add(t.id)
+        import re as _re
+        for mod in ("urllib", "json", "os", "time", "ast", "ssl", "threading"):
+            # 必须用词边界：否则 lbl_time.text 会被当成 time.x，
+            # _ast.parse 会被当成 ast.x —— 都是误报
+            pat = r"(?<![A-Za-z0-9_.])" + mod + r"\."
+            if _re.search(pat, src) and mod not in names:
+                bad.append("%s: 用了 %s. 但没 import" % (f, mod))
+    if bad:
+        raise AssertionError("缺少 import:\n      " + "\n      ".join(bad))
+    print("  所有模块的 import 都齐全 ✓")
+
+    # 真调一次：坏地址应抛网络错误，而不是 NameError
+    import tempfile
+    try:
+        D.download("http://127.0.0.1:9/nope.mp3",
+                   os.path.join(tempfile.gettempdir(), "x.mp3"), platform="tx")
+    except NameError as e:
+        raise AssertionError("download 里还有未定义名字: %s" % e)
+    except Exception:
+        pass          # 网络错误是预期的
+    print("  坏地址抛的是网络错误（不是 NameError）✓")
 
 
 def test_static():
@@ -834,6 +909,7 @@ def main():
     check("直链有效性校验", test_url_verify)
     check("QQ 内置解析器", test_qq_resolver)
     check("不静默换平台", test_no_silent_platform_switch)
+    check("下载无未导入名字", test_download_no_nameerror)
 
     print()
     if FAILS:

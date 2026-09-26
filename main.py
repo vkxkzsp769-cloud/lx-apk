@@ -804,9 +804,10 @@ class LxApp(App):
         if source == "tx":
             mid = (song.get("extra") or {}).get("songmid") or song.get("id")
             self.ui(lambda: self.set_status("正在解析 QQ 直链…"))
-            u, lv = qqresolve.resolve(mid, order[0])
+            u, lv, qmeta = qqresolve.resolve(mid, order[0])
             if u:
                 url, used = u, order[0]
+                self._pre_meta = qmeta      # 已经探测过，省一次请求
                 log("QQ 内置解析成功:", lv)
             else:
                 err = lv
@@ -818,7 +819,8 @@ class LxApp(App):
             err = err2 or err
 
         if url:
-            meta = songinfo.probe(url)
+            meta = getattr(self, "_pre_meta", None) or songinfo.probe(url)
+            self._pre_meta = None
             self.ui(lambda: self._song_ready(song, url, used, meta, source))
             return
 
