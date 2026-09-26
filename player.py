@@ -91,12 +91,10 @@ class Player:
 
     def stop(self):
         try:
-            if self._mp is not None and self._ui is not None:
-                mp = self._mp
-                self._mp = None
-
-                @self._ui
-                def _do():
+            mp = self._mp
+            self._mp = None
+            if mp is not None:
+                def _release():
                     try:
                         mp.stop()
                     except Exception:
@@ -106,6 +104,12 @@ class Player:
                         mp.release()
                     except Exception:
                         pass
+                # 没有 UI 线程通道时也必须放掉，否则 MediaPlayer 泄漏
+                # （原来只在 self._ui 存在时才 release）
+                if self._ui is not None:
+                    self._ui(_release)
+                else:
+                    _release()
             if self._sound is not None:
                 self._sound.stop()
                 self._sound.unload()
@@ -115,6 +119,31 @@ class Player:
         finally:
             self._state = self.IDLE
             self._listeners = []
+
+    # ---------- 错误确认 ----------
+    def _note_error(self, what, extra, delay=2.5):
+        """延后确认「到底是不是真的失败了」。
+
+        真机实测：有些直链会先回调一次 onError(what=-38)，紧接着
+        onPrepared 又成功（时长 276s，正常播放）。如果 onError 里立刻
+        报「播放失败」，用户看到的就是错误提示闪一下、随即变成正在播放 ——
+        像出了 bug。所以先记下，等一会儿确认还没就绪才真的报。
+        """
+        self._error_gen = getattr(self, "_error_gen", 0) + 1
+        gen = self._error_gen
+
+        def _confirm():
+            if gen != getattr(self, "_error_gen", -1):
+                return                      # 期间已经就绪 / 换歌了
+            if self._state in (self.PLAYING, self.PAUSED):
+                return                      # 已经播上了，虚惊一场
+            self._state = self.IDLE
+            self._emit("error", "播放器错误(%s/%s)，可能是直链失效或格式不支持"
+                       % (what, extra))
+
+        t = threading.Timer(delay, _confirm)
+        t.daemon = True
+        t.start()
 
     # ---------- 播放 ----------
     def play(self, url, on_event):
@@ -152,6 +181,8 @@ class Player:
             @java_method("(Landroid/media/MediaPlayer;)V")
             def onPrepared(self, mp):
                 try:
+                    # 作废可能已经排上的错误确认（见 _note_error）
+                    player._error_gen = getattr(player, "_error_gen", 0) + 1
                     player._duration = max(0.0, mp.getDuration() / 1000.0)
                     mp.start()
                     player._state = player.PLAYING
@@ -168,9 +199,8 @@ class Player:
             @java_method("(Landroid/media/MediaPlayer;II)Z")
             def onError(self, mp, what, extra):
                 diag("MediaPlayer 错误 what=%s extra=%s" % (what, extra))
-                player._state = player.IDLE
-                player._emit("error", "播放器错误(%s/%s)，可能是直链失效或格式不支持"
-                             % (what, extra))
+                # 不立刻报错：见 _note_error 的说明（有些链会先报错再成功）
+                player._note_error(what, extra)
                 return True
 
         class _Done(PythonJavaClass):
@@ -222,7 +252,11 @@ class Player:
         def _work():
             import downloader
             try:
-                path = os.path.join(tempfile.gettempdir(), "lx_test_audio")
+                # 必须带扩展名：SoundLoader 靠后缀挑解码器，
+                # 原来写死成没有后缀的 "lx_test_audio"，桌面兜底基本解不出来
+                ext = downloader.guess_ext(url, "") or "mp3"
+                path = os.path.join(tempfile.gettempdir(),
+                                    "lx_test_audio." + ext)
                 downloader.download(url, path)
                 from kivy.core.audio import SoundLoader
                 snd = SoundLoader.load(path)

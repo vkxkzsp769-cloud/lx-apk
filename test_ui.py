@@ -385,7 +385,14 @@ def test_ssl_fallback():
 
 
 def test_quality_format_filter():
-    """品质下拉要按「格式」偏好过滤，并且用平台声明的品质列表"""
+    """品质下拉：显示中文 + 按「格式」偏好过滤 + 能换回代号。
+
+    用户反馈看不懂 flac / hires / master 这些英文代号，所以下拉里一律
+    显示 songinfo.QUALITY_LABEL 的中文名，内部仍用代号流转。
+    这里两头都守住：既不能露英文代号，也不能把代号弄丢。
+    """
+    import songinfo as SI
+
     app = make_app()
     app._apply_source_info({
         "meta": {"name": "t", "version": "1"},
@@ -395,19 +402,33 @@ def test_quality_format_filter():
     app.sp_platform.text = "网易云 (wy)"
     app.sp_format.text = "自动"
     app._refresh_qualities()
-    if list(app.sp_quality.values) != ["128k", "320k", "flac", "hires"]:
+    want = [SI.quality_label(q) for q in ("128k", "320k", "flac", "hires")]
+    if list(app.sp_quality.values) != want:
         raise AssertionError("自动模式品质不对: %s" % (app.sp_quality.values,))
+
+    # 下拉里不能出现英文代号
+    for label in app.sp_quality.values:
+        if label in ("128k", "192k", "320k", "flac", "flac24bit",
+                     "hires", "master"):
+            raise AssertionError("品质下拉里还是英文代号: %r" % label)
+
+    # 中文标签必须能换回代号（否则解析时会拿中文去问音源）
+    app.sp_quality.text = SI.quality_label("flac")
+    if app._quality_code() != "flac":
+        raise AssertionError("标签换不回代号: %r" % app._quality_code())
 
     app.sp_format.text = "FLAC"
     app._refresh_qualities()
-    if list(app.sp_quality.values) != ["flac", "hires"]:
+    if list(app.sp_quality.values) != [SI.quality_label(q)
+                                       for q in ("flac", "hires")]:
         raise AssertionError("FLAC 过滤不对: %s" % (app.sp_quality.values,))
 
     app.sp_format.text = "MP3"
     app._refresh_qualities()
-    if list(app.sp_quality.values) != ["128k", "320k"]:
+    if list(app.sp_quality.values) != [SI.quality_label(q)
+                                       for q in ("128k", "320k")]:
         raise AssertionError("MP3 过滤不对: %s" % (app.sp_quality.values,))
-    print("  自动/FLAC/MP3 过滤都正确 ✓")
+    print("  中文显示 + 代号回换 + 自动/FLAC/MP3 过滤 ✓")
 
 
 def test_song_detail():
@@ -793,6 +814,84 @@ def test_download_survives_exists_lie():
         os.path.exists = real_exists
         os.remove = real_remove
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_player_transient_error_deferred():
+    """回归：MediaPlayer 的瞬时 onError 不能立刻报「播放失败」。
+
+    真机 diag.log：
+      MediaPlayer 错误 what=-38 extra=0
+      MediaPlayer 就绪，时长=276.0s        <- 紧接着就成功了
+    如果 onError 立刻 emit("error")，用户看到的是错误提示闪一下、
+    随即又变成「正在播放」，像出了 bug。现在延后确认：期间就绪就不报，
+    一直没就绪才当真失败。
+    """
+    import time
+    import player as P
+
+    events = []
+    pl = P.Player()
+    pl._on_event = lambda kind, payload: events.append((kind, payload))
+
+    # ① 报错后马上「就绪」（模拟 onPrepared 作废了这次错误确认）
+    pl._state = P.Player.BUFFERING
+    pl._note_error(-38, 0, delay=0.3)
+    pl._error_gen += 1
+    pl._state = P.Player.PLAYING
+    time.sleep(0.5)
+    if any(k == "error" for k, _ in events):
+        raise AssertionError("已经播上了不该再报错: %s" % events)
+    print("  瞬时错误被撤销 ✓")
+
+    # ② 报错后一直没就绪 -> 必须如实报出来，不能静默
+    events.clear()
+    pl._state = P.Player.BUFFERING
+    pl._note_error(1, 0, delay=0.3)
+    time.sleep(0.6)
+    if not any(k == "error" for k, _ in events):
+        raise AssertionError("真失败必须报出来: %s" % events)
+    if pl.state != P.Player.IDLE:
+        raise AssertionError("真失败后状态应为 IDLE，实际 %s" % pl.state)
+    print("  真失败仍会报出 ✓")
+
+
+def test_download_unique_path():
+    """回归：目标文件已存在就自动改名，**绝不覆盖**。
+
+    Android 上「覆盖」的两种写法真机都栽过：
+      1) 先 os.remove(dest) 再 rename -> FileNotFoundError
+      2) os.replace(tmp, dest)        -> OSError [Errno 1] Operation not permitted
+    两次的现象都是「进度条走到 100% 然后整个下载作废」，
+    所以干脆不覆盖：存在就顺延成 "xxx (1).mp3"。
+    """
+    import shutil
+    import tempfile
+    import downloader as D
+
+    tmp = tempfile.mkdtemp(prefix="lxuniq_")
+    try:
+        dest = os.path.join(tmp, "\u604b\u4eba - \u674e\u8363\u6d69.mp3")
+        if D.unique_path(dest) != dest:
+            raise AssertionError("目标不存在时不该改名")
+
+        with open(dest, "wb") as f:
+            f.write(b"x")
+        got = D.unique_path(dest)
+        if got == dest:
+            raise AssertionError("目标存在时必须改名")
+        if not got.endswith("(1).mp3"):
+            raise AssertionError("顺延命名不对: %s" % got)
+
+        with open(got, "wb") as f:
+            f.write(b"x")
+        got2 = D.unique_path(dest)
+        if not got2.endswith("(2).mp3"):
+            raise AssertionError("第二次顺延不对: %s" % got2)
+        if os.path.dirname(got2) != os.path.dirname(dest):
+            raise AssertionError("顺延结果跑出目录了: %s" % got2)
+        print("  同名自动顺延 (1)/(2) ✓")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_netease_paging():
@@ -1341,6 +1440,8 @@ def main():
     check("目录 tree URI 换算", test_tree_uri_to_path)
     check("QQ 代理可自定义", test_qq_proxies_configurable)
     check("下载不被 exists/remove 不一致搞挂", test_download_survives_exists_lie)
+    check("同名文件自动顺延不覆盖", test_download_unique_path)
+    check("播放器瞬时错误延后确认", test_player_transient_error_deferred)
     check("搜索分页 + 限流识别", test_netease_paging)
     check("内置多个音源", test_bundled_sources)
     check("5 个平台搜索都注册", test_searchers_registry)

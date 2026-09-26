@@ -22,11 +22,19 @@ FORMAT_BY_QUALITY = {
     "atmos": "m4a", "atmos_plus": "m4a",
 }
 
-# 品质展示名
+# 品质展示名（**必须是中文**）
+# 用户反馈看不懂 flac / hires / master 这些代号，所以下拉里一律用中文，
+# 代号只在内部流转（QUALITY_ORDER / 音源契约用代号）。
 QUALITY_LABEL = {
-    "128k": "128k 标准", "192k": "192k 较高", "320k": "320k 高",
-    "flac": "FLAC 无损", "flac24bit": "FLAC 24bit", "hires": "Hi-Res",
-    "master": "母带", "atmos": "全景声", "atmos_plus": "全景声+",
+    "128k": "标准音质",
+    "192k": "较高音质",
+    "320k": "高音质",
+    "flac": "无损音质",
+    "flac24bit": "24bit 无损",
+    "hires": "高解析无损",
+    "master": "母带音质",
+    "atmos": "全景声",
+    "atmos_plus": "全景声+",
 }
 
 FORMAT_ORDER = ["自动", "MP3", "FLAC"]

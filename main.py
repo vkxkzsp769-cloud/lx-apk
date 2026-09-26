@@ -202,6 +202,32 @@ class FlatButton(Button):
             c.rgba = self.bg_color
 
 
+class SearchInput(TextInput):
+    """搜索输入框。
+
+    用户反馈：点搜索框弹出软键盘，用返回键收起之后，**再点搜索框也弹不出
+    键盘了**。原因是 Android 上 Kivy 的 TextInput 这时 `focus` 仍然是 True，
+    系统认为「已经聚焦，不必再弹键盘」，状态就这么卡住。
+
+    这里在触摸时检查一次「自以为聚焦、但键盘其实不在」，做一次
+    「失焦 → 延时聚焦」，把键盘重新拉起来。键盘正常在的时候什么都不做。
+    """
+
+    def _keyboard_gone(self):
+        try:
+            from kivy.core.window import Window
+            return not Window.keyboard_height
+        except Exception:
+            return False
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos) and self.focus and self._keyboard_gone():
+            self.focus = False
+            Clock.schedule_once(lambda *_: setattr(self, "focus", True), 0.05)
+            return True
+        return super().on_touch_down(touch)
+
+
 # ============================================================
 #  主界面
 # ============================================================
@@ -299,8 +325,10 @@ class LxApp(App):
                                      **self.F)
         self.sp_platform.bind(text=lambda *_: self._refresh_qualities())
         row.add_widget(self.sp_platform)
-        self.sp_quality = CNSpinner(text="320k", values=QUALITY_ORDER,
-                                    font_size=dp(14), **self.F)
+        self.sp_quality = CNSpinner(
+            text=songinfo.quality_label("320k"),
+            values=[songinfo.quality_label(q) for q in QUALITY_ORDER],
+            font_size=dp(14), **self.F)
         row.add_widget(self.sp_quality)
         panel.add_widget(row)
 
@@ -322,11 +350,11 @@ class LxApp(App):
         # ---- 搜索 ----
         panel.add_widget(self._section("搜索"))
         row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        self.ti_search = TextInput(hint_text="输入歌名或歌手", multiline=False,
-                                   font_size=dp(15), padding=(dp(12), dp(12)),
-                                   background_color=C_CTRL,
-                                   foreground_color=C_TEXT,
-                                   hint_text_color=C_FAINT, **self.F)
+        self.ti_search = SearchInput(hint_text="输入歌名或歌手", multiline=False,
+                                     font_size=dp(15), padding=(dp(12), dp(12)),
+                                     background_color=C_CTRL,
+                                     foreground_color=C_TEXT,
+                                     hint_text_color=C_FAINT, **self.F)
         self.ti_search.bind(on_text_validate=self.do_search)
         row.add_widget(self.ti_search)
         self.btn_search = self._btn("搜索", color=C_ACCENT, w=dp(76),
@@ -839,10 +867,27 @@ class LxApp(App):
         return str(sb.toString())
 
     # ---------- 搜索 ----------
+    def _focus_search(self):
+        """把搜索框重新聚焦。
+
+        Android 上用户收起软键盘后 Kivy 的 focus 仍是 True，
+        直接再点不会弹键盘 —— 必须显式「失焦 → 延时聚焦」。
+        """
+        try:
+            ti = self.ti_search
+            ti.focus = False
+            Clock.schedule_once(lambda *_: setattr(ti, "focus", True), 0.05)
+        except Exception:
+            log_exc("_focus_search")
+
     def do_search(self, *_):
         try:
             keyword = self.ti_search.text.strip()
             if not keyword:
+                # 空输入时把键盘重新拉起来。用户反馈「关了键盘后点搜索
+                # 没反应」多半就卡在这：只报一句「请先输入歌名」，
+                # 键盘却不回来，看着像按钮坏了。
+                self._focus_search()
                 self.set_status("请先输入歌名")
                 return
             if self.busy:
@@ -895,20 +940,57 @@ class LxApp(App):
             self.set_status("没有找到结果")
             return
 
-        self.hint.text = "点击任意一首查看详情 / 播放 / 下载（共 %d 首）" % len(self.songs)
-        kw = dict(self.F)
+        self.hint.text = "点歌名直接播放，点右侧「下载」保存（共 %d 首）" % len(self.songs)
         for i, s in enumerate(self.songs):
-            item = FlatButton(
+            row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(6))
+            # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
+            song_btn = FlatButton(
                 text="%s\n%s    %s"
                      % (s["name"], s["singer"], s.get("interval") or "--:--"),
-                size_hint_y=None, height=dp(58), halign="left",
-                valign="middle", font_size=dp(13), color=C_TEXT,
-                bg_color=C_ITEM, radius=10, **self.F)   # 少了 **self.F 中文就是方块
-            item.bind(size=lambda b, v: setattr(b, "text_size",
-                                                (v[0] - dp(24), None)))
-            item.bind(on_release=lambda b, idx=i: self.open_song(idx))
-            self.results.add_widget(item)
-        self.set_status("找到 %d 首，点一首查看详情" % len(self.songs))
+                halign="left", valign="middle", font_size=dp(13),
+                color=C_TEXT, bg_color=C_ITEM, radius=10, **self.F)
+            song_btn.bind(size=lambda b, v: setattr(b, "text_size",
+                                                    (v[0] - dp(20), None)))
+            song_btn.bind(on_release=lambda b, idx=i: self.play_song(idx))
+            row.add_widget(song_btn)
+
+            dl = FlatButton(text="下载", font_size=dp(13), color=C_TEXT,
+                            bg_color=C_CTRL, radius=10, size_hint_x=None,
+                            width=dp(58), **self.F)
+            dl.bind(on_release=lambda b, idx=i: self.download_song(idx))
+            row.add_widget(dl)
+            self.results.add_widget(row)
+        self.set_status("找到 %d 首：点歌名播放，点「下载」保存" % len(self.songs))
+
+    # ---------- 列表上的直接操作 ----------
+    def play_song(self, idx):
+        """点歌名：解析直链后直接播放"""
+        self._act_on_song(idx, "play")
+
+    def download_song(self, idx):
+        """点下载：解析直链后直接下载"""
+        self._act_on_song(idx, "download")
+
+    def _act_on_song(self, idx, action):
+        try:
+            if idx >= len(self.songs):
+                return
+            if self.busy:
+                self.set_status("正在处理中，请稍候…")
+                return
+            song = self.songs[idx]
+            self.busy = True
+            self._cur_song = song
+            self._cur_url = None
+            self._pre_meta = None
+            self._pending_action = action
+            self.set_status(("正在准备播放: " if action == "play"
+                             else "正在准备下载: ") + song["name"])
+            self.bg(lambda: self._resolve_song(song), "resolve")
+        except Exception as e:
+            self.busy = False
+            log_exc("_act_on_song")
+            self.set_status("操作失败: %s" % e, C_ERR)
 
     # ---------- 品质 / 格式 ----------
     def _current_source(self):
@@ -928,15 +1010,32 @@ class LxApp(App):
         return list(QUALITY_ORDER)
 
     def _refresh_qualities(self):
-        """按平台 + 格式偏好刷新品质下拉"""
+        """按平台 + 格式偏好刷新品质下拉。
+
+        下拉里显示**中文标签**（用户看不懂 flac/hires 这些代号），
+        内部一律用代号，靠 _quality_code() 换回去。
+        """
         try:
             quals = songinfo.filter_qualities(self._platform_qualities(),
                                               self.sp_format.text)
-            self.sp_quality.values = quals
-            if self.sp_quality.text not in quals and quals:
-                self.sp_quality.text = quals[0]
+            self._qual_labels = {songinfo.quality_label(q): q for q in quals}
+            self.sp_quality.values = list(self._qual_labels.keys())
+            code = self._quality_code()
+            if code not in quals and quals:
+                code = quals[0]
+            self.sp_quality.text = songinfo.quality_label(code)
         except Exception:
             log_exc("_refresh_qualities")
+
+    def _quality_code(self):
+        """把下拉里的中文标签换回品质代号（换不回来就退回高音质）"""
+        text = (self.sp_quality.text or "").strip()
+        code = getattr(self, "_qual_labels", {}).get(text)
+        if code:
+            return code
+        if text in songinfo.QUALITY_LABEL:      # 兼容直接给代号的情况
+            return text
+        return "320k"
 
     # ---------- 歌曲详情 ----------
     def open_song(self, idx):
@@ -991,7 +1090,7 @@ class LxApp(App):
 
     def _resolve_song(self, song):
         """后台：解析直链（本平台内依次尝试各音质，不换平台）"""
-        want = self.sp_quality.text or "320k"
+        want = self._quality_code()
         order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
         order = order[:3]
 
@@ -1038,6 +1137,20 @@ class LxApp(App):
 
     def _song_failed(self, err, platform=None):
         name = PLATFORM_LABEL.get(platform or "", platform or "")
+        self.busy = False
+        self._pending_action = None
+        # 失败时**才**弹详情框 —— 那里有「改用 XX 平台」的入口。
+        # 成功路径不弹：点歌名就是直接播放，点「下载」就是直接下载。
+        #
+        # 注意判据是「是否真的在显示」，不是「对象存不存在」：
+        # _popup 弹过一次再关掉之后仍然不是 None（只是没挂在窗口上），
+        # 只看 None 会把错误写进一个已经关掉的框里，用户什么都看不到。
+        if getattr(self._popup, "parent", None) is None:
+            try:
+                self._show_song_popup(self._cur_song
+                                      or {"name": "未知歌曲", "singer": ""})
+            except Exception:
+                log_exc("_show_song_popup(失败兜底)")
         if getattr(self, "_pop_info", None) is not None:
             self._pop_info.text = ("%s 取不到直链\n原因: %s\n\n"
                                    "（不会自动换成别的平台 —— 你可以自己选）"
@@ -1082,6 +1195,16 @@ class LxApp(App):
                            songinfo.quality_label(quality),
                            (self._cur_ext or "?").upper(),
                            songinfo.human_size(meta.get("size"))), C_OK)
+
+        # 列表上的直接动作（点歌名播放 / 点下载）在这里接着走完。
+        # 走详情弹窗那条路时不带 _pending_action，所以不会重复触发。
+        act = getattr(self, "_pending_action", None)
+        self._pending_action = None
+        self.busy = False
+        if act == "play":
+            self.play_current()
+        elif act == "download":
+            self.download_current()
 
     def _switch_platform(self):
         """用户主动点了「改用 XX」才换平台"""
@@ -1273,8 +1396,12 @@ class LxApp(App):
     def _download_url(self, song, url, ext, platform=None):
         try:
             out_dir = download_dir()
-            if not appenv.using_public_dir() and IS_ANDROID \
-                    and not self._asked_permission:
+            # 往公共目录（Download/…）写需要「所有文件访问」；Android 11+
+            # 不授权就只能写 App 私有目录。原判断是「不打算用公共目录才提示」，
+            # 恰好写反了：真正要写公共目录时反而从不提示，用户一直没授权，
+            # 下载就卡在最后一步（真机实测 EPERM，进度条到 100% 然后作废）。
+            if IS_ANDROID and not self._asked_permission \
+                    and not appenv.has_all_files_access():
                 self._asked_permission = True
                 self.ui(lambda: self.set_status(
                     "提示：授权「所有文件访问」后文件会存到 "
@@ -1284,7 +1411,9 @@ class LxApp(App):
 
             name = downloader.safe_name("%s - %s" % (song.get("name", "unknown"),
                                                      song.get("singer", "")))
-            dest = os.path.join(out_dir, "%s.%s" % (name, ext))
+            # 同名文件自动改名，不覆盖 —— Android 上覆盖会 EPERM
+            dest = downloader.unique_path(
+                os.path.join(out_dir, "%s.%s" % (name, ext)))
 
             def on_progress(got, total):
                 self.ui(lambda: self._progress(got, total, song.get("name", "")))

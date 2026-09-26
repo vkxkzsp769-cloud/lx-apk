@@ -33,6 +33,29 @@ def safe_name(s):
     return (re.sub(r"\s+", " ", s).strip(" .") or "unknown")[:120]
 
 
+def unique_path(dest):
+    """目标已存在就换个名字，绝不覆盖。
+
+    为什么不能直接覆盖（真机实测两轮才定位到）：
+      1) 先 os.remove(dest) 再 rename —— os.path.exists(dest) 返回 True，
+         remove 却抛 FileNotFoundError（Android FUSE 看到的是 MediaStore
+         视图，真实文件系统里没有）。
+      2) 改成 os.replace(tmp, dest) —— 又变成
+         OSError [Errno 1] Operation not permitted，因为这个名字的文件
+         是当前安装「改不动」的（其他应用/旧安装留下、或权限范围之外）。
+    两次都表现成「进度条走到 100% 然后整个下载作废」。
+    下载器本来也不该悄悄盖掉用户已有的文件，所以改成自动改名。
+    """
+    if not os.path.exists(dest):
+        return dest
+    base, ext = os.path.splitext(dest)
+    for i in range(1, 1000):
+        cand = "%s (%d)%s" % (base, i, ext)
+        if not os.path.exists(cand):
+            return cand
+    return "%s (copy)%s" % (base, ext)
+
+
 # 各平台 CDN 大多会校验 Referer，缺了会返回 403/空内容。
 # 典型症状：能在线播放（播放器自带来源），但下载失败。
 PLATFORM_REFERER = {
@@ -127,17 +150,16 @@ def download(url, dest, on_progress=None, platform=None):
             if magic[:4] == b"<htm" or magic[:1] == b"{":
                 raise RuntimeError("下载到的是网页，直链失效")
 
-            # 覆盖同名文件。
-            # 不能写成「先 os.remove(dest) 再 os.rename」：
-            #   Android 的 FUSE 层会让 os.path.exists() 看到 MediaStore 里
-            #   其实已经不存在的条目，紧接着的 os.remove() 直接
-            #   FileNotFoundError —— 而它没被兜住，于是**整个下载作废**。
-            #   真机实测：11MB 已经下完，栽在删旧文件这一步
-            #   （diag.log「下载尝试1失败([Errno 2] No such file or
-            #    directory: '.../恋人 - 李荣浩.mp3')」）。
-            # os.replace 在 POSIX 和 Windows 上都是原子覆盖，
-            # 目标存在与否都正确，压根不需要先删。
-            os.replace(tmp, dest)
+            # os.replace 在 POSIX 和 Windows 上都是原子覆盖。
+            # 但如果目标就是动不了（Android 上目标属于别的应用/旧安装时
+            # 会 EPERM），别让整个下载作废 —— 改名保存，并写清日志。
+            try:
+                os.replace(tmp, dest)
+            except OSError as e:
+                alt = unique_path(dest)
+                log("覆盖 %s 失败(%s)，改存 %s" % (dest, e, alt))
+                diag("覆盖失败 %s -> 改为 %s" % (e, alt))
+                os.replace(tmp, alt)
             return got
 
         except Exception as e:
