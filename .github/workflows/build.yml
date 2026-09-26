@@ -47,22 +47,29 @@ jobs:
           restore-keys: |
             android-sdk-ndk-r25b-
 
-      # 必须单独缓存签名密钥，否则每个版本的 APK 签名都不一样，
+      # 固定签名密钥 —— 不做这一步，每个版本的 APK 签名都不一样，
       # Android 就只允许「先卸载再装」，用户每次升级都得删旧版。
       #
-      # 原因：构建走的是 `p4a apk --debug`，没有传 --keystore，
-      # 用的是 Gradle 默认的 debug 签名 —— 它读 $HOME/.android/debug.keystore。
-      # 而 runner 每次都是全新环境，这个文件不存在就会被重新生成一把新钥匙，
-      # 签名自然每次不同（实测 v2.6.4 与 v2.6.6 的 CERT.RSA sha256 不同、
-      # 连长度都不同：1019B vs 1015B）。
+      # 实测证据：v2.6.4 与 v2.6.6 的 CERT.RSA sha256 不同、连长度都不同
+      # （1019B vs 1015B）。原因是构建走 `p4a apk --debug`、没传
+      # --keystore，用的是 AGP 自动生成的 debug 钥匙；而 runner 每次都是
+      # 全新环境，那把钥匙每次都是新生成的。
       #
-      # key 不带 restore-keys：只有这一次缓存命中才算数，命中就不覆盖，
-      # 保证拿到的是同一把钥匙。
-      - name: 缓存签名密钥（保证能覆盖安装）
-        uses: actions/cache@v4
-        with:
-          path: ~/.android
-          key: android-debug-keystore-v1
+      # 先试过「缓存 ~/.android」，无效 —— 缓存只有 365 字节，说明钥匙
+      # 根本不在那里。所以改成把钥匙放在 Secret 里，每次构建还原回去。
+      #
+      # 别名/口令必须是 androiddebugkey / android：AGP 的 debug 签名配置
+      # 写死了这两个值，改别的它会找不到。
+      - name: 写入固定签名密钥（保证能覆盖安装）
+        if: ${{ secrets.DEBUG_KEYSTORE_B64 != '' }}
+        run: |
+          mkdir -p "$HOME/.android"
+          echo "${{ secrets.DEBUG_KEYSTORE_B64 }}" | base64 -d \
+            > "$HOME/.android/debug.keystore"
+          ls -l "$HOME/.android/debug.keystore"
+          # 提前读一次 —— 密钥不对就在这里失败，别拖到签名那一步才报
+          keytool -list -keystore "$HOME/.android/debug.keystore" \
+            -storepass android -alias androiddebugkey | tail -3
 
       - name: 预装 Android SDK
         env:
