@@ -127,9 +127,17 @@ def download(url, dest, on_progress=None, platform=None):
             if magic[:4] == b"<htm" or magic[:1] == b"{":
                 raise RuntimeError("下载到的是网页，直链失效")
 
-            if os.path.exists(dest):
-                os.remove(dest)
-            os.rename(tmp, dest)
+            # 覆盖同名文件。
+            # 不能写成「先 os.remove(dest) 再 os.rename」：
+            #   Android 的 FUSE 层会让 os.path.exists() 看到 MediaStore 里
+            #   其实已经不存在的条目，紧接着的 os.remove() 直接
+            #   FileNotFoundError —— 而它没被兜住，于是**整个下载作废**。
+            #   真机实测：11MB 已经下完，栽在删旧文件这一步
+            #   （diag.log「下载尝试1失败([Errno 2] No such file or
+            #    directory: '.../恋人 - 李荣浩.mp3')」）。
+            # os.replace 在 POSIX 和 Windows 上都是原子覆盖，
+            # 目标存在与否都正确，压根不需要先删。
+            os.replace(tmp, dest)
             return got
 
         except Exception as e:

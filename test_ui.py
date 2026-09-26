@@ -717,6 +717,84 @@ def test_qq_proxies_configurable():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_download_survives_exists_lie():
+    """回归：Android 上「exists 说文件在、remove 说不存在」不能把下载搞挂。
+
+    真机实测（diag.log 2026-09-26 15:10）：
+      下载尝试1 status=200 type=audio/mpeg len=11039079     <- 11MB 已经下完了
+      下载尝试1失败([Errno 2] No such file or directory:
+                    '.../恋人 - 李荣浩.mp3')
+    崩在 downloader.py:131 —— 上一行 os.path.exists(dest) 返回 True，
+    紧接着 os.remove(dest) 抛 FileNotFoundError。原因是 Android 的 FUSE 层
+    让 exists 看到的是 MediaStore 视图，真实文件系统里并没有这个条目。
+    而那个 remove 没被兜住，于是整个下载作废。
+
+    现在改成 os.replace 原子覆盖（POSIX/Windows 都正确），压根不先删。
+    """
+    import shutil
+    import tempfile
+    import downloader as D
+    import netutil
+
+    tmpdir = tempfile.mkdtemp(prefix="lxdl_")
+    dest = os.path.join(tmpdir, "\u604b\u4eba - \u674e\u8363\u6d69.mp3")
+    payload = b"ID3\x03\x00" + b"\x00" * 20000     # 够 10KB 门槛 + 音频魔数
+
+    real_exists, real_remove = os.path.exists, os.remove
+    real_urlopen = netutil.urlopen
+    calls = {"remove": 0}
+
+    class _Resp:
+        status = 200
+        headers = {"Content-Type": "audio/mpeg",
+                   "Content-Length": str(len(payload))}
+
+        def __init__(self):
+            self._buf = payload
+
+        def read(self, n=-1):
+            data = self._buf[:n] if n and n > 0 else self._buf
+            self._buf = self._buf[len(data):]
+            return data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_exists(p):
+        # 对目标文件撒谎：说它在
+        if os.path.normpath(str(p)) == os.path.normpath(dest):
+            return True
+        return real_exists(p)
+
+    def fake_remove(p):
+        calls["remove"] += 1
+        if os.path.normpath(str(p)) == os.path.normpath(dest):
+            raise FileNotFoundError(2, "No such file or directory", p)
+        return real_remove(p)
+
+    netutil.urlopen = lambda *a, **k: _Resp()
+    os.path.exists = fake_exists
+    os.remove = fake_remove
+    try:
+        got = D.download("http://example.com/a.mp3", dest, platform="tx")
+        if got != len(payload):
+            raise AssertionError("下载字节数不对: %s" % got)
+        if not real_exists(dest):
+            raise AssertionError("最终文件没落盘")
+        with open(dest, "rb") as f:
+            if f.read(3) != b"ID3":
+                raise AssertionError("落盘内容不对")
+        print("  exists 撒谎时照样下完 ✓（成功路径没再碰 remove）")
+    finally:
+        netutil.urlopen = real_urlopen
+        os.path.exists = real_exists
+        os.remove = real_remove
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_netease_paging():
     """回归：搜索必须能分页，且要识别接口限流。
 
@@ -1262,6 +1340,7 @@ def main():
     check("下载目录可自选 + 持久化", test_download_dir_setting)
     check("目录 tree URI 换算", test_tree_uri_to_path)
     check("QQ 代理可自定义", test_qq_proxies_configurable)
+    check("下载不被 exists/remove 不一致搞挂", test_download_survives_exists_lie)
     check("搜索分页 + 限流识别", test_netease_paging)
     check("内置多个音源", test_bundled_sources)
     check("5 个平台搜索都注册", test_searchers_registry)
