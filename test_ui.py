@@ -582,6 +582,12 @@ def test_bundled_sources():
         if not os.path.exists(pth) or os.path.getsize(pth) < 500:
             raise AssertionError("音源文件异常: %s" % n)
 
+    # 兜底：即使 assets/sources 没打进包，也必须能放出单文件音源，
+    # 否则 App 会「没有任何音源可用」（致命）
+    fb = appenv._fallback_single_source() if not items else None
+    if not items and not fb:
+        raise AssertionError("既没有多音源，兜底单文件也拿不到")
+
     default = appenv.default_source_path()
     if not os.path.exists(default):
         raise AssertionError("默认音源不存在: %s" % default)

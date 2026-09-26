@@ -271,21 +271,46 @@ def extract_bundled_sources():
     return out
 
 
+def _fallback_single_source():
+    """兜底：万一 assets/sources/ 没打进包，至少把 default_source.js 放出来。
+
+    正常情况用不到 —— 但「没有音源可用」是致命的，
+    所以这里留一条路，保证 App 永远有源可加载。
+    """
+    if os.path.exists(SOURCE_FILE) and os.path.getsize(SOURCE_FILE) > 1000:
+        return SOURCE_FILE
+    for cand in (BUILTIN_SOURCE,
+                 os.path.join(APP_DIR, "assets", "default_source.js")):
+        try:
+            if os.path.exists(cand) and os.path.getsize(cand) > 1000:
+                _copy_file(cand, SOURCE_FILE)
+                log("兜底音源 -> %s（来自 %s）" % (SOURCE_FILE, cand))
+                return SOURCE_FILE
+        except Exception:
+            log_exc("兜底音源 %s" % cand)
+    return None
+
+
 def default_source_path():
-    """默认音源路径（找不到就退回第一个）"""
+    """默认音源路径（找不到就退回第一个，再不行用兜底单文件）"""
     p = os.path.join(BUILTIN_DIR, DEFAULT_SOURCE_NAME)
     if os.path.exists(p):
         return p
     for fn, path in extract_bundled_sources():
         return path
-    return SOURCE_FILE
+    fb = _fallback_single_source()
+    return fb or SOURCE_FILE
 
 
 def ensure_source():
     """确保有一个可用音源：释放内置音源，返回默认那个的路径。"""
     items = extract_bundled_sources()
     if not items:
-        raise RuntimeError("APK 里没有内置音源（assets/sources 为空）")
+        fb = _fallback_single_source()
+        if not fb:
+            raise RuntimeError("找不到任何内置音源")
+        log("警告: assets/sources 为空，已退回单文件音源")
+        return fb
     path = default_source_path()
     log("默认音源:", os.path.basename(path))
     return path
