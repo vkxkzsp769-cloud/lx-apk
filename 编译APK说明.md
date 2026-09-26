@@ -175,3 +175,54 @@ python test_desktop.py "海阔天空"
 | `.github/workflows/build.yml` | 云端自动编译脚本 |
 | `assets/default_source.js` | 内置默认音源 |
 | `test_desktop.py` | 本地链路测试（不装 Kivy 也能跑） |
+
+---
+
+## 中文字体（`assets/fonts/`）
+
+App 自带一份中文字体，不依赖设备字体 —— 很多手机的
+`/system/fonts/NotoSansCJK-Regular.ttc` 里 face[0] 是**日文**变体，
+而 Kivy 的 SDL_ttf 只会打开 face 0，中文会被渲染成日文字形。
+
+**覆盖范围是有意留宽的**：`NotoSansSC-full.ttf` 覆盖
+CJK 基本区（简+繁+日文汉字）+ 扩展A + 兼容汉字 + 假名 + 全角标点
++ 常用符号，共 29717 个码点，约 9.9MB。
+
+> 早先版本只裁到 **GB2312（6763 汉字）**，于是繁体字、日文汉字、
+> 韩文、以及 `©®™♥♪` 这类符号全是方块 —— 歌名里一出现就中招。
+> **别为了瘦 APK 把字体裁回去。** `test_ui.py::test_bundled_font_preferred`
+> 会直接查 cmap，缺一个字就失败。
+
+重新生成（换字重 / 调覆盖）：
+
+```python
+from fontTools.ttLib import TTFont
+from fontTools.varLib import instancer
+from fontTools import subset
+
+f = TTFont(r"C:\Windows\Fonts\NotoSansSC-VF.ttf")
+# 注意：可变字体的默认轴是 wght=100(Thin)，必须显式实例化到 400
+instancer.instantiateVariableFont(f, {"wght": 400}, inplace=True)
+sub = subset.Subsetter()
+sub.populate(unicodes=set(range(0x4E00, 0xA000)) | set(range(0x3400, 0x4DC0)))
+sub.subset(f)
+f.save("assets/fonts/NotoSansSC-full.ttf")
+```
+
+---
+
+## 用设置弹窗改的东西（不用重编 APK）
+
+主面板右上角 **设置**：
+
+- **下载保存位置**：内置几个预设（`Download/落雪音源`、`Music/落雪音源`、
+  `Download` 根目录、App 私有目录），也可以走系统目录选择器任选。
+  选择会存进 `settings.json`，下次启动仍然生效。
+- **QQ 代理**：QQ 音乐靠第三方代理取直链，而这些代理**随时会失效**
+  （2026-09 实测内置 3 条里只剩 `kgqq1` 能用）。这里可以直接选一个
+  `.txt` 覆盖代理列表，一行一条、每行要含 `{id}`：
+
+  ```
+  # 注释行会被忽略
+  http://your-proxy.example.com/qq.php?type=mp3&id={id}&level={level}
+  ```

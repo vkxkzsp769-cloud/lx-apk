@@ -33,7 +33,7 @@ from kivy.uix.popup import Popup
 from kivy.uix.progressbar import ProgressBar
 from kivy.uix.slider import Slider
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.spinner import Spinner
+from kivy.uix.spinner import Spinner, SpinnerOption
 from kivy.uix.textinput import TextInput
 
 import appenv
@@ -45,8 +45,9 @@ import qqresolve
 import songinfo
 from appenv import (IS_ANDROID, SOURCE_FILE, default_source_path, diag,
                     download_dir, ensure_source, extract_bundled_sources, log,
-                    log_exc, request_all_files_access, save_source,
-                    source_title)
+                    log_exc, preset_dirs, request_all_files_access,
+                    save_source, set_download_dir, source_title,
+                    tree_uri_to_path)
 from lxbridge import LxBridge
 
 # ============================================================
@@ -88,6 +89,21 @@ def fmt_time(sec):
 # ============================================================
 #  控件
 # ============================================================
+class CNSpinnerOption(SpinnerOption):
+    """下拉列表项。
+
+    Spinner 的选项项默认**不带** font_name，展开后中文会显示成方块。
+    在创建时就把字体传进去最稳 —— 之前在 _create_dropdown 之后
+    再遍历容器补字体，时机并不可靠（选项可能是稍后才填进容器的，
+    那时遍历到的是空容器，等于没补）。
+    """
+
+    def __init__(self, **kw):
+        for k, v in fonts.font_kwargs().items():
+            kw.setdefault(k, v)
+        super().__init__(**kw)
+
+
 class CNSpinner(Spinner):
     """下拉框。做两件事：
 
@@ -109,6 +125,7 @@ class CNSpinner(Spinner):
         kw.setdefault("background_down", "")
         kw.setdefault("background_color", C_CTRL)
         kw.setdefault("color", C_TEXT)
+        kw.setdefault("option_cls", CNSpinnerOption)   # 下拉项在创建时就带中文字体
         super().__init__(**kw)
 
     def _create_dropdown(self, *largs):
@@ -207,6 +224,7 @@ class LxApp(App):
         self._cur_dur = 0.0
         self._popup = None
         self.F = fonts.font_kwargs()
+        self.P = fonts.popup_kwargs()      # Popup 标题的字体参数名是 title_font
 
         root = BoxLayout(orientation="vertical")
         attach_bg(root, C_BG)
@@ -244,6 +262,13 @@ class LxApp(App):
                              halign="right", valign="middle", **self.F)
         self.lbl_sub.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         box.add_widget(self.lbl_sub)
+        # 「设置」放这里而不是塞进主面板：
+        # 主面板的高度是有预算的（交接文档写死 330dp 左右，小屏 640dp
+        # 还要给结果列表留位置）。保存位置/QQ 代理这种低频项进弹窗，
+        # 主面板就不会把列表挤没。
+        self.btn_set = self._btn("设置", color=C_CTRL, w=dp(58), fs=dp(13))
+        self.btn_set.bind(on_release=lambda *_: self.open_settings())
+        box.add_widget(self.btn_set)
         return box
 
     def _build_panel(self):
@@ -441,6 +466,14 @@ class LxApp(App):
             diag("内置音源 %d 个: %s" % (len(labels), labels[:3]))
         else:
             self.sp_source.text = "无内置音源"
+        try:
+            self._fill_dir_presets()
+        except Exception:
+            log_exc("_fill_dir_presets")
+        try:
+            self._refresh_proxy_label()
+        except Exception:
+            log_exc("_refresh_proxy_label")
         self.set_status("正在启动 JS 引擎…")
         if IS_ANDROID:
             self.bridge.start(on_ready=self._on_engine_ready)
@@ -549,11 +582,94 @@ class LxApp(App):
         if self.hint.text.startswith("搜索后"):
             self.hint.text = "搜索后点结果即可下载"
 
-    # ---------- 换音源 ----------
-    def pick_source(self, *_):
-        """从手机里选一个新的音源 .js 文件"""
+    # ---------- 设置 ----------
+    def open_settings(self, *_):
+        """设置弹窗：下载保存位置 + QQ 代理。
+
+        这两项都是低频操作，放主面板会把「搜索框 + 结果列表」
+        挤到看不见（小屏尤其明显），所以收进弹窗。
+        """
+        content = BoxLayout(orientation="vertical", spacing=dp(10),
+                            padding=dp(14))
+
+        content.add_widget(self._section("下载保存位置"))
+        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        self.sp_dir = CNSpinner(text="—", values=[], font_size=dp(13),
+                                **self.F)
+        self.sp_dir.bind(on_text=self._on_dir_preset)
+        row.add_widget(self.sp_dir)
+        btn_dir = self._btn("选目录", color=C_CTRL, w=dp(72))
+        btn_dir.bind(on_release=self.pick_dir)
+        row.add_widget(btn_dir)
+        content.add_widget(row)
+        self._fill_dir_presets()
+
+        content.add_widget(self._section("QQ 代理（失效时可自己换，不用重编）"))
+        self.btn_proxy = self._btn("选择代理文件(.txt)", color=C_CTRL,
+                                   fs=dp(13), w=None)
+        self.btn_proxy.bind(on_release=self.pick_proxies)
+        content.add_widget(self.btn_proxy)
+        self._refresh_proxy_label()
+
+        content.add_widget(BoxLayout())      # 撑开，把关闭键压到底部
+        close = FlatButton(text="关闭", font_size=dp(15), bg_color=C_ACCENT,
+                           color=(1, 1, 1, 1), radius=10, size_hint_y=None,
+                           height=dp(46), **self.F)
+        close.bind(on_release=lambda *_: self._popup and self._popup.dismiss())
+        content.add_widget(close)
+
+        self._popup = Popup(title="设置", content=content,
+                            size_hint=(0.9, None), height=dp(340),
+                            title_size=dp(15), separator_color=C_ACCENT,
+                            **self.P)
+        self._popup.open()
+
+    # ---------- 下载目录 ----------
+    def _fill_dir_presets(self):
+        """填「保存位置」下拉：预设目录 + 当前生效项"""
+        sp = getattr(self, "sp_dir", None)
+        if sp is None:
+            return                      # 设置弹窗还没打开过
+        try:
+            items = preset_dirs()
+        except Exception:
+            log_exc("preset_dirs")
+            items = []
+        self._dir_paths = {label: path for label, path in items}
+        labels = [label for label, _ in items]
+        cur = download_dir()
+        hit = None
+        for label, path in items:
+            if os.path.normpath(path) == os.path.normpath(cur):
+                hit = label
+                break
+        if hit is None:
+            # 用户自己选的目录不在预设里 —— 补一条显示出来，
+            # 否则下拉会显示成另一个目录，等于骗用户
+            labels.append("自定义")
+            self._dir_paths["自定义"] = cur
+            hit = "自定义"
+        self.sp_dir.values = labels
+        self.sp_dir.text = hit
+        diag("下载目录 = %s（预设 %d 个）" % (cur, len(items)))
+
+    def _on_dir_preset(self, spinner, text):
+        path = getattr(self, "_dir_paths", {}).get((text or "").strip())
+        if not path:
+            return
+        if os.path.normpath(path) == os.path.normpath(download_dir()):
+            return
+        set_download_dir(path)
+        self.set_status("下载目录改为：%s" % path, C_OK)
+
+    def pick_dir(self, *_):
+        """系统目录选择器（任意目录）。
+
+        本 App 已经拿了「所有文件访问」，所以选完直接用真实路径写文件即可，
+        不必走 SAF 的 ContentResolver 那一套。
+        """
         if not IS_ANDROID:
-            self.set_status("桌面端请直接替换 sources/default.js")
+            self.set_status("桌面端请直接用预设目录")
             return
         try:
             from jnius import autoclass
@@ -561,14 +677,95 @@ class LxApp(App):
 
             Intent = autoclass("android.content.Intent")
             act = autoclass("org.kivy.android.PythonActivity").mActivity
+            if not getattr(self, "_picker_bound", False):
+                android_activity.bind(on_activity_result=self._on_picked)
+                self._picker_bound = True
+            intent = Intent("android.intent.action.OPEN_DOCUMENT_TREE")
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                            | Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            act.startActivityForResult(intent, 0x1235)
+        except Exception as e:
+            log_exc("pick_dir")
+            self.set_status("打开目录选择器失败: %s" % e, C_ERR)
 
-            # 只用 p4a 自带的 activity 回调机制：它内部已经注册好了 Java 侧的
-            # listener，这里传一个普通 Python 函数即可。
-            # 千万不要自己写 PythonJavaClass + __javainterfaces__ =
-            # ["org/kivy/android/activity/ActivityResultListener"] ——
-            # 那个类名在 APK 的 dex 里根本不存在，会抛
-            #   ClassNotFoundException: Didn't find class
-            #   "org.kivy.android.activity.ActivityResultListener"
+    def _on_dir_picked(self, result_code, intent):
+        try:
+            if result_code != -1 or intent is None or intent.getData() is None:
+                self.set_status("已取消选择目录")
+                return
+            path = tree_uri_to_path(intent.getData())
+            if not path:
+                self.set_status(
+                    "这个目录用不了（目前只支持手机内置存储），换一个试试",
+                    C_ERR)
+                return
+            set_download_dir(path)
+            self._fill_dir_presets()
+            self.set_status("下载目录改为：%s" % path, C_OK)
+        except Exception as e:
+            log_exc("_on_dir_picked")
+            self.set_status("设置目录失败: %s" % e, C_ERR)
+
+    def pick_proxies(self, *_):
+        """选一个 QQ 代理列表 .txt（一行一条，含 {id}）
+
+        这样第三方代理失效时用户能自己换 —— 不用等重新编译发版。
+        """
+        self._open_file_picker(0x1236)
+
+    def _on_proxies_picked(self, result_code, intent):
+        try:
+            if result_code != -1 or intent is None or intent.getData() is None:
+                self.set_status("已取消选择代理文件")
+                return
+            text = self._read_uri(intent.getData())
+            n = qqresolve.save_proxies(text)
+            self._refresh_proxy_label()
+            self.set_status("已保存 %d 条 QQ 代理" % n, C_OK)
+        except Exception as e:
+            log_exc("_on_proxies_picked")
+            self.set_status("代理文件不可用: %s" % e, C_ERR)
+
+    def _refresh_proxy_label(self):
+        try:
+            btn = getattr(self, "btn_proxy", None)
+            if btn is None:
+                return                  # 设置弹窗还没打开过
+            n_builtin = len(qqresolve.QQ_PROXIES)
+            has_custom = os.path.exists(qqresolve.QQ_PROXY_FILE)
+            extra = "，已加自定义" if has_custom else ""
+            btn.text = "选代理文件(.txt)  ·  内置 %d 条%s" % (n_builtin, extra)
+        except Exception:
+            log_exc("_refresh_proxy_label")
+
+    def _open_file_picker(self, code):
+        """打开系统文件选择器（音源 .js / 代理 .txt 共用）
+
+        两个不能踩的坑：
+
+        1) 只用 p4a 自带的 activity 回调机制：它内部已经注册好了 Java 侧的
+           listener，这里传一个普通 Python 函数即可。
+           千万不要自己写 PythonJavaClass + __javainterfaces__ =
+           ["org/kivy/android/activity/ActivityResultListener"] ——
+           那个类名在 APK 的 dex 里根本不存在，会抛
+             ClassNotFoundException: Didn't find class
+             "org.kivy.android.activity.ActivityResultListener"
+
+        2) createChooser 的第二个参数签名是 CharSequence，
+           直接传 Python str 会抛
+             No static methods called createChooser ...
+             requested: (Intent, 'str')
+           必须包成 java.lang.String 再 cast 成 CharSequence。
+        """
+        if not IS_ANDROID:
+            self.set_status("桌面端请直接替换文件")
+            return
+        try:
+            from jnius import autoclass
+            from android import activity as android_activity
+
+            Intent = autoclass("android.content.Intent")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
             if not getattr(self, "_picker_bound", False):
                 android_activity.bind(on_activity_result=self._on_picked)
                 self._picker_bound = True
@@ -576,32 +773,35 @@ class LxApp(App):
             intent = Intent(Intent.ACTION_GET_CONTENT)
             intent.setType("*/*")
             intent.addCategory(Intent.CATEGORY_OPENABLE)
-
-            # createChooser 的第二个参数签名是 CharSequence，
-            # 直接传 Python str 会抛:
-            #   No static methods called createChooser ...
-            #   requested: (Intent, 'str')
-            # 必须包成 java.lang.String 再 cast 成 CharSequence。
             launcher = intent
             try:
                 from jnius import cast
                 JString = autoclass("java.lang.String")
-                title = cast("java.lang.CharSequence",
-                             JString("选择音源 .js 文件"))
+                title = cast("java.lang.CharSequence", JString("选择文件"))
                 launcher = Intent.createChooser(intent, title)
-            except Exception as e:
-                # 拿不到选择器也没关系：系统在没有默认应用时会自己弹选择框
+            except Exception:
                 log_exc("createChooser")
-                log("退回直接 startActivityForResult:", e)
-
-            act.startActivityForResult(launcher, 0x1234)
+            act.startActivityForResult(launcher, code)
         except Exception as e:
-            log_exc("pick_source")
-            self.set_status("选择文件失败: %s" % e, C_ERR)
+            log_exc("_open_file_picker")
+            self.set_status("打开文件选择器失败: %s" % e, C_ERR)
+
+    # ---------- 换音源 ----------
+    def pick_source(self, *_):
+        """从手机里选一个新的音源 .js 文件
+
+        具体实现统一在 _open_file_picker（p4a activity 回调、
+        createChooser 的那两个坑都记在那里了），这里只管语义。
+        """
+        self._open_file_picker(0x1234)
 
     def _on_picked(self, request_code, result_code, intent):
-        """选完文件回调（p4a 的 activity 在 UI 线程派发）"""
+        """选完文件/目录回调（p4a 的 activity 在 UI 线程派发）"""
         try:
+            if request_code == 0x1235:
+                return self._on_dir_picked(result_code, intent)
+            if request_code == 0x1236:
+                return self._on_proxies_picked(result_code, intent)
             if request_code != 0x1234:
                 return
             if result_code != -1 or intent is None:
@@ -969,7 +1169,8 @@ class LxApp(App):
 
         self._popup = Popup(title="歌曲信息", content=content,
                             size_hint=(0.92, None), height=dp(310),
-                            title_size=dp(15), separator_color=C_ACCENT)
+                            title_size=dp(15), separator_color=C_ACCENT,
+                            **self.P)
         self._popup.open()
 
     # ---------- 播放 ----------

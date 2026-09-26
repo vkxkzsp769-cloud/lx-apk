@@ -15,9 +15,11 @@ result=104003（需要 VIP），免费渠道拿不到。
 只有真的取到音频（按魔数判断）才算成功。
 代理会失效，所以列成列表 —— 一个挂了还有下一个。
 """
+import os
 import time
 import urllib.request
 
+import appenv
 import netutil
 from appenv import diag, log, log_exc
 from songinfo import _from_content_type, looks_like_audio
@@ -36,11 +38,66 @@ LEVEL_BY_QUALITY = {
 }
 
 # 已知的 QQ 代理（按可靠性排序）。{id} 是 songmid，{level} 是上面那个值。
+#
+# 2026-09 实测（大陆网络，songmid=001auUcH4WQs2V，level=exhigh）：
+#   kgqq1     -> 206 + audio/mpeg + ID3，**可用**
+#   kgqq      -> 403，已死
+#   haitangw  -> 403，已死
+# 死的两条先留着 —— 这类第三方代理经常「复活」，多一条就多一次机会。
+# 但**不能只靠内置**：它们随时可能全部失效，所以有 load_proxies()。
 QQ_PROXIES = [
     "http://175.27.166.236/kgqq1/qq.php?type=mp3&id={id}&level={level}",
     "http://175.27.166.236/kgqq/qq.php?type=mp3&id={id}&level={level}",
     "https://music.haitangw.cc/kgqq/qq.php?type=mp3&id={id}&level={level}",
 ]
+
+# 用户自己的代理列表：一行一个模板（含 {id}，{level} 可选），# 开头是注释。
+# 放在应用私有目录，界面上的「代理」按钮可以直接选一个 .txt 放进来 ——
+# 这样代理失效时**不用重新编译 APK** 就能换，这是这个文件存在的全部意义。
+QQ_PROXY_FILE = os.path.join(appenv.APP_DIR, "qq_proxies.txt")
+
+
+def load_proxies():
+    """内置代理 + 用户自定义（自定义排前面，因为通常更新更及时）"""
+    custom = []
+    try:
+        if os.path.exists(QQ_PROXY_FILE):
+            with open(QQ_PROXY_FILE, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "{id}" not in line:
+                        log("忽略无效代理（缺少 {id}）: %s" % line[:60])
+                        continue
+                    if line not in custom:
+                        custom.append(line)
+    except Exception:
+        log_exc("读取 qq_proxies.txt")
+    if custom:
+        diag("QQ 代理: 自定义 %d 条 + 内置 %d 条"
+             % (len(custom), len(QQ_PROXIES)))
+    return custom + list(QQ_PROXIES)
+
+
+def save_proxies(text):
+    """保存用户选的代理列表，返回存下来的条数。
+
+    只收「含 {id} 的行」，其余当成注释/噪声丢掉 —— 宁可少存，
+    也不要存半条模板进去，那会在请求时才炸。
+    """
+    lines = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "{id}" in line:
+            if line not in lines:
+                lines.append(line)
+    if not lines:
+        raise ValueError("文件里没有可用代理（每行要含 {id}）")
+    with open(QQ_PROXY_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    log("已保存 %d 条 QQ 代理 -> %s" % (len(lines), QQ_PROXY_FILE))
+    return len(lines)
 
 
 # 解析结果缓存：同一首歌反复点（换音质、先播放再下载）不必重来。
@@ -119,8 +176,9 @@ def resolve(songmid, quality="320k", timeout=8):
         return cached[0], level, cached[1]
 
     last = "所有 QQ 代理都不可用"
+    proxies = load_proxies()
     for lv in levels:
-        for tpl in QQ_PROXIES:
+        for tpl in proxies:
             url = tpl.format(id=songmid, level=lv)
             t0 = time.time()
             try:

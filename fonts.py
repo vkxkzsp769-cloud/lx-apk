@@ -13,15 +13,28 @@ FONT_NAME = "CNFont"
 _registered_path = None
 
 
-# 打包进 APK 的简体中文字体（1.5MB，从 Noto Sans CJK SC 裁剪）
+# 打包进 APK 的中文字体（~9.9MB）
+#
 # 为什么必须自带：
 #   很多机器的 /system/fonts/NotoSansCJK-Regular.ttc 里 face[0] 是
 #   「Noto Sans CJK JP」（日文），而 Kivy 用的 SDL_ttf 只会打开 face 0 ——
 #   于是中文会用日文字形渲染，看起来就是「中文字符显示错误」
 #   （直/骨/今/画 这类字最明显）。
 #   所以优先用自带的 SC 字体，彻底摆脱设备差异。
+#
+# 覆盖范围（这一版的关键修复）：
+#   上一版只裁到 GB2312（6763 汉字），于是**繁体字、日文汉字、韩文、
+#   以及 ©®™♥♪ 这类符号**全部缺字 —— 歌名/歌手名里一出现就是方块
+#   （用户反馈「大部分正常，但部分字是方块」就是这个原因）。
+#   现在覆盖：CJK 基本区(简+繁+日文汉字) + 扩展A + 兼容汉字 + 假名
+#   + 全角标点 + 常用符号，共 29717 个码点。
+#
+# 想重新生成（换字重/裁体积）：
+#   从 Noto Sans SC 可变字体实例化到 wght=400 再子集化，
+#   命令见 编译APK说明.md 的「字体」一节。
+#   注意 VF 的默认轴是 100(Thin)，必须显式指定 400，否则字形过细。
 BUNDLED_FONT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "assets", "fonts", "NotoSansSC-subset.otf")
+                            "assets", "fonts", "NotoSansSC-full.ttf")
 
 
 def _candidates():
@@ -104,3 +117,15 @@ def register():
 def font_kwargs():
     """给 Kivy 控件的构造参数（注册失败就返回空，用默认字体）"""
     return {"font_name": FONT_NAME} if _registered_path else {}
+
+
+def popup_kwargs():
+    """Popup 的字体参数。
+
+    Popup **不是** Label：它不接受 font_name，标题字体用的是独立属性
+    `title_font`（Kivy 默认 'Roboto'）。所以不能用 font_kwargs()。
+    漏传的后果是弹窗标题（如「歌曲信息」）用 Roboto 渲染 —— 中文全是方块。
+    （这个缺口一直没被发现，是因为 test_ui 的控件树检查只遍历了
+      popup.content，从没检查 Popup 自身的标题。）
+    """
+    return {"title_font": FONT_NAME} if _registered_path else {}

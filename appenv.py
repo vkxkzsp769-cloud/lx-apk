@@ -3,10 +3,12 @@
 本模块只依赖标准库 + kivy.utils.platform，不创建任何界面对象，
 因此可以在 App 启动前安全导入。
 """
+import json
 import os
 import sys
 import time
 import traceback
+import urllib.parse as urllib_parse
 
 from kivy.utils import platform
 
@@ -160,10 +162,121 @@ def is_writable(path):
 
 
 def download_dir():
-    """每次下载前重新判定，这样用户刚授权就能立刻生效（不用重启 App）"""
+    """当前下载目录（每次下载前重新判定，用户刚换目录/刚授权就立刻生效）。
+
+    优先级：用户自选目录（可写）> 公共 Download/落雪音源 > App 私有目录。
+    用户自选的目录如果不可写（比如权限被回收、SD 卡拔了），
+    会自动退回默认，不会让下载直接失败。
+    """
+    custom = chosen_download_dir()
+    if custom and is_writable(custom):
+        return custom
     if is_writable(PUBLIC_DOWNLOAD_DIR):
         return PUBLIC_DOWNLOAD_DIR
     return PRIVATE_DOWNLOAD_DIR
+
+
+# ============================================================
+#  下载目录：用户自选（持久化到 settings.json）
+# ============================================================
+SETTINGS_FILE = os.path.join(APP_DIR, "settings.json")
+_chosen_dir = None          # None = 还没从磁盘读过
+
+
+def _external_root():
+    """外置存储根（Android 上就是 /storage/emulated/0）"""
+    for p in ("/storage/emulated/0", "/sdcard"):
+        if os.path.isdir(p):
+            return p
+    return "/storage/emulated/0"
+
+
+def preset_dirs():
+    """界面上可选的下载目录，返回 [(显示名, 路径)]。
+
+    预设而不是只让用户手打路径：绝大多数人只想要「Download 还是 Music」，
+    而任意目录走系统选择器（见 tree_uri_to_path）。
+    """
+    if not IS_ANDROID:
+        return [
+            ("Downloads/落雪音源", PUBLIC_DOWNLOAD_DIR),
+            ("App 目录/downloads", PRIVATE_DOWNLOAD_DIR),
+        ]
+    root = _external_root()
+    return [
+        ("Download/落雪音源（默认）", os.path.join(root, "Download", "落雪音源")),
+        ("Music/落雪音源", os.path.join(root, "Music", "落雪音源")),
+        ("Download（根目录）", os.path.join(root, "Download")),
+        ("App 私有目录（免权限）", PRIVATE_DOWNLOAD_DIR),
+    ]
+
+
+def chosen_download_dir():
+    """用户自选的目录（没选过返回空串）"""
+    global _chosen_dir
+    if _chosen_dir is not None:
+        return _chosen_dir
+    _chosen_dir = ""
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, encoding="utf-8") as f:
+                data = json.load(f) or {}
+            _chosen_dir = str(data.get("download_dir") or "").strip()
+    except Exception:
+        log_exc("读取 settings.json")
+        _chosen_dir = ""
+    return _chosen_dir
+
+
+def set_download_dir(path):
+    """记住用户选的下载目录"""
+    global _chosen_dir
+    _chosen_dir = str(path or "").strip()
+    try:
+        data = {}
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+        data["download_dir"] = _chosen_dir
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        log("下载目录已保存:", _chosen_dir)
+    except Exception:
+        log_exc("写入 settings.json")
+    return _chosen_dir
+
+
+def tree_uri_to_path(uri):
+    """把系统目录选择器返回的 tree URI 换成本地路径。
+
+    DocumentFile 那套 SAF 读写要一路 ContentResolver + OutputStream，
+    而本 App 已经拿了「所有文件访问」，直接用真实路径写更简单也更稳。
+    只在主存储卷（primary）上能换算；换不出来的返回 None，
+    调用方据此提示用户换一个目录。
+
+    uri 形如：
+      content://com.android.externalstorage.documents/tree/primary%3AMusic%2Ffoo
+    """
+    try:
+        s = str(uri)
+        if "/tree/" not in s:
+            return None
+        doc_id = s.split("/tree/", 1)[1]
+        doc_id = urllib_parse.unquote(doc_id)
+        if ":" not in doc_id:
+            return None
+        vol, rel = doc_id.split(":", 1)
+        if vol.lower() not in ("primary", "0"):
+            return None
+        rel = rel.strip("/")
+        base = _external_root()
+        return os.path.join(base, rel) if rel else base
+    except Exception:
+        log_exc("tree_uri_to_path")
+        return None
 
 
 def using_public_dir():

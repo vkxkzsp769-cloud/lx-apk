@@ -499,16 +499,222 @@ def test_all_widgets_use_cn_font():
             walk(c, depth + 1)
 
     walk(root)
-    if app._popup is not None and app._popup.content is not None:
-        walk(app._popup.content)
-    if app._popup is not None:
-        app._popup.dismiss()
+    pop = app._popup
+    if pop is not None:
+        # Popup 自身也要遍历，并且要**单查标题字体**。
+        # 标题是 Popup 内部创建的 Label，字体来自 title_font（不是
+        # font_name）—— 而 Popup 本身也不在 TEXTY 里。
+        # 历史上这里只遍历了 popup.content，标题从来没被检查过，
+        # 于是「弹窗标题显示成方块」一路漏到了用户手上。
+        walk(pop)
+        if pop.title and getattr(pop, "title_font", None) != fonts.FONT_NAME:
+            offenders.append("Popup(title=%r) title_font=%r"
+                             % (pop.title, getattr(pop, "title_font", None)))
+        pop.dismiss()
 
     if offenders:
         raise AssertionError(
             "以下控件没有中文字体，会显示成方块:\n      " +
             "\n      ".join(offenders))
     print("  控件树里所有文字控件都带中文字体 ✓")
+
+
+def test_spinner_dropdown_font():
+    """回归：Spinner **展开后**的列表项也要带中文字体。
+
+    SpinnerOption 默认没有 font_name —— 收起时显示正常，一展开全是方块，
+    所以肉眼很容易漏。现在通过 option_cls 在创建时就带上字体。
+    """
+    fonts.register()
+    if not fonts._registered_path:
+        print("  [SKIP] 测试机没有中文字体")
+        return
+
+    app = M.LxApp()
+    app.build()
+    app._apply_source_info({
+        "meta": {"name": "t", "version": "1"},
+        "sources": {"wy": {"name": "网易云", "qualitys": ["320k"]},
+                    "tx": {"name": "QQ音乐", "qualitys": ["128k"]}}})
+
+    sp = app.sp_platform
+    create = getattr(sp, "_create_dropdown", None)
+    if create is None:
+        print("  [SKIP] 该 Kivy 版本没有 _create_dropdown")
+        return
+    create()
+    dd = getattr(sp, "_dropdown", None)
+    if dd is None:
+        raise AssertionError("下拉没建起来")
+
+    bad = []
+    kids = list(getattr(dd.container, "children", []))
+    for child in kids:
+        fn = getattr(child, "font_name", None)
+        if fn != fonts.FONT_NAME:
+            bad.append("%s(%r) font=%r"
+                       % (type(child).__name__,
+                          getattr(child, "text", ""), fn))
+    if not kids:
+        raise AssertionError("下拉里一个选项都没有，检查没意义")
+    if bad:
+        raise AssertionError("下拉项没带中文字体，展开会是方块:\n      "
+                             + "\n      ".join(bad))
+    print("  下拉 %d 个选项都带中文字体 ✓" % len(kids))
+
+
+def test_download_dir_setting():
+    """回归：下载目录要能用户自选，并且记得住。
+
+    之前写死 Download/落雪音源，用户完全没法改 —— 手机存满 /
+    想存到 Music 或 SD 卡都没办法。
+    """
+    import json
+    import shutil
+    import tempfile
+    import appenv as A
+
+    old_settings = A.SETTINGS_FILE
+    old_chosen = A._chosen_dir
+    tmp = tempfile.mkdtemp(prefix="lxdir_")
+    try:
+        A.SETTINGS_FILE = os.path.join(tmp, "settings.json")
+        A._chosen_dir = None
+
+        if A.chosen_download_dir():
+            raise AssertionError("初始不该有自选目录")
+
+        target = os.path.join(tmp, "mydir")
+        A.set_download_dir(target)
+        if A.chosen_download_dir() != target:
+            raise AssertionError("设置后没记住")
+
+        # 落盘了 —— 重新读也要拿得到
+        A._chosen_dir = None
+        if A.chosen_download_dir() != target:
+            raise AssertionError("重读 settings.json 没拿到")
+        with open(A.SETTINGS_FILE, encoding="utf-8") as f:
+            if json.load(f).get("download_dir") != target:
+                raise AssertionError("settings.json 内容不对")
+
+        # 可写的自选目录要优先生效
+        if A.download_dir() != target:
+            raise AssertionError("download_dir() 没优先用自选目录: %s"
+                                 % A.download_dir())
+        print("  自选 + 持久化 ✓")
+
+        # 不可写的自选目录要自动退回，不能让下载直接失败
+        bad = os.path.join(tmp, "no", "such", "\x00bad")
+        A.set_download_dir(bad)
+        got = A.download_dir()
+        if got == bad:
+            raise AssertionError("不可写目录不该被采用")
+        if not os.path.isdir(got):
+            raise AssertionError("回退后的目录不存在: %s" % got)
+        print("  不可写自动回退 -> %s ✓" % got)
+
+        presets = A.preset_dirs()
+        if len(presets) < 2:
+            raise AssertionError("预设目录太少: %s" % (presets,))
+        for label, pth in presets:
+            if not label or not pth:
+                raise AssertionError("预设项不完整: %r" % ((label, pth),))
+        print("  预设目录 %d 个 ✓" % len(presets))
+    finally:
+        A.SETTINGS_FILE = old_settings
+        A._chosen_dir = old_chosen
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_tree_uri_to_path():
+    """系统目录选择器返回的 tree URI 要能换成本地路径。
+
+    本 App 走的是「真实路径直写」（已有所有文件访问权限），
+    所以必须把 SAF 的 tree URI 换算过来；换不出来（比如 SD 卡卷）
+    要老实返回 None，让界面提示用户换一个 —— 而不是给个假路径。
+    """
+    import appenv as A
+
+    ok_uri = ("content://com.android.externalstorage.documents/tree/"
+              "primary%3ADownload%2F%E8%90%BD%E9%9B%AA")
+    got = A.tree_uri_to_path(ok_uri)
+    if not got:
+        raise AssertionError("主存储卷应该能换算")
+    if "\u843d\u96ea" not in got:
+        raise AssertionError("没解出中文目录名: %r" % got)
+    print("  primary 卷 -> %s ✓" % got)
+
+    root_uri = "content://com.android.externalstorage.documents/tree/primary%3A"
+    if not A.tree_uri_to_path(root_uri):
+        raise AssertionError("主存储根目录应该能换算")
+
+    for bad, why in [
+        ("content://com.android.externalstorage.documents/tree/"
+         "1234-5678%3AMusic", "非主存储卷(SD 卡)"),
+        ("content://media/external/file/123", "不是 tree URI"),
+        ("garbage", "垃圾输入"),
+        ("", "空串"),
+    ]:
+        if A.tree_uri_to_path(bad) is not None:
+            raise AssertionError("%s 不该换算成功" % why)
+    print("  非主存储卷 / 非法输入 一律返回 None ✓")
+
+
+def test_qq_proxies_configurable():
+    """回归：QQ 代理要能用户自定义 —— 不重编 APK 就能换。
+
+    第三方 QQ 代理随时失效：2026-09 实测内置 3 条里只剩 kgqq1 能用
+    （另外两条都 403）。所以必须有「用户自己加代理」的路，
+    否则每次失效都得重新发版。
+    """
+    import shutil
+    import tempfile
+    import qqresolve as Q
+
+    if len(Q.QQ_PROXIES) < 2:
+        raise AssertionError("内置代理太少，全挂了就没得换")
+    for tpl in Q.QQ_PROXIES:
+        if "{id}" not in tpl:
+            raise AssertionError("内置代理模板缺少 {id}: %s" % tpl)
+
+    old_file = Q.QQ_PROXY_FILE
+    tmp = tempfile.mkdtemp(prefix="lxproxies_")
+    try:
+        Q.QQ_PROXY_FILE = os.path.join(tmp, "qq_proxies.txt")
+
+        got = Q.load_proxies()
+        if got != list(Q.QQ_PROXIES):
+            raise AssertionError("没有自定义文件时应等于内置: %s" % got)
+
+        n = Q.save_proxies(
+            "# 注释行\n"
+            "http://example.com/a.php?id={id}&level={level}\n"
+            "\n"
+            "http://example.com/b.php?id={id}\n"
+            "这行没有占位符，应被丢掉\n")
+        if n != 2:
+            raise AssertionError("应该只存下 2 条有效模板，实际 %d" % n)
+
+        got = Q.load_proxies()
+        if len(got) != 2 + len(Q.QQ_PROXIES):
+            raise AssertionError("自定义应排前且内置保留: %s" % got)
+        if not got[0].startswith("http://example.com/a.php"):
+            raise AssertionError("自定义代理应排最前: %s" % got[0])
+        print("  自定义 %d 条 + 内置 %d 条 ✓" % (n, len(Q.QQ_PROXIES)))
+
+        try:
+            Q.save_proxies("没有占位符\n# 只有注释\n")
+        except ValueError:
+            print("  全是无效行时如实报错 ✓")
+        else:
+            raise AssertionError("无效列表应该报错，不能静默存空文件")
+
+        u, info, meta = Q.resolve("", "320k")
+        if u is not None or meta is not None:
+            raise AssertionError("空 songmid 不该返回地址")
+    finally:
+        Q.QQ_PROXY_FILE = old_file
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_netease_paging():
@@ -641,23 +847,96 @@ def test_source_dropdown_lists_files():
     print("  音源/平台两个下拉各司其职 ✓")
 
 
-def test_bundled_font_preferred():
-    """回归：必须优先用自带的简体中文字体。
+def _font_codepoints(path, limit=200000):
+    """读字体 cmap，返回它实际覆盖的码点集合（纯标准库，不依赖 fontTools）。
 
-    很多机器的 /system/fonts/NotoSansCJK-Regular.ttc 里
-    face[0] 是 Noto Sans CJK **JP**（日文），而 Kivy 的 SDL_ttf
-    只会打开 face 0 -> 中文用日文字形渲染，就是「中文字符显示错误」。
-    （实测该 ttc 有 10 个 face，SC 在 face[2]。）
-    所以 APK 自带一份裁剪过的 SC 字体（1.5MB），并优先使用。
+    只处理 Unicode BMP 的 format 4 子表 —— 自带字体正是这种。
+    """
+    import struct
+    with open(path, "rb") as f:
+        data = f.read()
+    if data[:4] == b"ttcf":
+        raise AssertionError("这是字体集合(.ttc)，Kivy 只会渲染 face0，不要用它")
+    num_tables = struct.unpack(">H", data[4:6])[0]
+    cmap_off = None
+    for i in range(num_tables):
+        o = 12 + i * 16
+        if data[o:o + 4] == b"cmap":
+            cmap_off = struct.unpack(">I", data[o + 8:o + 12])[0]
+            break
+    if cmap_off is None:
+        raise AssertionError("字体里没有 cmap 表")
+    n_sub = struct.unpack(">H", data[cmap_off + 2:cmap_off + 4])[0]
+    base = None
+    for i in range(n_sub):
+        o = cmap_off + 4 + i * 8
+        pid, eid = struct.unpack(">HH", data[o:o + 4])
+        if (pid, eid) in ((3, 1), (0, 3), (0, 4)):
+            base = cmap_off + struct.unpack(">I", data[o + 4:o + 8])[0]
+            if pid == 3:
+                break
+    if base is None:
+        raise AssertionError("找不到可用的 cmap 子表")
+    fmt = struct.unpack(">H", data[base:base + 2])[0]
+    if fmt != 4:
+        raise AssertionError("只支持 format 4 子表，实际是 %d" % fmt)
+    seg_x2 = struct.unpack(">H", data[base + 6:base + 8])[0]
+    seg = seg_x2 // 2
+    end_o = base + 14
+    start_o = end_o + seg_x2 + 2
+    delta_o = start_o + seg_x2
+    range_o = delta_o + seg_x2
+    out = set()
+    for s in range(seg):
+        end = struct.unpack(">H", data[end_o + s * 2:end_o + s * 2 + 2])[0]
+        start = struct.unpack(">H", data[start_o + s * 2:start_o + s * 2 + 2])[0]
+        delta = struct.unpack(">h", data[delta_o + s * 2:delta_o + s * 2 + 2])[0]
+        ro = struct.unpack(">H", data[range_o + s * 2:range_o + s * 2 + 2])[0]
+        if start == 0xFFFF:
+            continue
+        for c in range(start, min(end, 0xFFFE) + 1):
+            if ro == 0:
+                gid = (c + delta) & 0xFFFF
+            else:
+                gi = range_o + s * 2 + ro + (c - start) * 2
+                if gi + 1 >= len(data):
+                    continue
+                gid = struct.unpack(">H", data[gi:gi + 2])[0]
+                if gid:
+                    gid = (gid + delta) & 0xFFFF
+            if gid:
+                out.add(c)
+                if len(out) > limit:
+                    return out
+    return out
+
+
+def test_bundled_font_preferred():
+    """回归：自带字体既要**优先使用**，又要**覆盖够全**。
+
+    1) 必须优先用自带 SC 字体
+       很多机器的 /system/fonts/NotoSansCJK-Regular.ttc 里
+       face[0] 是 Noto Sans CJK **JP**（日文），而 Kivy 的 SDL_ttf
+       只会打开 face 0 -> 中文用日文字形渲染（直/骨/今/画 最明显）。
+       （实测该 ttc 有 10 个 face，SC 在 face[2]。）
+
+    2) 覆盖面要够（这一条是后补的）
+       上一版只裁到 **GB2312（6763 汉字）**，结果繁体字、日文汉字、
+       韩文、以及 ©®™♥♪ 这类符号**全部缺字** —— 歌名/歌手名里
+       一出现就是方块。这里直接查字体的 cmap，缺一个字就失败。
     """
     import fonts
+
     path = fonts.BUNDLED_FONT
     if not os.path.exists(path):
         raise AssertionError("自带字体不存在: %s" % path)
     size = os.path.getsize(path)
     print("  自带字体: %s (%.2f MB)" % (os.path.basename(path), size / 1048576))
-    if size > 4 * 1024 * 1024:
-        raise AssertionError("自带字体太大（%.1f MB），会明显撑大 APK"
+    # 覆盖全的代价就是变大（GB2312 子集 1.5MB -> 全量 ~10MB）。
+    # 放宽到 12MB 是**刻意**的：为了「不撑大 APK」而牺牲覆盖，
+    # 换来的是用户看到的一堆方块，那个取舍是错的。
+    if size > 12 * 1024 * 1024:
+        raise AssertionError("自带字体过大（%.1f MB），检查是不是裁错了"
                              % (size / 1048576))
 
     fonts._registered_path = None
@@ -667,6 +946,27 @@ def test_bundled_font_preferred():
         raise AssertionError("没有优先用自带字体，实际用了 %s"
                              % fonts._registered_path)
     print("  优先选用自带字体 ✓")
+
+    cps = _font_codepoints(path)
+    probe = {
+        "简体": "海阔天空晴天周杰伦",
+        "繁体": "陳張學偉傑倫鄧劉華羅",
+        "日文汉字": "氣點證藝議師會來國",
+        "假名": "あいうえおアイウエオ",
+        "符号": "©®™♥♪★☆→√°",
+        "全角标点": "，。、；：？！（）《》【】…—·",
+    }
+    missing = {}
+    for name, s in probe.items():
+        miss = "".join(c for c in s if ord(c) not in cps)
+        if miss:
+            missing[name] = miss
+    print("  字体码点总数 = %d" % len(cps))
+    if missing:
+        raise AssertionError(
+            "自带字体缺字，这些字会显示成方块: %s"
+            % "  ".join("%s=%s" % kv for kv in missing.items()))
+    print("  简/繁/日文汉字/假名/符号/标点 覆盖完整 ✓")
 
 
 def test_download_referer():
@@ -958,6 +1258,10 @@ def main():
     check("JS 结果双层 JSON 解到底", test_eval_json_unwrap)
     check("SSL 证书失败自动降级", test_ssl_fallback)
     check("所有文字控件都带中文字体", test_all_widgets_use_cn_font)
+    check("Spinner 下拉项带中文字体", test_spinner_dropdown_font)
+    check("下载目录可自选 + 持久化", test_download_dir_setting)
+    check("目录 tree URI 换算", test_tree_uri_to_path)
+    check("QQ 代理可自定义", test_qq_proxies_configurable)
     check("搜索分页 + 限流识别", test_netease_paging)
     check("内置多个音源", test_bundled_sources)
     check("5 个平台搜索都注册", test_searchers_registry)
