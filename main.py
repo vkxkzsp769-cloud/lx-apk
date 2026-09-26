@@ -41,6 +41,7 @@ import downloader
 import fonts
 import searchers
 import player as player_mod
+import qqresolve
 import songinfo
 from appenv import (IS_ANDROID, SOURCE_FILE, default_source_path, diag,
                     download_dir, ensure_source, extract_bundled_sources, log,
@@ -785,63 +786,66 @@ class LxApp(App):
         return None, None, info, last or "所有音质都不可用"
 
     def _resolve_song(self, song):
-        """后台：解析直链（本平台多音质 -> 必要时跨平台）"""
+        """后台：解析直链（本平台内依次尝试各音质，不换平台）"""
         want = self.sp_quality.text or "320k"
         order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
         order = order[:3]
 
-        tried = []
         source = self._current_source()
-        tried.append(source)
         self.ui(lambda: self.set_status(
             "正在解析 (%s)…" % PLATFORM_LABEL.get(source, source)))
 
-        url, used, info, err = self._try_one(source, song, order)
+        url, used, info, err = None, None, None, ""
+
+        # QQ 优先走内置解析器：QQ 官方接口要 VIP，
+        # 而各音源自带的第三方代理有的已失效（实测聚合音源那条 403）。
+        # 内置这条路实测稳定（standard=128k / exhigh=320k / lossless=FLAC）。
+        # 注意：这一步仍然是 **QQ 平台**，不会偷偷换成别的平台。
+        if source == "tx":
+            mid = (song.get("extra") or {}).get("songmid") or song.get("id")
+            self.ui(lambda: self.set_status("正在解析 QQ 直链…"))
+            u, lv = qqresolve.resolve(mid, order[0])
+            if u:
+                url, used = u, order[0]
+                log("QQ 内置解析成功:", lv)
+            else:
+                err = lv
+                log("QQ 内置解析失败，改试音源自带接口:", lv)
+
+        # 再试音源自带的接口
+        if not url:
+            url, used, info, err2 = self._try_one(source, song, order)
+            err = err2 or err
+
         if url:
             meta = songinfo.probe(url)
             self.ui(lambda: self._song_ready(song, url, used, meta, source))
             return
 
-        # ---- 本平台不行 -> 跨平台找同一首歌 ----
-        # 「其他平台不稳定」时这一步能救回大部分情况
-        key = "%s %s" % (song["name"], song["singer"])
-        for alt in ("wy", "kg", "kw", "tx", "mg"):
-            if alt in tried:
-                continue
-            tried.append(alt)
-            self.ui(lambda alt=alt: self.set_status(
-                "该平台不可用，改在 %s 找同一首…"
-                % PLATFORM_LABEL.get(alt, alt)))
-            try:
-                cands = searchers.search(alt, key, 3)
-            except Exception:
-                log_exc("跨平台搜索 %s" % alt)
-                continue
-            if not cands:
-                continue
-            # 名字要能对上，避免换成完全不同的歌
-            best = None
-            for c in cands:
-                if song["name"][:6] in c["name"] or c["name"][:6] in song["name"]:
-                    best = c
-                    break
-            if best is None:
-                continue
-            u, q2, _, e2 = self._try_one(alt, best, order)
-            if u:
-                meta = songinfo.probe(u)
-                self.ui(lambda: self._song_ready(
-                    song, u, q2, meta, alt, note="来自 %s"
-                    % PLATFORM_LABEL.get(alt, alt)))
-                return
-            err = e2 or err
+        # 注意：这里**不再**自动换成别的平台。
+        # 用户选了 QQ 音乐就是要 QQ 音乐 —— 偷偷换成网易云/酷狗
+        # 等于给了一首「来源不对」的歌，比直接说失败更糟。
+        # 失败就如实报错，是否换平台由用户自己决定（见 _song_failed）。
+        self.ui(lambda: self._song_failed(err, source))
 
         self.ui(lambda: self._song_failed(err))
 
-    def _song_failed(self, err):
+    def _song_failed(self, err, platform=None):
+        name = PLATFORM_LABEL.get(platform or "", platform or "")
         if getattr(self, "_pop_info", None) is not None:
-            self._pop_info.text = "解析失败: %s\n（可能版权受限，换一首试试）" % err
-        self.set_status("解析失败: %s" % err, C_ERR)
+            self._pop_info.text = ("%s 取不到直链\n原因: %s\n\n"
+                                   "（不会自动换成别的平台 —— 你可以自己选）"
+                                   % (name or "该平台", err))
+        self.set_status("%s 取不到直链: %s" % (name or "该平台", err), C_ERR)
+        # 按钮改成「换个平台试试」，但必须用户点了才换
+        others = [p for p in ("wy", "kg", "kw", "mg", "tx")
+                  if p != platform and p in {x["source"] for x in self.platforms}]
+        if others and getattr(self, "_pop_dl", None) is not None:
+            nxt = others[0]
+            self._pop_dl.text = "改用%s" % PLATFORM_LABEL.get(nxt, nxt)
+            self._pop_dl.disabled = False
+            self._alt_platform = nxt
+            self._pop_dl.bind(on_release=lambda *_: self._switch_platform())
 
     def _song_ready(self, song, url, quality, meta, platform=None, note=""):
         self._cur_url = url
@@ -872,6 +876,58 @@ class LxApp(App):
                            songinfo.quality_label(quality),
                            (self._cur_ext or "?").upper(),
                            songinfo.human_size(meta.get("size"))), C_OK)
+
+    def _switch_platform(self):
+        """用户主动点了「改用 XX」才换平台"""
+        try:
+            alt = getattr(self, "_alt_platform", None)
+            if not alt:
+                return
+            if getattr(self, "_popup", None):
+                self._popup.dismiss()
+            song = self._cur_song
+            if not song:
+                return
+            # 按新平台重新搜一次，拿该平台的 id/extra
+            self.set_status("改用 %s 搜索同一首…"
+                            % PLATFORM_LABEL.get(alt, alt))
+            self.bg(lambda: self._research_on(alt, song), "alt-search")
+        except Exception:
+            log_exc("_switch_platform")
+
+    def _research_on(self, platform, song):
+        try:
+            key = "%s %s" % (song["name"], song["singer"])
+            cands = searchers.search(platform, key, 5)
+            best = None
+            for c in cands:
+                if (song["name"][:6] in c["name"]
+                        or c["name"][:6] in song["name"]):
+                    best = c
+                    break
+            if best is None:
+                self.ui(lambda: self.set_status(
+                    "%s 上没找到这首歌" % PLATFORM_LABEL.get(platform, platform),
+                    C_ERR))
+                return
+            self.ui(lambda: (setattr(self, "_cur_song", best),
+                             self.set_status("已切到 %s: %s"
+                                             % (PLATFORM_LABEL.get(platform, platform),
+                                                best["name"]))))
+            # 切到对应平台后再解析
+            self.ui(lambda: self._set_platform_and_load(platform, best))
+        except Exception as e:
+            log_exc("_research_on")
+            self.ui(lambda: self.set_status("换平台失败: %s" % e, C_ERR))
+
+    def _set_platform_and_load(self, platform, song):
+        for p in self.platforms:
+            if p["source"] == platform:
+                self.sp_platform.text = "%s (%s)" % (
+                    PLATFORM_LABEL.get(platform, platform), platform)
+                break
+        self._show_song_popup(song)
+        self.bg(lambda: self._resolve_song(song), "resolve")
 
     def _show_song_popup(self, song):
         kw = dict(self.F)

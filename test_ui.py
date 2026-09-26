@@ -731,6 +731,51 @@ def test_url_verify():
     print("  死链识破: %s ✓" % why)
 
 
+def test_qq_resolver():
+    """QQ 内置解析器：品质 -> level 映射要正确。
+
+    QQ 官方 vkey 接口多数歌返回 result=104003（要 VIP），
+    而音源自带的第三方代理有的已失效（聚合音源那条实测 403）。
+    所以内置一组代理逐个试、逐个校验。
+    """
+    import qqresolve
+    want = {"128k": "standard", "320k": "exhigh",
+            "flac": "lossless", "hires": "hires"}
+    for q, lv in want.items():
+        got = qqresolve.LEVEL_BY_QUALITY.get(q)
+        if got != lv:
+            raise AssertionError("%s -> %s，应为 %s" % (q, got, lv))
+    if len(qqresolve.QQ_PROXIES) < 2:
+        raise AssertionError("代理只有一个，挂掉就没得换了")
+    for tpl in qqresolve.QQ_PROXIES:
+        if "{id}" not in tpl:
+            raise AssertionError("代理模板缺少 {id}: %s" % tpl)
+    print("  level 映射正确，%d 个备用代理 ✓" % len(qqresolve.QQ_PROXIES))
+
+    u, info = qqresolve.resolve("", "320k")
+    if u is not None:
+        raise AssertionError("空 songmid 不该返回地址")
+    print("  空 songmid 被正确拒绝 ✓")
+
+
+def test_no_silent_platform_switch():
+    """回归：绝不能偷偷把用户选的平台换掉。
+
+    之前我做了「跨平台回退」：选了 QQ 音乐，取不到就用网易云顶上 ——
+    用户要的是 QQ，结果下到的是网易云的音频，
+    这比直接失败更糟（等于给了来源不对的东西）。
+    现在改成：失败就如实报错，是否换平台必须用户自己点。
+    """
+    src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
+    # 解析函数里不应再出现「自动换平台」的搜索调用
+    seg = src[src.index("def _resolve_song("):src.index("def _song_failed(")]
+    if "searchers.search(" in seg:
+        raise AssertionError("_resolve_song 里又在自动跨平台搜索了")
+    if "_switch_platform" not in src:
+        raise AssertionError("没有提供「用户主动换平台」的入口")
+    print("  _resolve_song 不会自动换平台，且保留了用户主动切换入口 ✓")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -787,6 +832,8 @@ def main():
     check("优先用自带简体字体", test_bundled_font_preferred)
     check("下载带平台 Referer", test_download_referer)
     check("直链有效性校验", test_url_verify)
+    check("QQ 内置解析器", test_qq_resolver)
+    check("不静默换平台", test_no_silent_platform_switch)
 
     print()
     if FAILS:
