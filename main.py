@@ -444,63 +444,101 @@ class SpringButton(FlatButton):
         shape.size = (w, h)
 
 
+def icon_parts(kind, w, h, ox=0.0, oy=0.0, unit=1.0):
+    """把图标拆成**父坐标系**下的图元描述（纯函数，不碰 Kivy，便于无 GL 断言）。
+
+    背景：往 widget.canvas 加的图元用的是**父坐标系**（和 widget.pos 同一空间），
+    而早期版本的 draw_icon 用本地坐标 `cx, cy = w/2, h/2` 算几何 ——
+    图标全被画到父容器原点附近去了（用户反馈「叉不在应该在的地方」）。
+    把几何抽在这里，就能在没有 OpenGL 的机器上直接断言坐标对不对。
+
+    ox/oy = 控件在父坐标系里的原点（widget.x / widget.y）；
+    unit  = 一个 dp 对应的像素数（线宽用它换算 —— 纯函数里不能调 dp()）。
+    返回 [(op, kwargs), ...]，op ∈ {"line", "mesh"}。
+    """
+    s = min(w, h) * 0.5
+    cx, cy = ox + w / 2.0, oy + h / 2.0
+    out = []
+    if kind == "settings":
+        # 三条滑杆（现代感的「设置」图标，比齿轮更好画也更好看）
+        lw = 1.6 * unit
+        for i, off in enumerate((-0.42, 0.0, 0.42)):
+            y = cy + s * off
+            out.append(("line", {"points": [cx - s * 0.72, y, cx + s * 0.72, y],
+                                 "width": lw}))
+            knx = cx + s * (0.34 if i % 2 == 0 else -0.30)
+            out.append(("line", {"circle": (knx, y, 2.4 * unit), "width": lw}))
+    elif kind == "search":
+        out.append(("line", {"circle": (cx - s * 0.18, cy + s * 0.18, s * 0.52),
+                             "width": 1.7 * unit}))
+        out.append(("line", {"points": [cx + s * 0.20, cy - s * 0.20,
+                                        cx + s * 0.64, cy - s * 0.64],
+                             "width": 1.7 * unit}))
+    elif kind == "close":
+        out.append(("line", {"points": [cx - s * 0.42, cy - s * 0.42,
+                                        cx + s * 0.42, cy + s * 0.42],
+                             "width": 1.7 * unit}))
+        out.append(("line", {"points": [cx - s * 0.42, cy + s * 0.42,
+                                        cx + s * 0.42, cy - s * 0.42],
+                             "width": 1.7 * unit}))
+    elif kind == "play":
+        out.append(("mesh", {"vertices": [cx - s * 0.34, cy - s * 0.5, 0, 0,
+                                          cx - s * 0.34, cy + s * 0.5, 0, 0,
+                                          cx + s * 0.52, cy, 0, 0],
+                             "indices": [0, 1, 2], "mode": "triangles"}))
+    elif kind == "pause":
+        bw = s * 0.26
+        for dx in (-0.34, 0.08):
+            out.append(("line", {"rectangle": (cx + s * dx, cy - s * 0.48,
+                                               bw, s * 0.96),
+                                 "width": 1.2 * unit}))
+    elif kind == "download":
+        out.append(("line", {"points": [cx, cy + s * 0.55, cx, cy - s * 0.20],
+                             "width": 1.8 * unit}))
+        out.append(("line", {"points": [cx - s * 0.34, cy + s * 0.10,
+                                        cx, cy - s * 0.24,
+                                        cx + s * 0.34, cy + s * 0.10],
+                             "width": 1.8 * unit}))
+        out.append(("line", {"points": [cx - s * 0.46, cy - s * 0.55,
+                                        cx + s * 0.46, cy - s * 0.55],
+                             "width": 1.8 * unit}))
+    elif kind == "expand":
+        out.append(("line", {"points": [cx - s * 0.5, cy - s * 0.12,
+                                        cx, cy + s * 0.36,
+                                        cx + s * 0.5, cy - s * 0.12],
+                             "width": 1.8 * unit}))
+    return out
+
+
 def draw_icon(widget, kind, color=None, size=None):
     """把图标**画**在控件上，而不是用字符。
 
     为什么不直接写 ⚙ / 🔍 这类字符：自带的中文字体是从 Noto Sans SC
     裁出来的，emoji 和大部分几何符号根本不在里面，写上去就是方块。
     自己用 canvas 画最稳，而且线条更锐利、更贴合极简风格。
+
+    ⚠ 图元必须用**父坐标系**（widget.x / widget.y 当原点）：
+    往 widget.canvas 加的东西和 widget.pos 在同一个坐标空间，
+    用本地坐标（0..w）会把图标画到父容器原点上去 ——
+    这就是「×」跑到屏幕左下角、按钮上只剩一个空圆的原因。
     """
-    from kivy.graphics import Color, Line, Mesh
+    from kivy.graphics import Color, InstructionGroup, Line, Mesh
     col = color or C_TEXT
+    _DRAW = {"line": Line, "mesh": Mesh}
 
     def _redraw(*_):
-        widget.canvas.after.clear()
         w, h = max(1.0, widget.width), max(1.0, widget.height)
-        s = min(w, h) * 0.5
-        cx, cy = w / 2.0, h / 2.0
-        with widget.canvas.after:
-            Color(*col)
-            if kind == "settings":
-                # 三条滑杆（现代感的「设置」图标，比齿轮更好画也更好看）
-                lw = dp(1.6)
-                for i, off in enumerate((-0.42, 0.0, 0.42)):
-                    y = cy + s * off
-                    Line(points=[cx - s * 0.72, y, cx + s * 0.72, y], width=lw)
-                    knx = cx + s * (0.34 if i % 2 == 0 else -0.30)
-                    Line(circle=(knx, y, dp(2.4)), width=lw)
-            elif kind == "search":
-                Line(circle=(cx - s * 0.18, cy + s * 0.18, s * 0.52),
-                     width=dp(1.7))
-                Line(points=[cx + s * 0.20, cy - s * 0.20,
-                             cx + s * 0.64, cy - s * 0.64], width=dp(1.7))
-            elif kind == "close":
-                Line(points=[cx - s * 0.42, cy - s * 0.42,
-                             cx + s * 0.42, cy + s * 0.42], width=dp(1.7))
-                Line(points=[cx - s * 0.42, cy + s * 0.42,
-                             cx + s * 0.42, cy - s * 0.42], width=dp(1.7))
-            elif kind == "play":
-                Mesh(vertices=[cx - s * 0.34, cy - s * 0.5, 0, 0,
-                               cx - s * 0.34, cy + s * 0.5, 0, 0,
-                               cx + s * 0.52, cy, 0, 0],
-                     indices=[0, 1, 2], mode="triangles")
-            elif kind == "pause":
-                bw = s * 0.26
-                for dx in (-0.34, 0.08):
-                    Line(rectangle=(cx + s * dx, cy - s * 0.48,
-                                    bw, s * 0.96), width=dp(1.2))
-            elif kind == "download":
-                Line(points=[cx, cy + s * 0.55, cx, cy - s * 0.20],
-                     width=dp(1.8))
-                Line(points=[cx - s * 0.34, cy + s * 0.10,
-                             cx, cy - s * 0.24,
-                             cx + s * 0.34, cy + s * 0.10], width=dp(1.8))
-                Line(points=[cx - s * 0.46, cy - s * 0.55,
-                             cx + s * 0.46, cy - s * 0.55], width=dp(1.8))
-            elif kind == "expand":
-                Line(points=[cx - s * 0.5, cy - s * 0.12,
-                             cx, cy + s * 0.36,
-                             cx + s * 0.5, cy - s * 0.12], width=dp(1.8))
+        # 图标画进自己的 InstructionGroup：不能用 canvas.after.clear()，
+        # 那会把 attach_border 加在同一 canvas.after 上的边框一起清掉。
+        grp = getattr(widget, "_icon_group", None)
+        if grp is None or grp not in widget.canvas.after.children:
+            grp = InstructionGroup()
+            widget._icon_group = grp
+            widget.canvas.after.add(grp)
+        grp.clear()
+        grp.add(Color(*col))
+        for op, kw in icon_parts(kind, w, h, widget.x, widget.y, dp(1.0)):
+            grp.add(_DRAW[op](**kw))
 
     widget.bind(pos=_redraw, size=_redraw)
     _redraw()

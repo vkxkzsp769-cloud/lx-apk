@@ -966,6 +966,83 @@ def test_bgfx_wired_with_fallback():
           % (mid, worst))
 
 
+def test_icon_geometry_in_parent_coords():
+    """回归：图标图元必须落在**父坐标系**里（用户反馈「叉不在应该在的地方」）。
+
+    往 widget.canvas 加的图元用的是父坐标系（和 widget.pos 同一空间），
+    但早期版本的 draw_icon 用本地坐标 `cx, cy = w/2, h/2` 算几何 ——
+    图标就被画到父容器原点附近去了：设置抽屉标题行的关闭「×」跑到屏幕
+    左下角，而按钮上只剩一个空的灰色圆底。
+
+    几何现在抽在纯函数 icon_parts() 里，这里直接断言它输出的每个坐标
+    都落在控件矩形 [ox, ox+w] × [oy, oy+h] 内 —— 把偏移去掉这条测试立刻红。
+    """
+    import main as M
+
+    w = h = 40.0
+    ox, oy = 100.0, 200.0
+    kinds = ("settings", "search", "close", "play", "pause", "download", "expand")
+    for kind in kinds:
+        parts = M.icon_parts(kind, w, h, ox, oy, 1.0)
+        if not parts:
+            raise AssertionError("图标 %s 没有任何图元" % kind)
+        xs, ys = [], []
+        for op, kw in parts:
+            if op == "line" and "points" in kw:
+                xs += list(kw["points"][0::2])
+                ys += list(kw["points"][1::2])
+            elif op == "line" and "circle" in kw:
+                xs.append(kw["circle"][0])
+                ys.append(kw["circle"][1])
+            elif op == "line" and "rectangle" in kw:
+                rx, ry, rw, rh = kw["rectangle"]
+                xs += [rx, rx + rw]
+                ys += [ry, ry + rh]
+            elif op == "mesh" and "vertices" in kw:
+                xs += list(kw["vertices"][0::4])
+                ys += list(kw["vertices"][1::4])
+            else:
+                raise AssertionError("图标 %s 出现未知图元 %r" % (kind, (op, kw)))
+        for x in xs:
+            if not (ox - 0.01 <= x <= ox + w + 0.01):
+                raise AssertionError(
+                    "%s 的 x=%.2f 跑出控件 [%.1f, %.1f]：是不是忘了加父坐标偏移？"
+                    % (kind, x, ox, ox + w))
+        for y in ys:
+            if not (oy - 0.01 <= y <= oy + h + 0.01):
+                raise AssertionError(
+                    "%s 的 y=%.2f 跑出控件 [%.1f, %.1f]：是不是忘了加父坐标偏移？"
+                    % (kind, y, oy, oy + h))
+
+    # 前提校验：证明这套断言真能抓到「本地坐标」写法 ——
+    # 不传偏移时坐标落在 [0, w] 里，上面那套边界检查必然判它越界。
+    local_xs = []
+    for op, kw in M.icon_parts("close", w, h, 0.0, 0.0, 1.0):
+        if op == "line" and "points" in kw:
+            local_xs += list(kw["points"][0::2])
+    if not local_xs or all(ox - 0.01 <= x <= ox + w + 0.01 for x in local_xs):
+        raise AssertionError("前提不成立：不偏移的坐标竟然也落在控件内，抓不到 bug")
+    print("  7 种图标图元全部落在父坐标系控件矩形内 ✓")
+
+
+def test_draw_icon_delegates_to_icon_parts():
+    """draw_icon 的几何必须来自 icon_parts()，别又各写一份坐标。
+
+    这次 bug 的根就是「几何算在一个地方、坐标空间在另一个地方」，
+    分散写两遍迟早再漂移。用源码检查把它钉住。
+    """
+    import inspect
+    import main as M
+
+    src = inspect.getsource(M.draw_icon)
+    if "icon_parts(" not in src:
+        raise AssertionError("draw_icon 没有调用 icon_parts()，几何可能又被写了一份")
+    # 反面教材：老写法直接算 cx, cy = w/2, h/2 再往 canvas 加图元
+    if "cx, cy = w / 2.0" in src:
+        raise AssertionError("draw_icon 里又出现了本地坐标 cx, cy = w/2, h/2")
+    print("  draw_icon 的几何来自 icon_parts，且不含本地坐标 ✓")
+
+
 def test_gradient_buffer_size():
     """回归：渐变缓冲必须按 colorfmt='rgb' 的 3 字节/像素打包。
 
@@ -1565,6 +1642,8 @@ def main():
     check("同名文件自动顺延不覆盖", test_download_unique_path)
     check("播放器瞬时错误延后确认", test_player_transient_error_deferred)
     check("动态背景接线 + 启动兜底", test_bgfx_wired_with_fallback)
+    check("图标画在父坐标系内", test_icon_geometry_in_parent_coords)
+    check("draw_icon 几何来自 icon_parts", test_draw_icon_delegates_to_icon_parts)
     check("渐变缓冲字节数", test_gradient_buffer_size)
     check("背景与主题同色系", test_theme_palette_consistent)
     check("搜索分页 + 限流识别", test_netease_paging)
