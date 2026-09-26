@@ -47,17 +47,7 @@ jobs:
           restore-keys: |
             android-sdk-ndk-r25b-
 
-      # ── 待办：固定签名密钥 ──────────────────────────────
-      # 目的：让每次构建用同一把钥匙签名，APK 才能覆盖安装
-      # （不修的话每个版本签名都不同，Android 只允许「先卸载再装」）。
-      #
-      # 已完成：固定密钥已生成为仓库 Secret `DEBUG_KEYSTORE_B64`
-      #         （PKCS12，别名 androiddebugkey / 口令 android）。
-      # 未完成：把它还原到 ~/.android/debug.keystore 的这一步会让
-      #         workflow 变成 startup_failure（一个 job 都不启动）——
-      #         本机 YAML 解析通过，是 GitHub 侧语义校验拦的，原因待查。
-      #         为避免构建继续挂在坏状态，暂时把这步撤掉。
-      # 下一步：定位该校验规则后再加回来；在那之前构建恢复原状。
+      # 签名说明见下面「编译 APK（release + 固定密钥签名）」那一步。
 
       - name: 预装 Android SDK
         env:
@@ -156,12 +146,37 @@ jobs:
               done
           echo "=== 补丁完成 ==="
 
-      - name: 编译 APK
+      - name: 编译 APK（release + 固定密钥签名）
+        env:
+          # 固定签名密钥：base64 的 PKCS12，存在仓库 Secret 里。
+          # 用 env 传值、在脚本里判空 —— 不要写成 step 级 if 引用 secrets。
+          KS_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+          P4A_RELEASE_KEYALIAS: androiddebugkey
+          P4A_RELEASE_KEYALIAS_PASSWD: android
+          P4A_RELEASE_KEYSTORE_PASSWD: android
         run: |
+          # ---- 固定签名，让 APK 能覆盖安装 ----
+          # 为什么要走 release 构建：只有 release 才用 p4a 的 P4A_RELEASE_*
+          # 这套显式密钥（见 p4a 源码 pythonforandroid/build.py 里
+          # --keystore/--signkey/--keystorepw/--signkeypw 的映射）。
+          # debug 构建用的是 AGP 自动生成的 debug 钥匙，在 CI 的全新环境里
+          # 每次都会重新生成 —— 实测两次构建的 CERT.RSA sha256 不同、
+          # 连长度都不同（1019B vs 1015B），Android 因此只允许先卸载再装。
+          if [ -n "$KS_B64" ]; then
+            KS="$RUNNER_TEMP/lx-sign.keystore"
+            printf '%s' "$KS_B64" | base64 -d > "$KS"
+            export P4A_RELEASE_KEYSTORE="$KS"
+            # 先读一次：密钥不对就在这里失败，别拖到签名那步才报
+            keytool -list -keystore "$KS" -storepass android \
+              -alias androiddebugkey | tail -3
+          else
+            echo "::warning::未配置 DEBUG_KEYSTORE_B64，本次签名可能无法覆盖安装"
+          fi
+
           # 注意：不要用 `yes | buildozer`。buildozer 正常跑完后 yes 仍写入，
           # 触发 SIGPIPE 让管道返回 1，步骤被判失败（尽管 APK 已生成）。
           set +e
-          buildozer -v android debug > build.log 2>&1
+          buildozer -v android release > build.log 2>&1
           RC=$?
           tail -50 build.log
           echo "buildozer 退出码: $RC"

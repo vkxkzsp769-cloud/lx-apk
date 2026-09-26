@@ -12,7 +12,23 @@ source.include_patterns = assets/*, assets/sources/*, assets/fonts/*, sources/*
 # 桌面专用的调试工具不进 APK（它们依赖 dukpy，Android 上没有这个 recipe）
 source.exclude_patterns = test_desktop.py, lx_engine.py, test_ui.py, tests/*
 
-version = 2.6.7
+version = 2.6.8
+
+# release 模式打包成 apk 而不是 aab。
+# buildozer 官方默认 `android.release_artifact = aab`（见 buildozer/
+# buildozer/default.spec），而我们要的是能直接装的 apk。
+# 为什么要走 release：只有 release 构建才会用 p4a 的 P4A_RELEASE_* 那套
+# 显式密钥签名（p4a 源码 pythonforandroid/build.py 里 --keystore 等参数
+# 映射的正是这几个环境变量）。debug 构建用的是 AGP 自动生成的 debug 钥匙，
+# 在 CI 的全新环境里每次都会重新生成 —— 签名每次不同，用户就只能先卸载
+# 再装。详见 .github/workflows/build.yml 的签名说明。
+android.release_artifact = apk
+
+# versionCode。buildozer 官方默认是 1（default.spec 里
+# `# android.numeric_version = 1`），不显式设置的话每个版本都是 1。
+# Android 要求新包的 versionCode >= 已装版本，显式递增最稳妥。
+# 每次发版把它往上加（跟 version 对应：2.6.7 -> 20607）。
+android.numeric_version = 20607
 
 # 只用 kivy（不锁版本）。锁 kivy==2.3.x 会拉 thorvg 依赖，
 # 其 recipe 在 NDK r25b 下 glob() 返回空 -> IndexError 导致编译失败。
