@@ -831,12 +831,15 @@ class LxApp(App):
         return panel
 
     def _sheet_head(self):
-        """抽屉顶部的标题行 + 关闭按钮"""
+        """抽屉右上角的关闭按钮。
+
+        原先是「设置」标题 + 关闭按钮。但抽屉一展开本身就说明了「这是设置
+        面板」，标题是冗余的 —— 去掉，只留右侧的关闭按钮。
+        """
         row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        t = Label(text="设置", bold=True, font_size=dp(16), color=C_TEXT,
-                  halign="left", valign="middle", **self.F)
-        t.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
-        row.add_widget(t)
+        # 左侧弹性占位：把关闭按钮顶到最右边。
+        # 不能只放按钮 —— 水平 BoxLayout 会把它排到最左边去。
+        row.add_widget(Widget())
         btn = IconButton("close", dia=dp(34), icon_color=C_DIM)
         btn.bind(on_release=lambda *_: self.close_settings())
         row.add_widget(btn)

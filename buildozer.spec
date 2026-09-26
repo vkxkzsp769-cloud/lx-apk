@@ -12,7 +12,7 @@ source.include_patterns = assets/*, assets/sources/*, assets/fonts/*, sources/*
 # 桌面专用的调试工具不进 APK（它们依赖 dukpy，Android 上没有这个 recipe）
 source.exclude_patterns = test_desktop.py, lx_engine.py, test_ui.py, tests/*
 
-version = 2.7.2
+version = 2.7.3
 
 # release 模式打包成 apk 而不是 aab。
 # buildozer 官方默认 `android.release_artifact = aab`（见 buildozer/
@@ -28,7 +28,7 @@ android.release_artifact = apk
 # `# android.numeric_version = 1`），不显式设置的话每个版本都是 1。
 # Android 要求新包的 versionCode >= 已装版本，显式递增最稳妥。
 # 每次发版把它往上加（跟 version 对应：2.6.7 -> 20607）。
-android.numeric_version = 20702
+android.numeric_version = 20703
 
 # 只用 kivy（不锁版本）。锁 kivy==2.3.x 会拉 thorvg 依赖，
 # 其 recipe 在 NDK r25b 下 glob() 返回空 -> IndexError 导致编译失败。
