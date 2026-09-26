@@ -501,7 +501,11 @@ class LxApp(App):
                 with open(path, encoding="utf-8", errors="replace") as f:
                     code = f.read()
             except Exception as e:
-                self.ui(lambda: self.set_status("读取音源失败: %s" % e, C_ERR))
+                # 注意：先把消息取出来再进 lambda。
+                # `except ... as e` 的 e 在 except 块结束时会被删除，
+                # 而 lambda 是稍后由 Clock 执行的，那时访问 e 会 NameError。
+                msg = str(e)
+                self.ui(lambda: self.set_status("读取音源失败: %s" % msg, C_ERR))
                 return
 
             ok, info = self.bridge.load_source(code)
@@ -920,7 +924,8 @@ class LxApp(App):
             self.ui(lambda: self._set_platform_and_load(platform, best))
         except Exception as e:
             log_exc("_research_on")
-            self.ui(lambda: self.set_status("换平台失败: %s" % e, C_ERR))
+            msg = str(e)      # 同上：别在 lambda 里直接用 e
+            self.ui(lambda: self.set_status("换平台失败: %s" % msg, C_ERR))
 
     def _set_platform_and_load(self, platform, song):
         for p in self.platforms:

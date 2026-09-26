@@ -80,8 +80,7 @@ def _wy_fetch(keyword, offset, limit):
     url = ("https://music.163.com/api/search/get/web"
            "?s=%s&type=1&offset=%d&limit=%d"
            % (urllib.parse.quote(keyword), offset, limit))
-    headers = {"Referer": "https://music.163.com/",
-               "Cookie": "appver=8.9.70;"}
+    # 走 netutil，Referer/Cookie 由 netutil 的调用处统一处理
     data = {}
     for i in range(RETRIES):
         try:

@@ -851,6 +851,64 @@ def test_download_no_nameerror():
     print("  坏地址抛的是网络错误（不是 NameError）✓")
 
 
+def test_no_except_var_in_lambda():
+    """回归：`except ... as e` 的 e 不能在 lambda 里用。
+
+    Python 在 except 块结束时会把 e 删掉（避免循环引用），
+    而我们的 lambda 是稍后由 Clock 在主线程执行的 ——
+    那时 e 已经不存在，直接 NameError。
+    真机上表现为「下载失败: name 'e' is not defined」这类莫名其妙的报错。
+
+    正确写法：先 msg = str(e)，再让 lambda 用 msg。
+    """
+    import ast as _ast
+    import os as _os
+    bad = []
+    for f in sorted(_os.listdir(HERE)):
+        if not f.endswith(".py"):
+            continue
+        tree = _ast.parse(open(_os.path.join(HERE, f), encoding="utf-8").read())
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.ExceptHandler) or not node.name:
+                continue
+            for sub in _ast.walk(node):
+                if isinstance(sub, _ast.Lambda):
+                    used = {n.id for n in _ast.walk(sub)
+                            if isinstance(n, _ast.Name)}
+                    if node.name in used:
+                        bad.append("%s:行%d except as %s -> lambda 里用了它"
+                                   % (f, sub.lineno, node.name))
+    if bad:
+        raise AssertionError("except 变量泄漏进 lambda:\n      "
+                             + "\n      ".join(bad))
+    print("  没有把 except 变量带进 lambda ✓")
+
+
+def test_no_undefined_names():
+    """用 pyflakes 全量扫「未定义名字」。
+
+    真实事故：downloader.py 少 import urllib / diag，
+    结果**所有平台都下载失败**，报 NameError ——
+    而在线播放不经过那段代码，现象就是「能听不能下」。
+    光靠人看很难发现，交给工具。
+    """
+    import subprocess, sys as _sys
+    try:
+        out = subprocess.run(
+            [_sys.executable, "-m", "pyflakes"] +
+            [os.path.join(HERE, f) for f in os.listdir(HERE)
+             if f.endswith(".py")],
+            capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        print("  [SKIP] pyflakes 不可用: %s" % e)
+        return
+    bad = [l for l in (out.stdout or "").splitlines()
+           if "undefined name" in l]
+    if bad:
+        raise AssertionError("存在未定义名字:\n      " + "\n      ".join(bad))
+    print("  pyflakes 未发现未定义名字 ✓")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -910,6 +968,8 @@ def main():
     check("QQ 内置解析器", test_qq_resolver)
     check("不静默换平台", test_no_silent_platform_switch)
     check("下载无未导入名字", test_download_no_nameerror)
+    check("except 变量不进 lambda", test_no_except_var_in_lambda)
+    check("pyflakes 未定义名字", test_no_undefined_names)
 
     print()
     if FAILS:
