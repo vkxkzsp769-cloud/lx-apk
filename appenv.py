@@ -224,8 +224,26 @@ BUNDLED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # 多个内置音源都释放到这里
 BUILTIN_DIR = os.path.join(APP_DIR, "builtin_sources")
 
-# 默认用哪个：聚合音源 特供版 实测 5 个平台全部可取直链
-DEFAULT_SOURCE_NAME = "01_聚合音源_特供版.js"
+# 内置音源的文件名一律用纯 ASCII。
+# 之前用了中文名，结果真机上 os.listdir() 拿到的是一串乱码
+# （形如 '01_￨ﾁﾚ￥ﾐﾈ...'），下拉框里全是怪字符 ——
+# 这是文件系统编码往返导致的，改成 ASCII 彻底绕开。
+DEFAULT_SOURCE_NAME = "src01_juhe.js"
+
+# 文件 -> 界面上显示的名字
+SOURCE_TITLES = {
+    "src01_juhe.js":      "聚合音源 特供版",
+    "src02_kxh.js":       "KxH测试 v1.7.17",
+    "src03_hyw.js":       "HYW公益测试 v0.74",
+    "src04_changqing.js": "长青SVIP v1.2.0",
+    "src05_molan.js":     "墨澜聚合 v2.2.0",
+    "src06_xinghai.js":   "星海 v2.3.11",
+}
+
+
+def source_title(filename):
+    """给下拉框用的显示名（认不出就用文件名）"""
+    return SOURCE_TITLES.get(filename, filename)
 
 
 def _copy_file(src, dst):

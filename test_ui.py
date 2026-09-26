@@ -700,6 +700,37 @@ def test_download_referer():
     print("  平台/主机 Referer 推断 + 备用头 ✓")
 
 
+def test_url_verify():
+    """回归：解析出地址 != 地址能用。
+
+    QQ 音乐那批第三方代理挂了会返回 403，
+    只看「有没有解析出字符串」会误判成成功，
+    最后在播放/下载时莫名其妙失败。所以必须校验响应内容。
+    """
+    import songinfo as S
+    cases = [
+        (b"ID3\x03\x00", True, "ID3"),
+        (b"\xff\xfb\x90\x00", True, "mp3 帧"),
+        (b"fLaC\x00", True, "flac"),
+        (b"\x00\x00\x00\x20ftypM4A ", True, "m4a"),
+        (b"OggS\x00", True, "ogg"),
+        (b"<html>403</html>", False, "网页"),
+        (b'{"code":403}', False, "JSON"),
+        (b"", False, "空"),
+    ]
+    for head, want, name in cases:
+        got = S.looks_like_audio(head)
+        if got != want:
+            raise AssertionError("%s 判定错了: %s" % (name, got))
+    print("  音频魔数识别 %d 种 ✓" % len(cases))
+
+    # 死链要能被识破（这是本测试的重点）
+    ok, why = S.verify("http://175.27.166.236/kgqq/qq.php?type=mp3&id=x", "tx")
+    if ok:
+        raise AssertionError("死链被判成可用")
+    print("  死链识破: %s ✓" % why)
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -755,6 +786,7 @@ def main():
     check("音源下拉列出文件", test_source_dropdown_lists_files)
     check("优先用自带简体字体", test_bundled_font_preferred)
     check("下载带平台 Referer", test_download_referer)
+    check("直链有效性校验", test_url_verify)
 
     print()
     if FAILS:

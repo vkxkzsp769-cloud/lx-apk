@@ -44,7 +44,8 @@ import player as player_mod
 import songinfo
 from appenv import (IS_ANDROID, SOURCE_FILE, default_source_path, diag,
                     download_dir, ensure_source, extract_bundled_sources, log,
-                    log_exc, request_all_files_access, save_source)
+                    log_exc, request_all_files_access, save_source,
+                    source_title)
 from lxbridge import LxBridge
 
 # ============================================================
@@ -426,12 +427,17 @@ class LxApp(App):
         except Exception:
             log_exc("释放内置音源")
             self.builtin = []
-        self.source_paths = {name: path for name, path in self.builtin}
-        if self.builtin:
-            names = [n for n, _ in self.builtin]
-            self.sp_source.values = names
-            self.sp_source.text = names[0]
-            diag("内置音源 %d 个: %s" % (len(names), names[:3]))
+        # 下拉显示友好名，内部记「显示名 -> 路径」
+        self.source_paths = {}
+        labels = []
+        for fname, path in self.builtin:
+            title = source_title(fname)
+            labels.append(title)
+            self.source_paths[title] = path
+        if labels:
+            self.sp_source.values = labels
+            self.sp_source.text = labels[0]
+            diag("内置音源 %d 个: %s" % (len(labels), labels[:3]))
         else:
             self.sp_source.text = "无内置音源"
         self.set_status("正在启动 JS 引擎…")
@@ -525,7 +531,8 @@ class LxApp(App):
 
         meta = info.get("meta") or {}
         # 有些音源 meta 里没有 name/version，用文件名兜底，别显示 "?"
-        src_name = os.path.basename(getattr(self, "_loading_source", "") or "")
+        src_name = source_title(
+            os.path.basename(getattr(self, "_loading_source", "") or ""))
         ctx = {
             "name": meta.get("name") or src_name or "音源",
             "version": meta.get("version") or "",
@@ -742,47 +749,101 @@ class LxApp(App):
             log_exc("open_song")
             self.set_status("打开歌曲失败: %s" % e, C_ERR)
 
-    def _resolve_song(self, song):
-        """后台：取直链（受限自动降品质）+ 探测格式/大小"""
-        source = self._current_source()
-        want = self.sp_quality.text or "320k"
+    def _try_one(self, source, song, qualities):
+        """在某个平台上按音质依次尝试，返回 (url, 音质, extra, 最后一次错误)
+
+        关键：解析出地址不算成功，还要 verify() 确认真能取到音频。
+        很多第三方接口挂了会返回 403，只看到「解析成功」会误判，
+        最后在播放/下载时才莫名其妙地失败。
+        """
         info = {"id": song["id"], "name": song["name"],
                 "singer": song["singer"], "source": source,
                 "interval": song.get("interval", ""),
                 "meta": {"songId": song["id"],
                          "albumName": song.get("album", "")}}
-        # 各平台取直链需要的专属字段（tx: songmid/strMediaMid，
-        # kg: hash，mg: copyrightId ...），搜索时就一并带回来了
-        extra = song.get("extra") or {}
-        for k, v in extra.items():
+        for k, v in (song.get("extra") or {}).items():
             if v:
                 info[k] = v
                 info["meta"].setdefault(k, v)
 
-        order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
-        url, used, err = None, want, ""
-        for q in order[:3]:
-            got, e = self.bridge.music_url(source, q, info)
-            if got and not downloader.is_restricted(got):
-                url, used = got, q
-                break
-            err = e or "该品质直链受限"
-            log("品质 %s 解析失败: %s" % (q, err))
+        last = ""
+        for q in qualities:
+            got, err = self.bridge.music_url(source, q, info)
+            if not got:
+                last = err or "未返回地址"
+                continue
+            if downloader.is_restricted(got):
+                last = "该音质直链受限"
+                continue
 
-        if not url:
-            msg = err
-            self.ui(lambda: self._song_failed(msg))
+            ok, why = songinfo.verify(got, source)
+            log("平台 %s 音质 %s: %s" % (source, q, "可用" if ok else why))
+            if ok:
+                return got, q, info, ""
+            last = why
+
+        return None, None, info, last or "所有音质都不可用"
+
+    def _resolve_song(self, song):
+        """后台：解析直链（本平台多音质 -> 必要时跨平台）"""
+        want = self.sp_quality.text or "320k"
+        order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
+        order = order[:3]
+
+        tried = []
+        source = self._current_source()
+        tried.append(source)
+        self.ui(lambda: self.set_status(
+            "正在解析 (%s)…" % PLATFORM_LABEL.get(source, source)))
+
+        url, used, info, err = self._try_one(source, song, order)
+        if url:
+            meta = songinfo.probe(url)
+            self.ui(lambda: self._song_ready(song, url, used, meta, source))
             return
 
-        meta = songinfo.probe(url)
-        self.ui(lambda: self._song_ready(song, url, used, meta))
+        # ---- 本平台不行 -> 跨平台找同一首歌 ----
+        # 「其他平台不稳定」时这一步能救回大部分情况
+        key = "%s %s" % (song["name"], song["singer"])
+        for alt in ("wy", "kg", "kw", "tx", "mg"):
+            if alt in tried:
+                continue
+            tried.append(alt)
+            self.ui(lambda alt=alt: self.set_status(
+                "该平台不可用，改在 %s 找同一首…"
+                % PLATFORM_LABEL.get(alt, alt)))
+            try:
+                cands = searchers.search(alt, key, 3)
+            except Exception:
+                log_exc("跨平台搜索 %s" % alt)
+                continue
+            if not cands:
+                continue
+            # 名字要能对上，避免换成完全不同的歌
+            best = None
+            for c in cands:
+                if song["name"][:6] in c["name"] or c["name"][:6] in song["name"]:
+                    best = c
+                    break
+            if best is None:
+                continue
+            u, q2, _, e2 = self._try_one(alt, best, order)
+            if u:
+                meta = songinfo.probe(u)
+                self.ui(lambda: self._song_ready(
+                    song, u, q2, meta, alt, note="来自 %s"
+                    % PLATFORM_LABEL.get(alt, alt)))
+                return
+            err = e2 or err
+
+        self.ui(lambda: self._song_failed(err))
 
     def _song_failed(self, err):
         if getattr(self, "_pop_info", None) is not None:
             self._pop_info.text = "解析失败: %s\n（可能版权受限，换一首试试）" % err
         self.set_status("解析失败: %s" % err, C_ERR)
 
-    def _song_ready(self, song, url, quality, meta):
+    def _song_ready(self, song, url, quality, meta, platform=None, note=""):
         self._cur_url = url
         self._cur_ext = meta.get("format") or songinfo.format_of(quality)
         self._cur_dur = 0.0
@@ -793,18 +854,22 @@ class LxApp(App):
         except Exception:
             pass
 
+        src = PLATFORM_LABEL.get(platform or "", "") if platform else ""
         if getattr(self, "_pop_info", None) is not None:
             self._pop_info.text = (
-                "歌手: %s\n时长: %s\n品质: %s\n格式: %s\n大小: %s"
+                "歌手: %s\n时长: %s\n品质: %s\n格式: %s\n大小: %s%s"
                 % (song["singer"], song.get("interval") or "--:--",
                    songinfo.quality_label(quality),
                    (self._cur_ext or "?").upper(),
-                   songinfo.human_size(meta.get("size"))))
+                   songinfo.human_size(meta.get("size")),
+                   ("\n来源: %s %s" % (src, note)).rstrip() if src else ""))
         if getattr(self, "_pop_play", None) is not None:
             self._pop_play.disabled = False
             self._pop_dl.disabled = False
-        self.set_status("已解析: %s（%s / %s / %s）"
-                        % (song["name"], songinfo.quality_label(quality),
+        self.set_status("已解析: %s（%s%s / %s / %s）"
+                        % (song["name"],
+                           ("%s " % src) if src else "",
+                           songinfo.quality_label(quality),
                            (self._cur_ext or "?").upper(),
                            songinfo.human_size(meta.get("size"))), C_OK)
 
