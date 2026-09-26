@@ -61,11 +61,19 @@ jobs:
       # 别名/口令必须是 androiddebugkey / android：AGP 的 debug 签名配置
       # 写死了这两个值，改别的它会找不到。
       - name: 写入固定签名密钥（保证能覆盖安装）
-        if: ${{ secrets.DEBUG_KEYSTORE_B64 != '' }}
+        # 注意：不能用 `if: ${{ secrets.X != '' }}` —— GitHub 明确不允许在
+        # step 的 if 条件里直接引用 secrets，整个 workflow 会被判无效，
+        # 表现为「run 失败且一个 job 都没启动」（本次实测踩到）。
+        # 正确做法：用 env 传进来，在脚本里判空。
+        env:
+          KS_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
         run: |
+          if [ -z "$KS_B64" ]; then
+            echo "::warning::未配置 DEBUG_KEYSTORE_B64，将使用自动生成的 debug 密钥；这样每个版本签名都不同，升级需先卸载旧版"
+            exit 0
+          fi
           mkdir -p "$HOME/.android"
-          echo "${{ secrets.DEBUG_KEYSTORE_B64 }}" | base64 -d \
-            > "$HOME/.android/debug.keystore"
+          printf '%s' "$KS_B64" | base64 -d > "$HOME/.android/debug.keystore"
           ls -l "$HOME/.android/debug.keystore"
           # 提前读一次 —— 密钥不对就在这里失败，别拖到签名那一步才报
           keytool -list -keystore "$HOME/.android/debug.keystore" \
