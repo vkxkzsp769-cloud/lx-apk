@@ -12,6 +12,14 @@ from appenv import IS_ANDROID, diag, log, log_exc
 FONT_NAME = "CNFont"
 _registered_path = None
 
+# 等宽字体（只用于时间这类纯数字文本，例如播放条的 "01:23 / 04:05"）
+#
+# 为什么需要：iOS 的播放时间用等宽字形，数字跳动时宽度不变，进度条不会
+# 跟着抖。中文数字在 Noto Sans SC 里是比例宽度，所以另找一个等宽字体。
+# 找不到就走 FONT_NAME 兜底 —— 等宽是锦上添花，绝不能因为缺字体而崩。
+MONO_NAME = "CNMono"
+_mono_path = None
+
 
 # 打包进 APK 的中文字体（~9.9MB）
 #
@@ -129,3 +137,81 @@ def popup_kwargs():
       popup.content，从没检查 Popup 自身的标题。）
     """
     return {"title_font": FONT_NAME} if _registered_path else {}
+
+
+def _mono_candidates():
+    """等宽字体候选。只用来渲染时间这类 ASCII 文本，所以不挑字形。
+
+    各家 Android 的等宽字体名字差得很远（RobotoMono / NotoSansMono /
+    DroidSansMono / MonoSpace…），光靠写死的几个路径命中率不高。
+    所以写死的列表之后**再扫一遍 /system/fonts**，凡是文件名里带 mono 的
+    都收进来 —— 和中文字体那边同一套思路。
+
+    等宽只是「数字不跳宽度」，命中不了就走 font_kwargs() 兜底，
+    绝不能因为缺字体让界面出问题，所以这里一律 try 住。
+    """
+    if IS_ANDROID:
+        out = [
+            "/system/fonts/RobotoMono-Regular.ttf",
+            "/system/fonts/NotoSansMono-Regular.ttf",
+            "/system/fonts/DroidSansMono.ttf",
+            "/system/fonts/CutiveMono.ttf",
+            "/system/fonts/MonoSpace.ttf",
+        ]
+        found = []
+        for d in ("/system/fonts", "/system/font"):
+            try:
+                if not os.path.isdir(d):
+                    continue
+                for fn in sorted(os.listdir(d)):
+                    low = fn.lower()
+                    if "mono" in low and low.endswith((".ttf", ".otf")):
+                        found.append(os.path.join(d, fn))
+            except Exception:
+                log_exc("扫描等宽字体目录 %s" % d)
+        out.extend(found)
+        return out
+
+    return [
+        "C:/Windows/Fonts/consola.ttf",
+        "C:/Windows/Fonts/Cour.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/System/Library/Fonts/Menlo.ttc",
+    ]
+
+
+def register_mono():
+    """注册等宽字体。找不到返回 False，调用方用 mono_kwargs() 会自动兜底。"""
+    global _mono_path
+    if _mono_path:
+        return True
+    try:
+        from kivy.core.text import LabelBase
+    except Exception:
+        log_exc("import LabelBase(mono)")
+        return False
+    for path in _mono_candidates():
+        try:
+            if not (path and os.path.exists(path)
+                    and os.path.getsize(path) > 10000):
+                continue
+            LabelBase.register(name=MONO_NAME, fn_regular=path)
+            _mono_path = path
+            log("已注册等宽字体:", path)
+            return True
+        except Exception:
+            log_exc("注册等宽字体 %s" % path)
+    log("未找到等宽字体，时间文本退回中文字体（不影响显示）")
+    return False
+
+
+def mono_kwargs():
+    """时间这类「用等宽更好」的文本控件用。
+
+    找不到等宽字体就返回中文字体参数 —— 数字仍然正常显示，
+    只是失去等宽（不会变方块，所以这里不需要专门报错）。
+    """
+    if _mono_path:
+        return {"font_name": MONO_NAME}
+    return font_kwargs()

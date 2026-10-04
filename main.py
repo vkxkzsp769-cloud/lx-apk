@@ -23,22 +23,15 @@ import threading
 import traceback
 
 from kivy.app import App
-from kivy.animation import Animation
 from kivy.clock import Clock
 from kivy.metrics import dp
-from kivy.properties import ListProperty, NumericProperty
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
-from kivy.uix.progressbar import ProgressBar
 from kivy.uix.slider import Slider
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.dropdown import DropDown
-from kivy.uix.spinner import Spinner, SpinnerOption
-from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
-from kivy.uix.floatlayout import FloatLayout
 
 import appenv
 import bgfx
@@ -54,41 +47,17 @@ from appenv import (IS_ANDROID, SOURCE_FILE, default_source_path, diag,
                     save_source, set_download_dir, source_title,
                     tree_uri_to_path)
 from lxbridge import LxBridge
-
-# ============================================================
-#  主题
-# ============================================================
-#  设计令牌
-# ============================================================
-# 暗黑极简：深邃深灰底 + 稍亮卡片 + 细微边框高光。
-# 主色刻意用**低饱和**蓝紫渐变，不用刺眼的纯色。
-C_BG = (0.059, 0.059, 0.067, 1)       # #0F0F11 页面底色
-C_CARD = (0.086, 0.086, 0.098, 0.94)  # 卡片（稍亮，略带透明让背景透出来）
-C_CTRL = (0.118, 0.118, 0.137, 1)     # 输入/下拉
-C_ITEM = (0.098, 0.098, 0.114, 1)     # 列表项
-C_SEP = (1, 1, 1, 0.055)              # 边框高光 / 分隔线
-C_ACCENT = (0.42, 0.45, 0.95, 1)      # 主色（低饱和蓝）
-C_ACCENT_D = (0.30, 0.32, 0.72, 1)
-# 蓝紫渐变的两端（胶囊按钮、进度条用）
-GRAD_A = (0.42, 0.45, 0.95)           # #6B73F2 蓝
-GRAD_B = (0.58, 0.42, 0.95)           # #946BF2 紫
-C_TEXT = (0.96, 0.96, 0.97, 1)
-C_DIM = (0.62, 0.63, 0.68, 1)
-C_FAINT = (0.40, 0.41, 0.45, 1)
-C_OK = (0.345, 0.800, 0.502, 1)
-C_ERR = (0.949, 0.451, 0.451, 1)
-
-# 圆角：大圆角是这个风格的关键（16~24）
-R_LG = 24
-R_MD = 16
-R_SM = 12
-
-# 「毛玻璃」近似参数。
-# Kivy 的 canvas 没有实时模糊（backdrop-blur），所以做法是：
-#   半透明填充 + 细微边框高光 + 一层低对比竖向渐变叠色。
-# 观感接近毛玻璃，但严格说不是真模糊 —— 这一点跟用户说明过。
-GLASS_FILL = (1, 1, 1, 0.045)
-GLASS_HI = (1, 1, 1, 0.10)
+# 界面层：所有「长什么样」的东西都在 lxui 里（详见该文件头部）。
+# 这里只 import 用得到的令牌 / 控件 / 纯函数；icon_parts 与 grad_buffer
+# 本文件不直接调用，但都是冒烟测试会 import 的名字，所以一并导出。
+from lxui import (  # noqa: F401
+    C_ACCENT, C_BG, C_DIM, C_ERR, C_FAINT, C_OK, C_ROW, C_SHEET, C_TEXT,
+    C_WHITE, GRAD_A, GRAD_B, H_SEARCH, H_TOUCH, R_CAPSULE, R_SHEET,
+    BarView, CNSpinner, Disc, FlatButton, GroupCard, GroupRow, IconButton,
+    ModalLayer, PickerSheet, SearchInput, SongRow, SpringButton,
+    attach_bg, attach_border, attach_gradient, draw_icon, follow, glass,
+    grad_buffer, icon_parts, rounded, soft_shadow, spring_to,
+)
 
 PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我",
                   "kg": "酷狗", "mg": "咪咕", "qsvip": "企鹅SVIP"}
@@ -101,6 +70,11 @@ COUNT_VALUE = {"20 首": 20, "50 首": 50, "100 首": 100,
                "200 首": 200, "300 首": 300, "全部": None}
 
 TIME_FMT = "%02d:%02d"
+# 搜索结果行高（单位 dp）。入场动画和「保险丝」收尾都读它 —— 以前这个 58
+# 在三个地方各写了一遍，改一处就错位。
+# 注意写的是裸数字：dp() 依赖 Metrics，模块导入时窗口还没建，
+# 在模块级求值会把 import 搞崩（仓库里实测踩过），所以只在函数里换算。
+ROW_H = 58
 
 
 def fmt_time(sec):
@@ -112,502 +86,10 @@ def fmt_time(sec):
 
 
 # ============================================================
-#  控件
-# ============================================================
-class CNSpinnerOption(SpinnerOption):
-    """下拉列表项。
-
-    Spinner 的选项项默认是 Kivy 自带的灰底渐变按钮 —— 就是用户说的
-    「像老安卓」。这里换成和界面一致的深色圆角行 + 中文字体 + 左对齐。
-
-    两个坑：
-      * 选项项**不会**继承 Spinner 的字体，不传就是方块
-      * Spinner._update_dropdown_size 会把每项高度强制设成 Spinner 的高度，
-        所以高度不用自己定，但 size_hint_y 必须是 None
-
-    背景用 attach_bg() 而不是继承 FlatButton —— 后者定义在本类之后，
-    写在基类位置上会在 import 时就 NameError。
-    """
-
-    def __init__(self, **kw):
-        for k, v in fonts.font_kwargs().items():
-            kw.setdefault(k, v)
-        kw.setdefault("background_normal", "")      # 关掉默认灰底贴图
-        kw.setdefault("background_down", "")
-        kw.setdefault("background_color", (0, 0, 0, 0))
-        kw.setdefault("size_hint_y", None)
-        kw.setdefault("halign", "left")
-        kw.setdefault("valign", "middle")
-        kw.setdefault("font_size", dp(14))
-        kw.setdefault("color", C_TEXT)
-        super().__init__(**kw)
-        attach_bg(self, C_ITEM, radius=9)
-        self.bind(size=lambda b, v: setattr(b, "text_size", (v[0] - dp(22), None)))
-
-
-class CNDropdown(DropDown):
-    """下拉框本体。
-
-    默认 DropDown 是个裸 ScrollView + 裸 GridLayout：没有背景、没有留白、
-    还带一条滚动条，拉开就是一列灰色方块。这里给它铺上深色圆角底、
-    加内边距、隐藏滚动条，并限制最大高度（否则长列表会铺满整屏）。
-    """
-
-    def __init__(self, **kw):
-        kw.setdefault("max_height", dp(340))
-        kw.setdefault("bar_width", 0)          # 隐藏滚动条，靠留白区分
-        super().__init__(**kw)
-        try:
-            c = self.container
-            if c is not None:
-                c.padding = (dp(6), dp(6))
-                c.spacing = dp(2)
-                attach_bg(c, C_CARD, radius=12)
-        except Exception:
-            log_exc("CNDropdown 背景")
-
-
-class CNSpinner(Spinner):
-    """下拉框。做三件事：
-
-    1) 下拉列表项不会继承 font_name，中文会显示成方块 —— 用 option_cls
-       在创建时就带上字体。
-    2) 默认的下拉外观是「老安卓」风格 —— 换成 dropdown_cls + 深色圆角。
-    3) Kivy 的 Spinner 默认用灰底贴图，跟这套深色主题不搭，
-       所以关掉贴图改用纯色（background_normal=""）。
-
-    注意：不要重新声明 font_name！
-    Label 自己就有 font_name（默认 'Roboto'），重新声明成
-    StringProperty(None) 会把默认值覆盖成 None，
-    于是 Kivy 的 resolve_font_name() 拿到 None 后崩：
-      AttributeError: 'NoneType' object has no attribute 'endswith'
-    这个崩只在「没找到中文字体」时触发（那时不会传 font_name），
-    很容易漏测。
-    """
-
-    def __init__(self, **kw):
-        kw.setdefault("background_normal", "")
-        kw.setdefault("background_down", "")
-        kw.setdefault("background_color", C_CTRL)
-        kw.setdefault("color", C_TEXT)
-        kw.setdefault("option_cls", CNSpinnerOption)   # 下拉项：深色圆角 + 中文字体
-        kw.setdefault("dropdown_cls", CNDropdown)      # 下拉框：深色圆角 + 留白
-        super().__init__(**kw)
-
-
-def vibrate(ms=12):
-    """极短的触感反馈。
-
-    没有 VIBRATE 权限、或不在 Android 上，就静默跳过 ——
-    触感只是锦上添花，绝不能因为它让点击失效。
-    """
-    if not IS_ANDROID:
-        return
-    try:
-        from jnius import autoclass
-        act = autoclass("org.kivy.android.PythonActivity").mActivity
-        svc = act.getSystemService("vibrator")
-        svc.vibrate(int(ms))
-    except Exception:
-        pass
-
-
-def attach_bg(widget, color, radius=0):
-    """给控件加背景（可选圆角）。
-
-    Kivy 没有 canvas_before 这个属性（它是 widget.canvas.before 对象），
-    当构造参数传会抛 TypeError 导致启动即崩 —— 必须建好后再加图元。
-    """
-    from kivy.graphics import Color, Rectangle, RoundedRectangle
-    with widget.canvas.before:
-        Color(*color)
-        if radius:
-            shape = RoundedRectangle(pos=widget.pos, size=widget.size,
-                                     radius=[dp(radius)])
-        else:
-            shape = Rectangle(pos=widget.pos, size=widget.size)
-
-    def _sync(w, *_):
-        shape.pos = w.pos
-        shape.size = w.size
-
-    widget.bind(pos=_sync, size=_sync)
-    return widget
-
-
-def grad_buffer(c1, c2, size=64, horizontal=True):
-    """按 colorfmt='rgb' 生成渐变像素缓冲。
-
-    抽出来是为了能**在没有 GL 的机器上验证字节数** ——
-    贴图本身要 Texture.create（要 GL），但缓冲区长度对不对是纯算术。
-
-    ⚠ 这里踩过一个坑：colorfmt="rgb" 是**每像素 3 字节**，
-    但最初写成 `bytes(px + (255,))` 往每像素塞了 4 字节 ——
-    长度对不上，纹理读进去就是错位数据，整片渐变色乱掉
-    （用户看到的就是「界面颜色乱了」）。所以断言里要卡死字节数。
-    """
-    per_px = 3
-    out = bytearray()
-    for i in range(size):
-        t = i / float(size - 1)
-        px = bytes(int(255 * (c1[k] + (c2[k] - c1[k]) * t)) for k in range(3))
-        if len(px) != per_px:                     # 自检，防止再写回 4 字节
-            raise AssertionError("每像素必须是 %d 字节，实际 %d" % (per_px, len(px)))
-        # 横向贴图是 size×1（每行 1 像素，共 size 个像素）；
-        # 竖向贴图是 1×size（每行也只有 1 个像素，共 size 行）——
-        # 两种情况**都是** size 个像素，所以都是直接追加一个像素，不能乘 size。
-        out += px
-    expect = (size * 1 if horizontal else 1 * size) * per_px
-    if len(out) != expect:
-        raise AssertionError("缓冲长度 %d 不等于 w*h*3=%d" % (len(out), expect))
-    return bytes(out)
-
-
-def make_grad_texture(c1, c2, size=64, horizontal=True):
-    """生成两端渐变的贴图（供胶囊按钮 / 进度条用）。
-
-    为什么用贴图：Kivy 的 Color/Rectangle 只能画纯色，没有渐变。
-    自己算一张小贴图拉伸，是唯一能做出渐变的路子。
-    """
-    from kivy.graphics.texture import Texture
-    dims = (size, 1) if horizontal else (1, size)
-    tex = Texture.create(size=dims, colorfmt="rgb")
-    tex.blit_buffer(grad_buffer(c1, c2, size, horizontal),
-                    colorfmt="rgb", bufferfmt="ubyte")
-    tex.wrap = "clamp_to_edge"
-    tex.mag_filter = "linear"
-    tex.min_filter = "linear"
-    return tex
-
-
-def attach_gradient(widget, c1, c2, radius=R_LG, horizontal=True):
-    """给控件加渐变圆角背景（描边由 attach_border 单独负责）"""
-    from kivy.graphics import Color, RoundedRectangle
-    tex = make_grad_texture(c1, c2, horizontal=horizontal)
-    with widget.canvas.before:
-        Color(1, 1, 1, 1)
-        shape = RoundedRectangle(pos=widget.pos, size=widget.size,
-                                 radius=[dp(radius)], texture=tex)
-
-    def _sync(w, *_):
-        shape.pos = w.pos
-        shape.size = w.size
-
-    widget.bind(pos=_sync, size=_sync)
-    # 记下来给 SpringButton 用；同时把 FlatButton 自带的纯色底压成全透明，
-    # 否则会「纯色底 + 渐变底」两层叠着画，颜色不对。
-    widget._grad_shape = shape
-    plain = getattr(widget, "_bg_color", None)
-    if plain is not None:
-        plain.rgba = (0, 0, 0, 0)
-    return widget
-
-
-def attach_border(widget, radius=R_MD, color=None, width=1.0):
-    """细微边框高光。
-
-    暗色界面里卡片如果只有填充色，会「糊」在一起分不出层级 ——
-    一圈极淡的描边是最省力的分层手段（border highlight）。
-    """
-    from kivy.graphics import Color, Line
-    col = color or C_SEP
-    with widget.canvas.after:
-        c = Color(*col)
-        line = Line(width=dp(width), rounded_rectangle=(0, 0, 1, 1, dp(radius)))
-
-    def _sync(w, *_):
-        line.rounded_rectangle = (w.x, w.y, w.width, w.height, dp(radius))
-
-    widget.bind(pos=_sync, size=_sync)
-    _sync(widget)
-    # 保持引用，防止被 GC
-    widget._border_line = line
-    widget._border_color = c
-    return widget
-
-
-def attach_glow(widget, color=None, spread=None, alpha=0.30):
-    """柔和的发光阴影（暗色界面里 shadow 不能用黑色，看不见 —— 得用彩色光）。
-
-    用背景模块那张径向渐变贴图拉伸成椭圆铺在控件**后面**。
-    必须在 attach_bg / attach_gradient **之前**调用，canvas.before 里
-    按插入顺序绘制，后加的会盖在前面。
-
-    注意 spread 的默认值写成 None、在函数体里算 dp()：默认参数是在
-    **模块导入时**求值的，而 dp() 依赖 Metrics（要窗口），
-    在窗口就绪前求值会直接把导入搞崩（本次实测踩到）。
-    """
-    from kivy.graphics import Color, Rectangle
-    if spread is None:
-        spread = dp(18)
-    r, g, b = (color or C_ACCENT)[:3]
-    tex = bgfx.make_glow_texture()
-    with widget.canvas.before:
-        c = Color(r, g, b, alpha)
-        rect = Rectangle(pos=widget.pos, size=widget.size, texture=tex)
-
-    def _sync(w, *_):
-        rect.pos = (w.x - spread, w.y - spread)
-        rect.size = (w.width + spread * 2, w.height + spread * 2)
-
-    widget.bind(pos=_sync, size=_sync)
-    _sync(widget)
-    widget._glow_rect = rect
-    widget._glow_color = c
-    return widget
-
-
-class FlatButton(Button):
-    """扁平圆角按钮。
-
-    背景用自绘圆角矩形，所以要把 Kivy 默认的灰色贴图关掉
-    （background_normal="" + background_color 透明）。
-    """
-    bg_color = ListProperty([0.24, 0.27, 0.34, 1])
-    radius = NumericProperty(8)
-
-    def __init__(self, **kw):
-        kw.setdefault("background_normal", "")
-        kw.setdefault("background_down", "")
-        kw.setdefault("background_color", (0, 0, 0, 0))   # 关掉默认灰底
-        super().__init__(**kw)
-        # 注意：bg_color 是通过 kwargs 设进来的，Kivy 会在 super().__init__()
-        # 里就触发 on_bg_color，那时 canvas 图元还不存在 —— 所以那里必须判空。
-        from kivy.graphics import Color, RoundedRectangle
-        with self.canvas.before:
-            self._bg_color = Color(*self.bg_color)
-            self._bg_shape = RoundedRectangle(
-                pos=self.pos, size=self.size, radius=[dp(self.radius)])
-        self.bind(pos=self._sync, size=self._sync)
-
-    def _sync(self, *_):
-        self._bg_shape.pos = self.pos
-        self._bg_shape.size = self.size
-
-    def _apply_bg(self):
-        c = getattr(self, "_bg_color", None)
-        if c is None:
-            return
-        # 渐变按钮：纯色底已经被 attach_gradient 压成全透明，
-        # 这里**不能**再按 bg_color 画回来 —— 否则一按下去就会冒出一块
-        # 灰蓝纯色盖住渐变（用户反馈「颜色乱了」的原因之一）。
-        if getattr(self, "_grad_shape", None) is not None:
-            return
-        r, g, b, a = self.bg_color
-        # 按下时压暗一点。原来 background_normal/down 都设成空串，
-        # 于是按钮**完全没有触摸反馈**，点下去像没反应。
-        k = 0.78 if self.state == "down" else 1.0
-        c.rgba = (r * k, g * k, b * k, a)
-
-    def on_bg_color(self, *_):
-        self._apply_bg()
-
-    def on_state(self, *_):
-        self._apply_bg()
-
-
-class SpringButton(FlatButton):
-    """按下缩到 0.95、松开带一点过冲弹回 1.0 —— 弹簧手感。
-
-    Kivy 的 Widget 没有 scale 变换（那得用 PushMatrix 改 canvas 矩阵），
-    所以这里动画的是**背景形状的内缩比例**：视觉上缩小了，但控件本身的
-    布局尺寸不动 —— 否则会和 BoxLayout 的排布打架。
-
-    松手用 out_back 缓动，比线性更有「弹」的感觉。
-    """
-    press_scale = NumericProperty(0.95)
-    _press = NumericProperty(0.0)      # 0=常态 1=完全按下
-
-    def __init__(self, **kw):
-        self._haptic = kw.pop("haptic", True)
-        super().__init__(**kw)
-        self.bind(state=self._on_state, _press=self._sync)
-
-    def _on_state(self, *_):
-        down = self.state == "down"
-        if down and self._haptic:
-            vibrate(10)
-        Animation(
-            _press=1.0 if down else 0.0,
-            duration=0.07 if down else 0.24,
-            t="out_quad" if down else "out_back",
-        ).start(self)
-
-    def _sync(self, *_):
-        shape = getattr(self, "_grad_shape", None) or getattr(self, "_bg_shape", None)
-        if shape is None:
-            return
-        grow = 1.0 - self._press * (1.0 - self.press_scale)
-        w, h = self.width * grow, self.height * grow
-        shape.pos = (self.x + (self.width - w) / 2.0,
-                     self.y + (self.height - h) / 2.0)
-        shape.size = (w, h)
-
-
-def icon_parts(kind, w, h, ox=0.0, oy=0.0, unit=1.0):
-    """把图标拆成**父坐标系**下的图元描述（纯函数，不碰 Kivy，便于无 GL 断言）。
-
-    背景：往 widget.canvas 加的图元用的是**父坐标系**（和 widget.pos 同一空间），
-    而早期版本的 draw_icon 用本地坐标 `cx, cy = w/2, h/2` 算几何 ——
-    图标全被画到父容器原点附近去了（用户反馈「叉不在应该在的地方」）。
-    把几何抽在这里，就能在没有 OpenGL 的机器上直接断言坐标对不对。
-
-    ox/oy = 控件在父坐标系里的原点（widget.x / widget.y）；
-    unit  = 一个 dp 对应的像素数（线宽用它换算 —— 纯函数里不能调 dp()）。
-    返回 [(op, kwargs), ...]，op ∈ {"line", "mesh"}。
-    """
-    s = min(w, h) * 0.5
-    cx, cy = ox + w / 2.0, oy + h / 2.0
-    out = []
-    if kind == "settings":
-        # 三条滑杆（现代感的「设置」图标，比齿轮更好画也更好看）
-        lw = 1.6 * unit
-        for i, off in enumerate((-0.42, 0.0, 0.42)):
-            y = cy + s * off
-            out.append(("line", {"points": [cx - s * 0.72, y, cx + s * 0.72, y],
-                                 "width": lw}))
-            knx = cx + s * (0.34 if i % 2 == 0 else -0.30)
-            out.append(("line", {"circle": (knx, y, 2.4 * unit), "width": lw}))
-    elif kind == "search":
-        out.append(("line", {"circle": (cx - s * 0.18, cy + s * 0.18, s * 0.52),
-                             "width": 1.7 * unit}))
-        out.append(("line", {"points": [cx + s * 0.20, cy - s * 0.20,
-                                        cx + s * 0.64, cy - s * 0.64],
-                             "width": 1.7 * unit}))
-    elif kind == "close":
-        out.append(("line", {"points": [cx - s * 0.42, cy - s * 0.42,
-                                        cx + s * 0.42, cy + s * 0.42],
-                             "width": 1.7 * unit}))
-        out.append(("line", {"points": [cx - s * 0.42, cy + s * 0.42,
-                                        cx + s * 0.42, cy - s * 0.42],
-                             "width": 1.7 * unit}))
-    elif kind == "play":
-        out.append(("mesh", {"vertices": [cx - s * 0.34, cy - s * 0.5, 0, 0,
-                                          cx - s * 0.34, cy + s * 0.5, 0, 0,
-                                          cx + s * 0.52, cy, 0, 0],
-                             "indices": [0, 1, 2], "mode": "triangles"}))
-    elif kind == "pause":
-        bw = s * 0.26
-        for dx in (-0.34, 0.08):
-            out.append(("line", {"rectangle": (cx + s * dx, cy - s * 0.48,
-                                               bw, s * 0.96),
-                                 "width": 1.2 * unit}))
-    elif kind == "download":
-        out.append(("line", {"points": [cx, cy + s * 0.55, cx, cy - s * 0.20],
-                             "width": 1.8 * unit}))
-        out.append(("line", {"points": [cx - s * 0.34, cy + s * 0.10,
-                                        cx, cy - s * 0.24,
-                                        cx + s * 0.34, cy + s * 0.10],
-                             "width": 1.8 * unit}))
-        out.append(("line", {"points": [cx - s * 0.46, cy - s * 0.55,
-                                        cx + s * 0.46, cy - s * 0.55],
-                             "width": 1.8 * unit}))
-    elif kind == "expand":
-        out.append(("line", {"points": [cx - s * 0.5, cy - s * 0.12,
-                                        cx, cy + s * 0.36,
-                                        cx + s * 0.5, cy - s * 0.12],
-                             "width": 1.8 * unit}))
-    return out
-
-
-def draw_icon(widget, kind, color=None, size=None):
-    """把图标**画**在控件上，而不是用字符。
-
-    为什么不直接写 ⚙ / 🔍 这类字符：自带的中文字体是从 Noto Sans SC
-    裁出来的，emoji 和大部分几何符号根本不在里面，写上去就是方块。
-    自己用 canvas 画最稳，而且线条更锐利、更贴合极简风格。
-
-    ⚠ 图元必须用**父坐标系**（widget.x / widget.y 当原点）：
-    往 widget.canvas 加的东西和 widget.pos 在同一个坐标空间，
-    用本地坐标（0..w）会把图标画到父容器原点上去 ——
-    这就是「×」跑到屏幕左下角、按钮上只剩一个空圆的原因。
-    """
-    from kivy.graphics import Color, InstructionGroup, Line, Mesh
-    col = color or C_TEXT
-    _DRAW = {"line": Line, "mesh": Mesh}
-
-    def _redraw(*_):
-        w, h = max(1.0, widget.width), max(1.0, widget.height)
-        # 图标画进自己的 InstructionGroup：不能用 canvas.after.clear()，
-        # 那会把 attach_border 加在同一 canvas.after 上的边框一起清掉。
-        grp = getattr(widget, "_icon_group", None)
-        if grp is None or grp not in widget.canvas.after.children:
-            grp = InstructionGroup()
-            widget._icon_group = grp
-            widget.canvas.after.add(grp)
-        grp.clear()
-        grp.add(Color(*col))
-        for op, kw in icon_parts(kind, w, h, widget.x, widget.y, dp(1.0)):
-            grp.add(_DRAW[op](**kw))
-
-    widget.bind(pos=_redraw, size=_redraw)
-    _redraw()
-    widget._icon_redraw = _redraw
-    return widget
-
-
-class IconButton(SpringButton):
-    """只有图标的圆形按钮"""
-
-    def __init__(self, kind, dia=None, color=None, bg=(1, 1, 1, 0.06),
-                 icon_color=None, **kw):
-        # dp() 不能在默认参数里求值（导入期就要窗口），所以在这里算
-        if dia is None:
-            dia = dp(40)
-        kw.setdefault("size_hint", (None, None))
-        kw.setdefault("size", (dia, dia))
-        # 图标必须自己声明垂直居中：Kivy 的 BoxLayout 在交叉轴（竖直方向）
-        # **不会**居中固定尺寸的子控件，而是把它贴到内容区底部 ——
-        # 于是图标高/矮于同行文字时就错位：
-        #   头部「设置」图标 42px，内容区只有 34px → 中心偏高 4px
-        #   抽屉「关闭」图标 34px，行高 44px      → 中心偏低 5px
-        # （搜索框的放大镜当初手写了 pos_hint，这两处漏了）
-        kw.setdefault("pos_hint", {"center_y": 0.5})
-        kw.setdefault("bg_color", bg)
-        kw.setdefault("color", (0, 0, 0, 0))   # 不显示文字
-        super().__init__(**kw)
-        self._bg_shape.radius = [dia / 2.0]    # 正圆
-        draw_icon(self, kind, color=icon_color)
-
-
-class SearchInput(TextInput):
-    """搜索输入框。
-
-    用户反馈：点搜索框弹出软键盘，用返回键收起之后，**再点搜索框也弹不出
-    键盘了**。原因是 Android 上 Kivy 的 TextInput 这时 `focus` 仍然是 True，
-    系统认为「已经聚焦，不必再弹键盘」，状态就这么卡住。
-
-    这里在触摸时检查一次「自以为聚焦、但键盘其实不在」，做一次
-    「失焦 → 延时聚焦」，把键盘重新拉起来。键盘正常在的时候什么都不做。
-    """
-
-    def _keyboard_gone(self):
-        try:
-            from kivy.core.window import Window
-            return not Window.keyboard_height
-        except Exception:
-            return False
-
-    def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos) and self.focus and self._keyboard_gone():
-            self.focus = False
-            Clock.schedule_once(lambda *_: setattr(self, "focus", True), 0.05)
-            return True
-        return super().on_touch_down(touch)
-
-
-# ============================================================
 #  主界面
 # ============================================================
 class LxApp(App):
     title = "落雪音源下载器"
-    # 抽屉遮罩的不透明度（动画驱动）
-    _scrim_a = NumericProperty(0.0)
-
-    def on__scrim_a(self, *_):
-        c = getattr(self, "_scrim_c", None)
-        if c is not None:
-            c.a = self._scrim_a
 
     # ---------- 生命周期 ----------
     def build(self):
@@ -627,18 +109,22 @@ class LxApp(App):
         self.F = fonts.font_kwargs()
         self.P = fonts.popup_kwargs()      # Popup 标题的字体参数名是 title_font
 
-        root = BoxLayout(orientation="vertical")
+        # 根容器必须是 FloatLayout：主界面铺满，设置抽屉是**叠在上面**的
+        # 浮层。竖排 BoxLayout 做不到这件事 —— 抽屉只能被挤成一条，
+        # 永远做不出 iOS 那种「从底部浮起来盖住内容」的效果。
+        root = FloatLayout()
         attach_bg(root, C_BG)
         # 动态背景必须在 attach_bg 之后建：canvas.before 里按插入顺序绘制，
-        # 光斑要压在底色之上、卡片之下（卡片半透明，光斑会透出来）。
+        # 光斑要压在底色之上、内容之下。
         # 兜底：背景只是装饰，建不起来也绝不能拦住 App 启动。
         try:
             self.bgfx = bgfx.MusicBackground(root)
         except Exception:
             log_exc("创建动态背景")
             self.bgfx = None
+        self.root = root
 
-        # 主内容区（顶部栏 / 搜索条 / 列表 / 悬浮播放栏）
+        # 主内容区（顶部栏 / 搜索条 / 结果列表 / 悬浮播放胶囊）
         self.main = BoxLayout(orientation="vertical")
         self.main.add_widget(self._build_header())
         self.main.add_widget(self._build_search())
@@ -646,38 +132,17 @@ class LxApp(App):
         self.main.add_widget(self._build_footer())
         root.add_widget(self.main)
 
-        # 设置抽屉打开时压暗主内容 —— 用 canvas.after 盖一层黑，
-        # 它在子控件**之后**绘制，所以能盖住列表（Kivy 的 canvas 不裁剪，
-        # 但这一层正好只需要盖住主内容区）。
-        from kivy.graphics import Color as _C, Rectangle as _R
-        with self.main.canvas.after:
-            self._scrim_c = _C(0, 0, 0, 0.0)
-            self._scrim_r = _R(pos=self.main.pos, size=self.main.size)
-        self.main.bind(pos=self._sync_scrim, size=self._sync_scrim)
-
-        # 底部抽屉：初始高度 0（收在屏幕外）。
-        # 为什么动画高度而不是位置：在 BoxLayout/FloatLayout 里做位置动画
-        # 会和布局的排布互相覆盖，高度是唯一不会被抢回去的自由度。
-        self.sheet = BoxLayout(orientation="vertical", size_hint_y=None,
-                               height=0, padding=(dp(16), dp(8)),
-                               spacing=dp(6))
-        attach_bg(self.sheet, C_CARD, radius=R_LG)
-        attach_border(self.sheet, radius=R_LG)
-        self.sheet.add_widget(self._sheet_head())
-        # 套一层滚动：配置项不少，小屏上必须能滚，否则底部几项会被切掉
-        sv = ScrollView(bar_width=dp(2), do_scroll_x=False)
-        inner = self._build_panel()
-        sv.add_widget(inner)
-        self.sheet.add_widget(sv)
-        # 抽屉目标高度：屏高的 72% 与 560dp 取小 —— 不遮住整个屏幕，
-        # 留一点主内容能看见（并露出遮罩变暗的效果）
+        # 设置抽屉：遮罩 + 底部卡片 + 拖拽条，弹出动画走弹簧物理。
+        # 高度取「屏高 74% 与 600dp 取小」—— 不遮住整屏，留一点主界面能看见。
         try:
             from kivy.core.window import Window as _W
-            self._sheet_h = min(dp(560), max(dp(300), _W.height * 0.72))
+            self._sheet_h = min(dp(600), max(dp(320), _W.height * 0.74))
         except Exception:
-            self._sheet_h = dp(460)
+            self._sheet_h = dp(480)
+        self.sheet = ModalLayer(height=self._sheet_h)
+        self.sheet.head.add_widget(self._sheet_head())
+        self._build_panel()              # 往 self.sheet.body 里填分组列表
         root.add_widget(self.sheet)
-        self._sheet_open = False
 
         Clock.schedule_once(self._guard(self._boot), 0.2)
         Clock.schedule_interval(self._guard(self._tick), 0.5)
@@ -687,7 +152,7 @@ class LxApp(App):
         # 整个界面会是全透明的，那比没有动效糟得多（而且我看不到真机）。
         root.opacity = 0.0
         Clock.schedule_once(
-            lambda *_: Animation(opacity=1.0, d=0.28, t="out_quad").start(root), 0.05)
+            lambda *_: spring_to(root, "opacity", 1.0, 0.35, 1.0), 0.05)
         Clock.schedule_once(lambda *_: setattr(root, "opacity", 1.0), 1.5)
         return root
 
@@ -703,38 +168,41 @@ class LxApp(App):
 
     # ---------- UI 组装 ----------
     def _build_header(self):
-        """顶部只留标题 + 设置图标 —— 配置项全部收进底部抽屉。
+        """顶部只留标题 + 平台数 + 设置图标 —— 配置项全部收进底部抽屉。
 
         原来这里挂着一整块控制面板（音源/平台/品质/格式/数量），
         小屏上几乎把歌曲列表挤没了。现在只在右上角放一个图标。
         """
-        box = BoxLayout(size_hint_y=None, height=dp(62),
-                        padding=(dp(20), dp(14)), spacing=dp(10))
+        box = BoxLayout(size_hint_y=None, height=dp(58),
+                        padding=(dp(20), dp(10)), spacing=dp(8))
         t = Label(text="落雪音源下载器", bold=True, font_size=dp(20),
                   halign="left", valign="middle", color=C_TEXT, **self.F)
         t.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         box.add_widget(t)
-        self.lbl_sub = Label(text="", size_hint_x=None, width=dp(96),
+        self.lbl_sub = Label(text="", size_hint_x=None, width=dp(84),
                              font_size=dp(11), color=C_FAINT,
                              halign="right", valign="middle", **self.F)
         self.lbl_sub.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         box.add_widget(self.lbl_sub)
-        self.btn_set = IconButton("settings", dia=dp(42), icon_color=C_DIM)
+        self.btn_set = IconButton("settings", dia=dp(40), icon_color=C_DIM)
         self.btn_set.bind(on_release=lambda *_: self.open_settings())
         box.add_widget(self.btn_set)
         return box
 
     def _build_search(self):
-        """搜索条：长条形 + 内嵌放大镜 + 渐变胶囊按钮"""
-        wrap = BoxLayout(size_hint_y=None, height=dp(58),
+        """搜索条：胶囊输入框（左内嵌放大镜）+ 等高渐变胶囊按钮。
+
+        输入框和按钮**同高同圆角**（44 / 22）—— 高度不齐是上一版
+        「看着不专业」的主要原因之一。
+        """
+        wrap = BoxLayout(size_hint_y=None, height=dp(H_SEARCH + 12),
                          padding=(dp(16), dp(6)), spacing=dp(10))
 
-        # 输入框做成圆角胶囊，放大镜画在它左内侧
-        self.ti_box = BoxLayout(size_hint_y=None, height=dp(46))
-        attach_bg(self.ti_box, C_CTRL, radius=R_LG)
-        attach_border(self.ti_box, radius=R_LG, color=C_SEP)
+        self.ti_box = BoxLayout(size_hint_y=None, height=dp(H_SEARCH))
+        rounded(self.ti_box, C_ROW, corners=[dp(R_CAPSULE)] * 4)
+        attach_border(self.ti_box, radius=R_CAPSULE)
 
-        ico = Widget(size_hint=(None, None), size=(dp(34), dp(46)),
+        ico = Widget(size_hint=(None, None), size=(dp(32), dp(H_SEARCH)),
                      pos_hint={"center_y": 0.5})
         draw_icon(ico, "search", color=C_FAINT)
         self.ti_box.add_widget(ico)
@@ -749,192 +217,297 @@ class LxApp(App):
         self.ti_box.add_widget(self.ti_search)
         wrap.add_widget(self.ti_box)
 
-        # 搜索按钮：渐变胶囊，与输入框等高
         self.btn_search = SpringButton(text="搜索", bold=True, font_size=dp(14),
                                        size_hint=(None, None),
-                                       size=(dp(76), dp(46)),
-                                       color=(1, 1, 1, 1), **self.F)
-        attach_gradient(self.btn_search, GRAD_A, GRAD_B, radius=R_LG)
+                                       size=(dp(76), dp(H_SEARCH)),
+                                       color=C_WHITE, **self.F)
+        attach_gradient(self.btn_search, GRAD_A, GRAD_B, radius=R_CAPSULE)
         self.btn_search.bind(on_release=self.do_search)
         wrap.add_widget(self.btn_search)
         return wrap
 
-    def _build_panel(self):
-        """设置抽屉的内容（全部配置项都收在这里）。
+    def _build_state_holders(self):
+        """把「值」和「显示」分开：spinner 是**真身**，分组行只是读它。
 
-        注意：原来的 sp_source / sp_platform / sp_quality / sp_format /
-        sp_count 仍然叫这些名字 —— 别的地方（_apply_source_info /
-        _refresh_qualities / _resolve_song 等）都靠这些属性取控件，
-        换名字会连环崩。
+        这些 spinner **不进**控件树 —— 界面上看到的是 iOS 风格的分组行
+        （点一行 → 弹出二级选择页）。它们只当状态容器：值在这里，
+        显示在行上（lxui.follow 做单向同步），这样「谁拥有数据」很清楚。
+
+        控件名保持不变：_apply_source_info / _refresh_qualities /
+        _quality_code / _resolve_song / _fill_dir_presets 等一大片地方
+        都直接读这些属性，改名会连环崩。
         """
-        panel = BoxLayout(orientation="vertical", size_hint_y=None,
-                          padding=(dp(18), dp(6)), spacing=dp(12))
-        panel.bind(minimum_height=panel.setter("height"))
-
-        # ---- 音源文件（内置多个，可切换）----
-        panel.add_widget(self._section("音源"))
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
+        F = self.F
         self.sp_source = CNSpinner(text="加载中…", values=[], font_size=dp(13),
-                                   **self.F)
+                                   **F)
         self.sp_source.bind(on_text=self._on_source_picked)
-        row.add_widget(self.sp_source)
-        btn = self._btn("更换", color=C_CTRL, w=dp(72))
-        btn.bind(on_release=self.pick_source)
-        row.add_widget(btn)
-        panel.add_widget(row)
-
-        # ---- 平台 / 品质 ----
-        panel.add_widget(self._section("平台与品质"))
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        self.sp_platform = CNSpinner(text="—", values=[], font_size=dp(14),
-                                     **self.F)
+        self.sp_platform = CNSpinner(text="—", values=[], font_size=dp(13), **F)
         self.sp_platform.bind(text=lambda *_: self._refresh_qualities())
-        row.add_widget(self.sp_platform)
         self.sp_quality = CNSpinner(
             text=songinfo.quality_label("320k"),
             values=[songinfo.quality_label(q) for q in QUALITY_ORDER],
-            font_size=dp(14), **self.F)
-        row.add_widget(self.sp_quality)
-        panel.add_widget(row)
-
-        # ---- 格式 + 数量 ----
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        row.add_widget(self._field("格式", w=dp(40)))
+            font_size=dp(13), **F)
         self.sp_format = CNSpinner(text="自动", values=songinfo.FORMAT_ORDER,
-                                   font_size=dp(14), size_hint_x=None,
-                                   width=dp(104), **self.F)
+                                   font_size=dp(13), **F)
         self.sp_format.bind(text=lambda *_: self._refresh_qualities())
-        row.add_widget(self.sp_format)
-        row.add_widget(self._field("数量", w=dp(40)))
         self.sp_count = CNSpinner(text="100 首", values=COUNT_ORDER,
-                                  font_size=dp(14), size_hint_x=None,
-                                  width=dp(104), **self.F)
-        row.add_widget(self.sp_count)
-        panel.add_widget(row)
-
-        # ---- 下载位置 + QQ 代理（原来在独立的设置弹窗里）----
-        panel.add_widget(self._section("下载保存位置"))
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        self.sp_dir = CNSpinner(text="—", values=[], font_size=dp(13), **self.F)
+                                  font_size=dp(13), **F)
+        self.sp_dir = CNSpinner(text="—", values=[], font_size=dp(13), **F)
         self.sp_dir.bind(on_text=self._on_dir_preset)
-        row.add_widget(self.sp_dir)
-        btn_dir = self._btn("选目录", color=C_CTRL, w=dp(72))
-        btn_dir.bind(on_release=self.pick_dir)
-        row.add_widget(btn_dir)
-        panel.add_widget(row)
+        # QQ 代理：_refresh_proxy_label 会写它的 text，这里保留作状态。
+        self.btn_proxy = FlatButton(text="", font_size=dp(13),
+                                    bg_color=C_ROW, color=C_TEXT, **F)
 
-        panel.add_widget(self._section("QQ 代理（失效时可自己换）"))
-        self.btn_proxy = self._btn("选择代理文件(.txt)", color=C_CTRL, fs=dp(13),
-                                   h=dp(44))
-        self.btn_proxy.bind(on_release=self.pick_proxies)
-        panel.add_widget(self.btn_proxy)
-        return panel
+    def _build_panel(self):
+        """设置抽屉的内容：iOS 分组列表（三组六行）。
+
+        彻底废掉旧的「标签和控件并排塞一行」的方块排版 —— 那种排法在小屏
+        上挤成一团，而且每个控件各是一个 Kivy 原生下拉，观感就是「老安卓」。
+        现在每行是「左标题 + 右当前值 + ›」，整行可点，点开进二级选择页。
+        """
+        self._build_state_holders()
+        body = self.sheet.body
+
+        # 第一组：音源 / 平台与品质
+        g1 = GroupCard()
+        self.row_source = GroupRow("音源", on_tap=self._pick_source_sheet)
+        g1.add_row(self.row_source)
+        self.row_plat = GroupRow("平台与品质", sep_below=False,
+                                 on_tap=self._pick_platform_sheet)
+        g1.add_row(self.row_plat)
+        body.add_widget(g1)
+
+        # 第二组：格式 / 数量 / 下载保存位置
+        g2 = GroupCard()
+        self.row_format = GroupRow("格式", on_tap=self._pick_format_sheet)
+        g2.add_row(self.row_format)
+        self.row_count = GroupRow("数量", on_tap=self._pick_count_sheet)
+        g2.add_row(self.row_count)
+        self.row_dir = GroupRow("下载保存位置", sep_below=False,
+                                on_tap=self._pick_dir_sheet)
+        g2.add_row(self.row_dir)
+        body.add_widget(g2)
+
+        # 第三组：QQ 代理
+        g3 = GroupCard()
+        self.row_proxy = GroupRow("QQ 代理", value="选择代理文件",
+                                  sep_below=False, on_tap=self.pick_proxies)
+        g3.add_row(self.row_proxy)
+        body.add_widget(g3)
+        body.add_widget(Widget(size_hint_y=None, height=dp(8)))
+
+        # 值 → 行：行永远只读，不写状态
+        follow(self.row_source, self.sp_source)
+        follow(self.row_format, self.sp_format)
+        follow(self.row_count, self.sp_count)
+        follow(self.row_dir, self.sp_dir, self._dir_short_text)
+        self._sync_plat_row()
+        self.sp_platform.bind(text=lambda *_: self._sync_plat_row())
+        self.sp_quality.bind(text=lambda *_: self._sync_plat_row())
 
     def _sheet_head(self):
-        """抽屉右上角的关闭按钮。
-
-        原先是「设置」标题 + 关闭按钮。但抽屉一展开本身就说明了「这是设置
-        面板」，标题是冗余的 —— 去掉，只留右侧的关闭按钮。
-        """
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        # 左侧弹性占位：把关闭按钮顶到最右边。
-        # 不能只放按钮 —— 水平 BoxLayout 会把它排到最左边去。
-        row.add_widget(Widget())
-        btn = IconButton("close", dia=dp(34), icon_color=C_DIM)
+        """抽屉右上角的关闭按钮（中间那条拖拽指示条由 ModalLayer 自己画）。"""
+        btn = IconButton("close", dia=dp(30), icon_color=C_DIM)
+        btn.pos_hint = {"right": 0.97, "center_y": 0.5}
         btn.bind(on_release=lambda *_: self.close_settings())
-        row.add_widget(btn)
-        return row
+        return btn
 
-    def _sync_scrim(self, *_):
+    def _sync_plat_row(self):
+        """「平台与品质」行 = 平台 + 音质 两段拼出来的。"""
         try:
-            self._scrim_r.pos = self.main.pos
-            self._scrim_r.size = self.main.size
+            row = getattr(self, "row_plat", None)
+            if row is None:
+                return
+            p = (self.sp_platform.text or "—").strip()
+            q = (self.sp_quality.text or "").strip()
+            row.value = "%s · %s" % (p, q) if q else p
         except Exception:
-            pass
+            log_exc("_sync_plat_row")
 
-    def _section(self, text):
-        lb = Label(text=text, size_hint_y=None, height=dp(20),
-                   font_size=dp(11), color=C_FAINT, bold=True,
-                   halign="left", valign="middle", **self.F)
-        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
-        return lb
-
-    def _btn(self, text, color=None, w=None, bold=False, fs=None, h=None):
-        b = FlatButton(text=text, size_hint_x=None if w else 1,
-                       width=w or 0, font_size=fs or dp(14), bold=bold,
-                       bg_color=color or C_CTRL, color=C_TEXT, **self.F)
-        if h:
-            # 直接加进竖向 BoxLayout 时必须给固定高度：那类面板的高度是
-            # minimum_height（由子控件撑开），size_hint_y=1 的控件在那里会被
-            # 算成 0 ——「选择代理文件」按钮就是这样塌成 0 高、整条看不见的。
-            b.size_hint_y = None
-            b.height = h
-        return b
-
-    def _field(self, text, w=None):
-        lb = Label(text=text, size_hint_x=None, width=w or dp(42),
-                   font_size=dp(14),
-                   color=C_DIM, halign="left", valign="middle", **self.F)
-        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
-        return lb
+    def _dir_short_text(self, label):
+        """下载目录行只显示路径**尾部**（完整路径太长，会把行撑爆）。"""
+        try:
+            path = getattr(self, "_dir_paths", {}).get((label or "").strip())
+            if not path:
+                return label or "默认"
+            tail = path.replace("\\", "/").rstrip("/").split("/")[-1]
+            return "…/%s" % tail if tail else path
+        except Exception:
+            log_exc("_dir_short_text")
+            return label or ""
 
     def _build_results(self):
-        wrap = BoxLayout(orientation="vertical", padding=(dp(12), dp(4)),
-                         spacing=dp(4))
+        """结果区：提示行 + 可滚动列表；空的时候显示极模糊唱片占位。"""
+        wrap = BoxLayout(orientation="vertical", padding=(dp(14), dp(2)),
+                         spacing=dp(2))
         self.hint = Label(text="搜索后点结果即可播放或下载", size_hint_y=None,
                           height=dp(26), font_size=dp(12), color=C_FAINT,
                           halign="left", valign="middle", **self.F)
         self.hint.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         wrap.add_widget(self.hint)
+
+        # 列表和空状态叠在同一块区域里（FloatLayout），互斥显示
+        stack = FloatLayout()
         self.sv = ScrollView(bar_width=dp(2), bar_color=(0.35, 0.4, 0.5, 1),
                              bar_inactive_color=(0.22, 0.25, 0.31, 1))
         self.results = BoxLayout(orientation="vertical", size_hint_y=None,
                                  spacing=dp(8), padding=(0, dp(2)))
         self.results.bind(minimum_height=self.results.setter("height"))
         self.sv.add_widget(self.results)
-        wrap.add_widget(self.sv)
+        stack.add_widget(self.sv)
+
+        self.empty = FloatLayout()
+        self.empty.add_widget(Disc(pos_hint={"center_x": 0.5, "center_y": 0.56}))
+        tip = Label(text="搜索一首歌开始", size_hint_y=None, height=dp(24),
+                    font_size=dp(13), color=C_FAINT, halign="center",
+                    valign="middle", pos_hint={"center_x": 0.5, "y": 0.12},
+                    **self.F)
+        tip.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        self.empty.add_widget(tip)
+        stack.add_widget(self.empty)
+        wrap.add_widget(stack)
         return wrap
 
     def _build_footer(self):
+        """底部播放条：悬浮的毛玻璃胶囊卡片，不是一个方块。
+
+        视觉与状态分离（见 lxui.BarView 的说明）：
+          * 进度**视觉** = BarView（圆润、带渐变）
+          * 进度**状态/触摸** = 那个看不见的 Slider（opacity=0）——
+            这样 _tick / _seek_down / _seek_up 这些逻辑一行都不用改
+          * 下载进度同理，BarView 直接顶掉原来的 ProgressBar
+        """
         outer = BoxLayout(orientation="vertical", size_hint_y=None,
-                          padding=(dp(10), dp(6)))
+                          padding=(dp(12), dp(8)))
         outer.bind(minimum_height=outer.setter("height"))
-        box = BoxLayout(orientation="vertical", size_hint_y=None,
-                        padding=(dp(14), dp(12)), spacing=dp(10))
-        attach_bg(box, C_CARD, radius=14)
-        box.bind(minimum_height=box.setter("height"))
-        outer.add_widget(box)
+        card = BoxLayout(orientation="vertical", size_hint_y=None,
+                         padding=(dp(16), dp(12)), spacing=dp(8))
+        card.bind(minimum_height=card.setter("height"))
+        # 投影要在填充之前加：canvas.before 按插入顺序绘制，后加的盖前面
+        soft_shadow(card, spread=dp(20), alpha=0.55)
+        rounded(card, C_SHEET, corners=[dp(R_SHEET)] * 4)
+        glass(card, radius=R_SHEET)
+        outer.add_widget(card)
 
-        # ---- 播放条 ----
-        prow = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(10))
-        self.btn_play = self._btn("播放", color=C_ACCENT, w=dp(64), fs=dp(14))
+        # ---- 播放按钮 + 时间（时间用等宽，数字跳动时不会左右抖）----
+        top = BoxLayout(size_hint_y=None, height=dp(H_TOUCH), spacing=dp(12))
+        self.btn_play = IconButton("play", dia=dp(H_TOUCH), bg=C_WHITE,
+                                   icon_color=(0.07, 0.07, 0.08, 1))
         self.btn_play.bind(on_release=lambda *_: self.toggle_play())
-        prow.add_widget(self.btn_play)
+        self.btn_play.bind(text=self._on_play_text)
+        top.add_widget(self.btn_play)
+        top.add_widget(Widget())
+        self.lbl_time = Label(text="00:00 / 00:00", size_hint_x=None,
+                              width=dp(100), font_size=dp(12), color=C_DIM,
+                              halign="right", valign="middle",
+                              **fonts.mono_kwargs())
+        self.lbl_time.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        top.add_widget(self.lbl_time)
+        card.add_widget(top)
 
-        self.slider = Slider(min=0, max=1000, value=0, step=1,
-                             cursor_size=(dp(18), dp(18)),
-                             background_width=dp(3))
+        # ---- 进度：BarView 画，底下那个透明 Slider 收触摸 ----
+        seek = FloatLayout(size_hint_y=None, height=dp(28))
+        self.bar = BarView(size_hint=(1, None), height=dp(28), thickness=9,
+                           pos_hint={"center_y": 0.5}, show_knob=True)
+        seek.add_widget(self.bar)
+        # opacity=0：Kivy 的 opacity 只影响绘制、不影响触摸分发，
+        # 所以它是「看不见但仍能拖」的完美候选。
+        self.slider = Slider(min=0, max=1000, value=0, step=1, opacity=0.0,
+                             size_hint=(1, None), height=dp(28),
+                             pos_hint={"center_y": 0.5})
         self.slider.bind(on_touch_down=self._seek_down,
                          on_touch_up=self._seek_up)
-        prow.add_widget(self.slider)
+        self.slider.bind(value=lambda *_: setattr(
+            self.bar, "value", self.slider.value / 1000.0))
+        seek.add_widget(self.slider)
+        card.add_widget(seek)
 
-        self.lbl_time = Label(text="00:00 / 00:00", size_hint_x=None,
-                              width=dp(96), font_size=dp(12), color=C_DIM,
-                              halign="right", valign="middle", **self.F)
-        self.lbl_time.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
-        prow.add_widget(self.lbl_time)
-        box.add_widget(prow)
-
-        # ---- 下载进度 ----
-        self.pb = ProgressBar(max=100, size_hint_y=None, height=dp(4))
-        box.add_widget(self.pb)
-        # 名字必须是 self.status —— set_status() 写的就是它
-        self.status = Label(text="正在启动…", size_hint_y=None, height=dp(34),
+        # ---- 状态文字 ----
+        self.status = Label(text="正在启动…", size_hint_y=None, height=dp(32),
                             font_size=dp(12), color=C_DIM,
                             halign="left", valign="middle", **self.F)
         self.status.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
-        box.add_widget(self.status)
+        card.add_widget(self.status)
+
+        # ---- 下载 / 缓冲进度：细条，同一个 BarView（0..100）----
+        self.pb = BarView(size_hint=(1, None), height=dp(4), thickness=3,
+                          max=100.0, show_knob=False)
+        card.add_widget(self.pb)
         return outer
+
+    def _on_play_text(self, *_):
+        """播放按钮的文字变了 → 换图标（播放 ↔ 暂停）。
+
+        逻辑层只会去改 btn_play.text（"播放"/"暂停"），图标由这里跟着变 ——
+        业务代码完全不需要知道「图标」这回事。
+        """
+        try:
+            kind = "pause" if "暂停" in (self.btn_play.text or "") else "play"
+            draw_icon(self.btn_play, kind, color=(0.07, 0.07, 0.08, 1))
+        except Exception:
+            log_exc("_on_play_text")
+
+    # ---------- 二级选择页（分组行点开）----------
+    def _open_picker(self, title, values, current, on_pick, actions=()):
+        """按**当前**的 spinner 状态即时生成一个底部选择页。
+
+        每次点行都重新生成，这样选项永远是最新的（音源列表是启动后才填的、
+        音质列表还会随平台/格式变），不用维护缓存。
+        """
+        try:
+            p = PickerSheet(title=title, options=list(values), current=current,
+                            on_pick=on_pick, actions=list(actions),
+                            on_closed=lambda: self._drop(p))
+            self.root.add_widget(p)
+            p.present()
+            return p
+        except Exception:
+            log_exc("_open_picker")
+            return None
+
+    def _drop(self, w):
+        """选择页收回后从树上摘掉，别一直堆在 root 里。"""
+        try:
+            if w.parent is not None:
+                w.parent.remove_widget(w)
+        except Exception:
+            log_exc("_drop")
+
+    def _pick_source_sheet(self):
+        self._open_picker("选择音源", list(self.sp_source.values),
+                          self.sp_source.text,
+                          lambda t: setattr(self.sp_source, "text", t),
+                          [("从文件选择音源…", self.pick_source)])
+
+    def _pick_platform_sheet(self):
+        self._open_picker("选择平台", list(self.sp_platform.values),
+                          self.sp_platform.text, self._pick_platform)
+
+    def _pick_platform(self, text):
+        self.sp_platform.text = text          # 会触发 _refresh_qualities
+        # 选完平台接着选音质（iOS 的逐级下钻）。等上一层收完再弹，
+        # 两层动画叠在一起会显得很乱。
+        Clock.schedule_once(lambda *_: self._pick_quality_sheet(), 0.18)
+
+    def _pick_quality_sheet(self):
+        self._open_picker("选择音质", list(self.sp_quality.values),
+                          self.sp_quality.text,
+                          lambda t: setattr(self.sp_quality, "text", t))
+
+    def _pick_format_sheet(self):
+        self._open_picker("选择格式", list(self.sp_format.values),
+                          self.sp_format.text,
+                          lambda t: setattr(self.sp_format, "text", t))
+
+    def _pick_count_sheet(self):
+        self._open_picker("搜索结果数量", list(COUNT_ORDER), self.sp_count.text,
+                          lambda t: setattr(self.sp_count, "text", t))
+
+    def _pick_dir_sheet(self):
+        self._open_picker("下载保存位置", list(self.sp_dir.values),
+                          self.sp_dir.text,
+                          lambda t: setattr(self.sp_dir, "text", t),
+                          [("选择其他目录…", self.pick_dir)])
 
     # ---------- 线程工具 ----------
     def ui(self, fn):
@@ -1106,36 +679,26 @@ class LxApp(App):
 
     # ---------- 设置 ----------
     def open_settings(self, *_):
-        """从底部滑出设置面板，同时背景逐渐变暗。
+        """从底部弹出设置抽屉：遮罩渐显 + 卡片弹性升起。
 
-        为什么用高度动画：面板挂在竖排 BoxLayout 里，Kivy 的布局每一帧都会
-        按 size_hint/pos_hint 重新摆放子控件，动画位置会被覆盖回去 ——
-        height 是唯一不会被抢走的自由度。
+        动画和遮罩都在 lxui.ModalLayer 里（弹簧积分、吞触摸、保险丝），
+        这里只管「打开前先把值刷新一遍」—— 用户上次改过目录/代理，
+        抽屉里要显示的是最新的。
         """
         try:
-            if getattr(self, "_sheet_open", False):
+            if self.sheet.is_open:
                 return
-            self._sheet_open = True
             self._fill_dir_presets()
             self._refresh_proxy_label()
-            Animation(height=self._sheet_h, d=0.34,
-                      t="out_cubic").start(self.sheet)
-            Animation(_scrim_a=0.55, d=0.34).start(self)
-            # 保险丝：动画没跑起来也要落到最终状态，否则面板卡在半开。
-            Clock.schedule_once(
-                lambda *_: setattr(self.sheet, "height", self._sheet_h), 0.7)
+            self.sheet.present()
         except Exception:
             log_exc("open_settings")
 
     def close_settings(self, *_):
         try:
-            if not getattr(self, "_sheet_open", False):
+            if not self.sheet.is_open:
                 return
-            self._sheet_open = False
-            Animation(height=0, d=0.26, t="out_quad").start(self.sheet)
-            Animation(_scrim_a=0.0, d=0.26).start(self)
-            Clock.schedule_once(
-                lambda *_: setattr(self.sheet, "height", 0), 0.6)
+            self.sheet.dismiss()
         except Exception:
             log_exc("close_settings")
 
@@ -1242,14 +805,24 @@ class LxApp(App):
             self.set_status("代理文件不可用: %s" % e, C_ERR)
 
     def _refresh_proxy_label(self):
+        """刷新 QQ 代理那行的状态。
+
+        btn_proxy 只当状态容器（保存完整描述），行上显示简短的「已自定义 /
+        选择代理文件」—— 完整信息（内置几条）在点开后的选择页里能看到，
+        塞进 52dp 的行里会被截断。
+        """
         try:
             btn = getattr(self, "btn_proxy", None)
             if btn is None:
-                return                  # 设置弹窗还没打开过
+                return                  # 设置抽屉还没建好
             n_builtin = len(qqresolve.QQ_PROXIES)
             has_custom = os.path.exists(qqresolve.QQ_PROXY_FILE)
             extra = "，已加自定义" if has_custom else ""
             btn.text = "选代理文件(.txt)  ·  内置 %d 条%s" % (n_builtin, extra)
+            row = getattr(self, "row_proxy", None)
+            if row is not None:
+                row.value = ("已自定义" if has_custom
+                             else "选择代理文件")
         except Exception:
             log_exc("_refresh_proxy_label")
 
@@ -1416,64 +989,67 @@ class LxApp(App):
             return
         self._show_results(songs)
 
+    def _set_empty(self, show):
+        """空状态（模糊唱片）显隐 —— 它只是装饰，出错也不该影响流程。"""
+        try:
+            self.empty.opacity = 1.0 if show else 0.0
+        except Exception:
+            log_exc("_set_empty")
+
     def _clear_results(self):
         self.results.clear_widgets()
+        self._set_empty(True)
 
     def _show_results(self, songs):
         self.songs = list(songs or [])
         self._clear_results()
         if not self.songs:
             self.hint.text = "没有找到结果，换个关键词试试"
+            self._set_empty(True)
             self.set_status("没有找到结果")
             return
 
         self.hint.text = "点歌名直接播放，点右侧「下载」保存（共 %d 首）" % len(self.songs)
+        self._set_empty(False)
         # 只给前几首做入场动效：几百首全做会明显卡，而且看不到那么远
         STAGGER = 10
+        row_h = dp(ROW_H)
         for i, s in enumerate(self.songs):
-            row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(6))
-            # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
-            song_btn = FlatButton(
-                text="%d. %s\n%s    %s"
-                     % (i + 1, s["name"], s["singer"],
-                        s.get("interval") or "--:--"),
-                halign="left", valign="middle", font_size=dp(13),
-                color=C_TEXT, bg_color=C_ITEM, radius=10, **self.F)
-            song_btn.bind(size=lambda b, v: setattr(b, "text_size",
-                                                    (v[0] - dp(20), None)))
-            song_btn.bind(on_release=lambda b, idx=i: self.play_song(idx))
-            row.add_widget(song_btn)
-
-            dl = FlatButton(text="下载", font_size=dp(13), color=C_TEXT,
-                            bg_color=C_CTRL, radius=10, size_hint_x=None,
-                            width=dp(58), **self.F)
-            dl.bind(on_release=lambda b, idx=i: self.download_song(idx))
-            row.add_widget(dl)
+            row = SongRow(
+                index=i + 1, title=s["name"],
+                subtitle="%s    %s" % (s["singer"],
+                                       s.get("interval") or "--:--"),
+                on_play=lambda idx=i: self.play_song(idx),
+                on_download=lambda idx=i: self.download_song(idx))
             self.results.add_widget(row)
-
             if i < STAGGER:
                 # 错峰进场：淡入 + 高度展开，列表像「长」出来而不是一次砸下来
                 row.opacity = 0.0
                 row.height = 0
-                anim = Animation(opacity=1.0, height=dp(58), duration=0.22,
-                                 t="out_quad")
                 Clock.schedule_once(
-                    lambda *_, r=row, a=anim: a.start(r), 0.03 * i)
+                    lambda *_, r=row, h=row_h: self._enter_row(r, h), 0.03 * i)
 
         # 保险丝：万一入场动画没跑起来，列表会停在全透明/零高度，
         # 那比没有动效糟得多 —— 到点无条件把最终状态写回去。
-        if self.songs:
-            def _settle(*_):
-                try:
-                    for w in self.results.children:
-                        w.opacity = 1.0
-                        if w.height < dp(58):
-                            w.height = dp(58)
-                except Exception:
-                    log_exc("列表入场收尾")
-            Clock.schedule_once(_settle, 0.03 * min(len(self.songs), STAGGER) + 0.6)
+        def _settle(*_):
+            try:
+                for w in self.results.children:
+                    w.opacity = 1.0
+                    if w.height < row_h:
+                        w.height = row_h
+            except Exception:
+                log_exc("列表入场收尾")
+        Clock.schedule_once(_settle, 0.03 * min(len(self.songs), STAGGER) + 0.7)
 
         self.set_status("找到 %d 首：点歌名播放，点「下载」保存" % len(self.songs))
+
+    def _enter_row(self, row, height):
+        """单行入场：弹簧淡入 + 高度展开。"""
+        try:
+            spring_to(row, "opacity", 1.0, 0.30, 1.0)
+            spring_to(row, "height", height, 0.30, 1.0)
+        except Exception:
+            log_exc("_enter_row")
 
     # ---------- 列表上的直接操作 ----------
     def play_song(self, idx):
@@ -1773,12 +1349,17 @@ class LxApp(App):
         self.bg(lambda: self._resolve_song(song), "resolve")
 
     def _show_song_popup(self, song):
+        """歌曲详情框（解析失败时才弹，成功路径是直接播/直接下）。
+
+        仍然是 Kivy 的 Popup，但换成了暗色面板 + 胶囊按钮，和高亮边框 ——
+        原来那种「系统灰面板」和新的暗色界面放一起很突兀。
+        """
         kw = dict(self.F)
         content = BoxLayout(orientation="vertical", spacing=dp(8),
-                            padding=dp(12))
+                            padding=dp(14))
 
         name = Label(text="%s — %s" % (song["name"], song["singer"]),
-                     size_hint_y=None, height=dp(44), font_size=dp(15),
+                     size_hint_y=None, height=dp(42), font_size=dp(16),
                      bold=True, color=C_TEXT, halign="left", valign="middle",
                      **kw)
         name.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
@@ -1789,29 +1370,31 @@ class LxApp(App):
         self._pop_info.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
         content.add_widget(self._pop_info)
 
-        btns = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        self._pop_play = FlatButton(text="播放", font_size=dp(15),
-                                    bg_color=C_ACCENT, color=(1, 1, 1, 1),
-                                    radius=10, disabled=True, **kw)
+        btns = BoxLayout(size_hint_y=None, height=dp(H_TOUCH), spacing=dp(10))
+        self._pop_play = SpringButton(text="播放", font_size=dp(15),
+                                      bg_color=C_ACCENT, color=C_WHITE,
+                                      radius=R_CAPSULE, disabled=True, **kw)
         self._pop_play.bind(on_release=lambda *_: self.play_current())
         btns.add_widget(self._pop_play)
 
         self._pop_dl = FlatButton(text="下载", font_size=dp(15),
-                                  bg_color=C_CTRL, color=C_TEXT,
-                                  radius=10, disabled=True, **kw)
+                                  bg_color=C_ROW, color=C_TEXT,
+                                  radius=R_CAPSULE, disabled=True, **kw)
         self._pop_dl.bind(on_release=lambda *_: self.download_current())
         btns.add_widget(self._pop_dl)
         content.add_widget(btns)
 
         self._popup = Popup(title="歌曲信息", content=content,
-                            size_hint=(0.92, None), height=dp(310),
-                            title_size=dp(15), separator_color=C_ACCENT,
+                            size_hint=(0.92, None), height=dp(320),
+                            title_size=dp(16), title_color=C_TEXT,
+                            separator_color=C_ACCENT,
+                            background_color=(0.11, 0.11, 0.118, 0.96),
                             **self.P)
         # 淡入。刻意从 0.86 而不是 0 起 —— 万一动画没跑起来，
         # 弹窗至少是「几乎全可见」，不会变成一个看不见却挡住点击的遮罩。
         self._popup.opacity = 0.86
         self._popup.open()
-        Animation(opacity=1.0, duration=0.18, t="out_quad").start(self._popup)
+        spring_to(self._popup, "opacity", 1.0, 0.28, 1.0)
 
     # ---------- 播放 ----------
     def play_current(self):
@@ -1973,6 +1556,8 @@ class LxApp(App):
 if __name__ == "__main__":
     appenv.install_crash_guard()
     fonts.register()
+    # 等宽字体只用于播放时间（数字不跳宽度），找不到会自动退回中文字体
+    fonts.register_mono()
     try:
         LxApp().run()
     except Exception:
