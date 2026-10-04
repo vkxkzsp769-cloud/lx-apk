@@ -111,6 +111,11 @@ def fmt_time(sec):
     return TIME_FMT % (sec // 60, sec % 60)
 
 
+# ⚠ Kivy 的四元 padding 顺序是 (top, right, bottom, left)（顺时针），
+# 不是常见的 (left, top, right, bottom)。四元组一律按 Kivy 语义书写；
+# 二元组是 (水平, 垂直)。搞混过一次：标题贴左、列表卡左右留白不对称。
+
+
 def spring_t(p):
     """苹果式阻尼弹簧缓动：先冲过终点一点，再回落定住。
 
@@ -628,31 +633,56 @@ def draw_icon(widget, kind, color=None, size=None):
     （_icon_kind / _icon_color），再调一次只刷新状态并即时重画
     —— 播放键那种「按文本切换 play/pause 图形」靠这个实现。
     """
-    from kivy.graphics import Color, InstructionGroup, Line, Mesh
+    from kivy.graphics import (Color, InstructionGroup, Line, Mesh, PushMatrix,
+                               PopMatrix, Translate)
     _DRAW = {"line": Line, "mesh": Mesh}
     widget._icon_kind = kind
     widget._icon_color = list(color or C_TEXT)
 
-    def _redraw(*_):
-        w, h = max(1.0, widget.width), max(1.0, widget.height)
+    def _geom_key():
+        return (round(max(1.0, widget.width), 1),
+                round(max(1.0, widget.height), 1),
+                widget._icon_kind, tuple(widget._icon_color))
+
+    def _sync(*_):
+        # 结构：grp = [Translate, body]。
+        #   位置变化（滚动就是一直变）→ 只改 Translate 的 xyz，零重建；
+        #   尺寸/图形/颜色变化 → 重建 body 里的几何（少见）。
         # 图标画进自己的 InstructionGroup：不能用 canvas.after.clear()，
         # 那会把 attach_border/attach_sep 加在同一 canvas.after 上的线一起清掉。
         grp = getattr(widget, "_icon_group", None)
         if grp is None or grp not in widget.canvas.after.children:
             grp = InstructionGroup()
             widget._icon_group = grp
+            # ⚠ Translate 直接改 GL 上下文矩阵，Kivy 的 InstructionGroup
+            # **不会**自动 save/restore —— 不加 Push/Pop 会把偏移泄漏给
+            # 之后画的一切（实测整屏错乱、读回全黑）。必须成对包起来。
+            grp.add(PushMatrix())
+            widget._icon_tr = Translate(widget.x, widget.y, 0)
+            grp.add(widget._icon_tr)
+            widget._icon_body = InstructionGroup()
+            grp.add(widget._icon_body)
+            grp.add(PopMatrix())
             widget.canvas.after.add(grp)
-        grp.clear()
-        grp.add(Color(*widget._icon_color))
-        for op, kw in icon_parts(widget._icon_kind, w, h, widget.x, widget.y,
-                                 dp(1.0)):
-            grp.add(_DRAW[op](**kw))
+        else:
+            widget._icon_tr.xyz = (widget.x, widget.y, 0)
+        key = _geom_key()
+        if getattr(widget, "_icon_key", None) == key:
+            return
+        widget._icon_key = key
+        w = max(1.0, widget.width)
+        h = max(1.0, widget.height)
+        body = widget._icon_body
+        body.clear()
+        body.add(Color(*widget._icon_color))
+        for op, kw in icon_parts(widget._icon_kind, w, h, 0.0, 0.0, dp(1.0)):
+            body.add(_DRAW[op](**kw))
 
     if not getattr(widget, "_icon_bound", False):
         widget._icon_bound = True
-        widget.bind(pos=_redraw, size=_redraw)
-    widget._icon_redraw = _redraw
-    _redraw()
+        widget.bind(pos=_sync, size=_sync)
+    widget._icon_redraw = _sync
+    _sync()
     return widget
 
 
@@ -760,16 +790,20 @@ class SeekBar(Slider):
         kw.setdefault("size_hint_y", None)
         kw.setdefault("height", dp(44))      # 触摸目标 ≥44dp（HIG）
         super().__init__(**kw)
-        from kivy.graphics import Color, Rectangle, RoundedRectangle
-        tex = bgfx.make_glow_texture()
+        from kivy.graphics import Color, RoundedRectangle
         self._kn = dp(18)
+        # 游标投影：三层**同心圆**（半径递增、alpha 递减）近似柔和阴影。
+        # 别改回径向渐变贴图拉伸 —— 那是椭圆，中心还会随 squash 偏移，
+        # 视觉上就是「阴影和圆没重叠、乱成一团」。
         with self.canvas.after:
             self._tr_c = Color(0.878, 0.878, 0.894, 1)     # 未播段浅灰
-            self._tr = RoundedRectangle(radius=[dp(2)])
+            self._tr = RoundedRectangle(radius=[dp(3)])
             self._fl_c = Color(*C_ACCENT)                   # 已播段系统蓝
-            self._fl = RoundedRectangle(radius=[dp(2)])
-            self._kd_c = Color(*SHADOW_C, 0.22)             # 游标投影
-            self._kd = Rectangle(texture=tex)
+            self._fl = RoundedRectangle(radius=[dp(3)])
+            self._k3_c = Color(*SHADOW_C, 0.08)
+            self._k3 = RoundedRectangle(radius=[dp(16)])
+            self._k2_c = Color(*SHADOW_C, 0.12)
+            self._k2 = RoundedRectangle(radius=[dp(13)])
             self._kn_c = Color(1, 1, 1, 1)
             self._kn_s = RoundedRectangle(radius=[self._kn / 2.0])
         self.bind(pos=self._redraw, size=self._redraw,
@@ -794,11 +828,13 @@ class SeekBar(Slider):
         self._fl.pos = (x0, cy - th / 2.0)
         self._fl.size = (max(th, w * f), th)
         kx = x0 + w * f
-        pad = self._kn * 0.9
-        self._kd.pos = (kx - pad, cy - pad * 0.75)
-        self._kd.size = (pad * 2, pad * 1.5)
-        self._kn_s.pos = (kx - self._kn / 2.0, cy - self._kn / 2.0)
-        self._kn_s.size = (self._kn, self._kn)
+        d1, d2, d3 = self._kn, self._kn + dp(4), self._kn + dp(10)
+        self._kn_s.pos = (kx - d1 / 2.0, cy - d1 / 2.0)
+        self._kn_s.size = (d1, d1)
+        self._k2.pos = (kx - d2 / 2.0, cy - d2 / 2.0 - dp(1.5))
+        self._k2.size = (d2, d2)
+        self._k3.pos = (kx - d3 / 2.0, cy - d3 / 2.0 - dp(2.5))
+        self._k3.size = (d3, d3)
 
 
 class ProgressCapsule(ProgressBar):
@@ -953,7 +989,7 @@ class LxApp(App):
         # 布局就不会把动画位置抢回去 —— 旧版挂在 BoxLayout 里只能"顶内容"，
         # 不是"浮起来盖住内容"，层级感完全不对。
         self.sheet = BoxLayout(orientation="vertical", size_hint=(1, None),
-                               padding=(dp(18), dp(6), dp(18), dp(12)),
+                               padding=(dp(6), dp(18), dp(12), dp(18)),
                                spacing=dp(14))
         attach_shadow(self.sheet, spread=dp(26), alpha=0.24, squash=0.4)
         attach_bg(self.sheet, C_CARD, radius=[28, 28, 0, 0])   # 顶部两角圆
@@ -1007,7 +1043,7 @@ class LxApp(App):
         小屏上几乎把歌曲列表挤没了。
         """
         box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(94),
-                        padding=(dp(20), dp(10), dp(20), dp(2)), spacing=dp(0))
+                        padding=(dp(10), dp(20), dp(2), dp(20)), spacing=dp(0))
         row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
         t = Label(text="落雪音源", bold=True, font_size=dp(27),
                   halign="left", valign="middle", color=C_TEXT, **self.F)
@@ -1029,7 +1065,7 @@ class LxApp(App):
     def _build_search(self):
         """搜索条：iOS 胶囊输入（聚焦染蓝）+ 系统蓝胶囊按钮"""
         wrap = BoxLayout(size_hint_y=None, height=dp(58),
-                         padding=(dp(16), dp(2), dp(16), dp(8)), spacing=dp(10))
+                         padding=(dp(2), dp(16), dp(8), dp(16)), spacing=dp(10))
 
         # 输入框是 secondarySystemFill 胶囊，放大镜画在它左内侧
         self.ti_box = BoxLayout(size_hint_y=None, height=dp(44))
@@ -1123,7 +1159,7 @@ class LxApp(App):
         _fill_dir_presets / _refresh_proxy_label）和测试都靠属性取控件。
         """
         panel = BoxLayout(orientation="vertical", size_hint_y=None,
-                          padding=(dp(2), dp(2), dp(2), dp(6)), spacing=dp(16))
+                          padding=(dp(2), dp(2), dp(6), dp(2)), spacing=dp(16))
         panel.bind(minimum_height=panel.setter("height"))
 
         # ---- 音源 ----
@@ -1227,7 +1263,7 @@ class LxApp(App):
     def _build_results(self):
         """结果区：一整张白色分组卡（iOS 列表），行与行靠发丝线分隔"""
         wrap = BoxLayout(orientation="vertical",
-                         padding=(dp(16), dp(2), dp(16), dp(6)), spacing=dp(6))
+                         padding=(dp(2), dp(16), dp(6), dp(16)), spacing=dp(6))
         self.hint = Label(text="搜索后点结果即可播放或下载", size_hint_y=None,
                           height=dp(24), font_size=dp(12), color=C_FAINT,
                           halign="left", valign="middle", **self.F)
@@ -1240,9 +1276,11 @@ class LxApp(App):
         self.results = BoxLayout(orientation="vertical", size_hint_y=None,
                                  spacing=0, padding=(0, 0))
         self.results.bind(minimum_height=self.results.setter("height"))
-        # 投影先画、白卡后画 —— 顺序反了投影会把卡片糊住（canvas 按插入序）
-        attach_shadow(self.results, spread=dp(12), alpha=0.11, squash=0.5)
+        # 长列表容器**不要**投影：投影贴图会被拉伸到整卡高度
+        # （300 首 ≈ 十几屏），滚动时每帧巨幅半透明 overdraw，就是「小卡」。
+        # 用发丝描边分层，观感干净、成本近乎零。
         attach_bg(self.results, C_CARD, radius=R_LG)
+        attach_border(self.results, radius=R_LG, color=(0.235, 0.235, 0.263, 0.10))
         self.sv.add_widget(self.results)
         wrap.add_widget(self.sv)
         return wrap
@@ -1251,7 +1289,7 @@ class LxApp(App):
         """底部迷你播放器卡（Apple Music 播放条的画法）：
         圆钮 + 自绘进度 + 时间，下面接细胶囊下载进度与状态行。"""
         outer = BoxLayout(orientation="vertical", size_hint_y=None,
-                          padding=(dp(12), dp(4), dp(12), dp(10)))
+                          padding=(dp(4), dp(12), dp(10), dp(12)))
         outer.bind(minimum_height=outer.setter("height"))
         box = BoxLayout(orientation="vertical", size_hint_y=None,
                         padding=(dp(14), dp(12)), spacing=dp(8))
@@ -1784,7 +1822,7 @@ class LxApp(App):
         STAGGER = 9
         for i, s in enumerate(self.songs):
             row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(4),
-                            padding=(dp(0), 0))
+                            padding=(0, dp(16), 0, 0))
             # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
             song_btn = FlatButton(
                 text="%s\n%s · %s" % (s["name"], s["singer"],
@@ -2143,7 +2181,7 @@ class LxApp(App):
         """歌曲详情：iOS alert 式白卡（自绘圆角+投影，不用 Kivy 默认贴图边框）"""
         kw = dict(self.F)
         content = BoxLayout(orientation="vertical", spacing=dp(10),
-                            padding=(dp(20), dp(4), dp(20), dp(16)))
+                            padding=(dp(4), dp(20), dp(16), dp(20)))
 
         name = Label(text="%s\n%s" % (song["name"], song["singer"]),
                      size_hint_y=None, height=dp(56), font_size=dp(17),

@@ -107,7 +107,7 @@ class MusicBackground:
     BG_TOP = (0.952, 0.952, 0.964, 1)     # 顶部略深（#F3F3F6）
     BG_BOTTOM = (0.976, 0.976, 0.984, 1)  # 底部略亮（#F9F9FB）
 
-    def __init__(self, host, fps=24):
+    def __init__(self, host, fps=18):
         self._host = host
         self._fps = float(fps)
         self._t = 0.0
