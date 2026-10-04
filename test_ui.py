@@ -1486,9 +1486,12 @@ def test_download_no_nameerror():
             continue
         raw = open(_os.path.join(HERE, f), encoding="utf-8").read()
         tree = _ast.parse(raw)
-        # 扫描时去掉注释行 —— 否则注释里写个 "time." 也会被当成缺 import
+        # 扫描时去掉注释行和 import 行 —— 否则注释里写个 "time." 会被当成缺
+        # import；`import urllib.parse as urllib_parse` 这种带别名的写法，
+        # import 语句本身含 "urllib." 但**函数体**根本没用它（用了也拿不到
+        # 裸名 urllib）—— 之前把这种合法写法误判成缺 import。
         src = "\n".join(l for l in raw.splitlines()
-                        if not l.strip().startswith("#"))
+                        if not l.strip().startswith(("#", "import ", "from ")))
         names = set()
         for n in _ast.walk(tree):
             if isinstance(n, _ast.Import):
