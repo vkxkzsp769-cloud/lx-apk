@@ -111,9 +111,12 @@ def fmt_time(sec):
     return TIME_FMT % (sec // 60, sec % 60)
 
 
-# ⚠ Kivy 的四元 padding 顺序是 (top, right, bottom, left)（顺时针），
-# 不是常见的 (left, top, right, bottom)。四元组一律按 Kivy 语义书写；
-# 二元组是 (水平, 垂直)。搞混过一次：标题贴左、列表卡左右留白不对称。
+# ⚠ padding 语义（**实测** Kivy 2.3，文档写的 (t,r,b,l) 是错的）：
+#   四元组 = (left, top, right, bottom)
+#   二元组 = (horizontal, vertical)
+# 探针：BoxLayout(size=300).padding=(10,20,30,40) → 子控件 x=10 y=40 w=260 h=240
+# 即 左=10 上=20 右=30 下=40。按 (t,r,b,l) 写过一次，左距/右距全错位（用户：
+# 「下载按钮还是对不齐，要整齐」）。别再改了，先跑那个探针再动。
 
 
 def spring_t(p):
@@ -792,18 +795,15 @@ class SeekBar(Slider):
         super().__init__(**kw)
         from kivy.graphics import Color, RoundedRectangle
         self._kn = dp(18)
-        # 游标投影：三层**同心圆**（半径递增、alpha 递减）近似柔和阴影。
-        # 别改回径向渐变贴图拉伸 —— 那是椭圆，中心还会随 squash 偏移，
-        # 视觉上就是「阴影和圆没重叠、乱成一团」。
+        # 播放游标：**无投影**（用户要求直接去掉；此前椭圆贴图阴影中心
+        # 会偏移，看起来和圆不重叠）。白圆 + 极细灰描边，干净利落。
         with self.canvas.after:
             self._tr_c = Color(0.878, 0.878, 0.894, 1)     # 未播段浅灰
             self._tr = RoundedRectangle(radius=[dp(3)])
             self._fl_c = Color(*C_ACCENT)                   # 已播段系统蓝
             self._fl = RoundedRectangle(radius=[dp(3)])
-            self._k3_c = Color(*SHADOW_C, 0.08)
-            self._k3 = RoundedRectangle(radius=[dp(16)])
-            self._k2_c = Color(*SHADOW_C, 0.12)
-            self._k2 = RoundedRectangle(radius=[dp(13)])
+            self._ke_c = Color(0.72, 0.72, 0.75, 0.9)       # 描边
+            self._ke = RoundedRectangle(radius=[(self._kn + dp(2)) / 2.0])
             self._kn_c = Color(1, 1, 1, 1)
             self._kn_s = RoundedRectangle(radius=[self._kn / 2.0])
         self.bind(pos=self._redraw, size=self._redraw,
@@ -828,13 +828,12 @@ class SeekBar(Slider):
         self._fl.pos = (x0, cy - th / 2.0)
         self._fl.size = (max(th, w * f), th)
         kx = x0 + w * f
-        d1, d2, d3 = self._kn, self._kn + dp(4), self._kn + dp(10)
+        d1 = self._kn
+        d0 = self._kn + dp(2)
+        self._ke.pos = (kx - d0 / 2.0, cy - d0 / 2.0)
+        self._ke.size = (d0, d0)
         self._kn_s.pos = (kx - d1 / 2.0, cy - d1 / 2.0)
         self._kn_s.size = (d1, d1)
-        self._k2.pos = (kx - d2 / 2.0, cy - d2 / 2.0 - dp(1.5))
-        self._k2.size = (d2, d2)
-        self._k3.pos = (kx - d3 / 2.0, cy - d3 / 2.0 - dp(2.5))
-        self._k3.size = (d3, d3)
 
 
 class ProgressCapsule(ProgressBar):
@@ -989,7 +988,7 @@ class LxApp(App):
         # 布局就不会把动画位置抢回去 —— 旧版挂在 BoxLayout 里只能"顶内容"，
         # 不是"浮起来盖住内容"，层级感完全不对。
         self.sheet = BoxLayout(orientation="vertical", size_hint=(1, None),
-                               padding=(dp(6), dp(18), dp(12), dp(18)),
+                               padding=(dp(18), dp(6), dp(18), dp(12)),
                                spacing=dp(14))
         attach_shadow(self.sheet, spread=dp(26), alpha=0.24, squash=0.4)
         attach_bg(self.sheet, C_CARD, radius=[28, 28, 0, 0])   # 顶部两角圆
@@ -1043,7 +1042,7 @@ class LxApp(App):
         小屏上几乎把歌曲列表挤没了。
         """
         box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(94),
-                        padding=(dp(10), dp(20), dp(2), dp(20)), spacing=dp(0))
+                        padding=(dp(20), dp(10), dp(20), dp(2)), spacing=dp(0))
         row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
         t = Label(text="落雪音源", bold=True, font_size=dp(27),
                   halign="left", valign="middle", color=C_TEXT, **self.F)
@@ -1065,7 +1064,7 @@ class LxApp(App):
     def _build_search(self):
         """搜索条：iOS 胶囊输入（聚焦染蓝）+ 系统蓝胶囊按钮"""
         wrap = BoxLayout(size_hint_y=None, height=dp(58),
-                         padding=(dp(2), dp(16), dp(8), dp(16)), spacing=dp(10))
+                         padding=(dp(16), dp(2), dp(16), dp(8)), spacing=dp(10))
 
         # 输入框是 secondarySystemFill 胶囊，放大镜画在它左内侧
         self.ti_box = BoxLayout(size_hint_y=None, height=dp(44))
@@ -1159,7 +1158,7 @@ class LxApp(App):
         _fill_dir_presets / _refresh_proxy_label）和测试都靠属性取控件。
         """
         panel = BoxLayout(orientation="vertical", size_hint_y=None,
-                          padding=(dp(2), dp(2), dp(6), dp(2)), spacing=dp(16))
+                          padding=(dp(2), dp(2), dp(2), dp(6)), spacing=dp(16))
         panel.bind(minimum_height=panel.setter("height"))
 
         # ---- 音源 ----
@@ -1263,7 +1262,7 @@ class LxApp(App):
     def _build_results(self):
         """结果区：一整张白色分组卡（iOS 列表），行与行靠发丝线分隔"""
         wrap = BoxLayout(orientation="vertical",
-                         padding=(dp(2), dp(16), dp(6), dp(16)), spacing=dp(6))
+                         padding=(dp(16), dp(2), dp(16), dp(6)), spacing=dp(6))
         self.hint = Label(text="搜索后点结果即可播放或下载", size_hint_y=None,
                           height=dp(24), font_size=dp(12), color=C_FAINT,
                           halign="left", valign="middle", **self.F)
@@ -1289,7 +1288,7 @@ class LxApp(App):
         """底部迷你播放器卡（Apple Music 播放条的画法）：
         圆钮 + 自绘进度 + 时间，下面接细胶囊下载进度与状态行。"""
         outer = BoxLayout(orientation="vertical", size_hint_y=None,
-                          padding=(dp(4), dp(12), dp(10), dp(12)))
+                          padding=(dp(12), dp(4), dp(12), dp(10)))
         outer.bind(minimum_height=outer.setter("height"))
         box = BoxLayout(orientation="vertical", size_hint_y=None,
                         padding=(dp(14), dp(12)), spacing=dp(8))
@@ -1822,7 +1821,7 @@ class LxApp(App):
         STAGGER = 9
         for i, s in enumerate(self.songs):
             row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(4),
-                            padding=(0, dp(16), 0, 0))
+                            padding=(0, 0, dp(16), 0))
             # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
             song_btn = FlatButton(
                 text="%s\n%s · %s" % (s["name"], s["singer"],
@@ -1840,7 +1839,8 @@ class LxApp(App):
                             bg=(0.926, 0.953, 1.0, 1))
             dl.bind(on_release=lambda b, idx=i: self.download_song(idx))
             row.add_widget(dl)
-            attach_sep(row, inset=dp(16))
+            # inset 24 = 和歌名文字起点对齐（行左缘 + btn 内边距 + 字距实测 ≈24）
+            attach_sep(row, inset=dp(24))
             self.results.add_widget(row)
 
             if i < STAGGER:
@@ -2181,7 +2181,7 @@ class LxApp(App):
         """歌曲详情：iOS alert 式白卡（自绘圆角+投影，不用 Kivy 默认贴图边框）"""
         kw = dict(self.F)
         content = BoxLayout(orientation="vertical", spacing=dp(10),
-                            padding=(dp(4), dp(20), dp(16), dp(20)))
+                            padding=(dp(20), dp(4), dp(20), dp(16)))
 
         name = Label(text="%s\n%s" % (song["name"], song["singer"]),
                      size_hint_y=None, height=dp(56), font_size=dp(17),
