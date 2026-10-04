@@ -797,15 +797,17 @@ class SeekBar(Slider):
         super().__init__(**kw)
         from kivy.graphics import Color, RoundedRectangle
         self._kn = dp(18)
-        # 播放游标：**纯白圆，无投影无描边**（用户两轮反馈都要去掉，
-        # 之前残留的「影」其实是 Kivy 默认 22px 灰球贴图漏边 —— 已把
-        # cursor_size 缩到 1px 消除）。白圆骑在蓝段端点上，对比足够。
+        # 播放游标：**系统蓝实心 + 白描边**（白圆在浅灰未播轨上看不出，
+        # 用户点名改蓝）。蓝球骑在蓝段端点时靠 2dp 白圈分界；
+        # Kivy 默认 22px 灰球已被 cursor_size=1px 消除，无任何投影。
         with self.canvas.after:
             self._tr_c = Color(0.878, 0.878, 0.894, 1)     # 未播段浅灰
             self._tr = RoundedRectangle(radius=[dp(3)])
             self._fl_c = Color(*C_ACCENT)                   # 已播段系统蓝
             self._fl = RoundedRectangle(radius=[dp(3)])
-            self._kn_c = Color(1, 1, 1, 1)
+            self._kb_c = Color(1, 1, 1, 1)                  # 游标白圈底
+            self._kb = RoundedRectangle(radius=[(self._kn + dp(4)) / 2.0])
+            self._kn_c = Color(*C_ACCENT)
             self._kn_s = RoundedRectangle(radius=[self._kn / 2.0])
         self.bind(pos=self._redraw, size=self._redraw,
                   value=self._redraw, min=self._redraw, max=self._redraw)
@@ -830,6 +832,9 @@ class SeekBar(Slider):
         self._fl.size = (max(th, w * f), th)
         kx = x0 + w * f
         d1 = self._kn
+        d2 = self._kn + dp(4)
+        self._kb.pos = (kx - d2 / 2.0, cy - d2 / 2.0)
+        self._kb.size = (d2, d2)
         self._kn_s.pos = (kx - d1 / 2.0, cy - d1 / 2.0)
         self._kn_s.size = (d1, d1)
 
