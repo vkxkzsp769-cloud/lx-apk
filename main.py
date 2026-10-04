@@ -785,25 +785,26 @@ class SeekBar(Slider):
         # Kivy 2.3 的 Slider 样式属性名（别写 1.x 的 background_normal/cursor，
         # 那些属性不存在，传进 __init__ 直接 TypeError）。
         # ⚠ 不要把 cursor_image / background_horizontal 设成空串 —— 真机上
-        # 空贴图加载失败会污染整个 GL 帧（首帧能读回、赋值后全黑）。
-        # 默认贴图照常创建，由下面 canvas.after 的自绘**盖住**它们：
-        # 轨道画满整宽、游标圆盖住默认图，观感就是 iOS 的细轨 + 白圆钮。
-        kw.setdefault("cursor_size", (dp(22), dp(22)))
+        # 空贴图会污染整个 GL 帧。但默认 cursor 是 22px 的安卓灰球，
+        # 直接盖不住（用户：「阴影还没去除」）—— 把它缩成 1px 就消失了；
+        # 拖动热区随之改 sensitivity='all'：整条滑轨都能拖，比原来跟手，
+        # 也更 iOS。自绘白圆 + 1px 描边照常画在 canvas.after。
+        kw.setdefault("cursor_size", (dp(1), dp(1)))
+        kw.setdefault("sensitivity", "all")
         kw.setdefault("value_track", False)
         kw.setdefault("size_hint_y", None)
         kw.setdefault("height", dp(44))      # 触摸目标 ≥44dp（HIG）
         super().__init__(**kw)
         from kivy.graphics import Color, RoundedRectangle
         self._kn = dp(18)
-        # 播放游标：**无投影**（用户要求直接去掉；此前椭圆贴图阴影中心
-        # 会偏移，看起来和圆不重叠）。白圆 + 极细灰描边，干净利落。
+        # 播放游标：**纯白圆，无投影无描边**（用户两轮反馈都要去掉，
+        # 之前残留的「影」其实是 Kivy 默认 22px 灰球贴图漏边 —— 已把
+        # cursor_size 缩到 1px 消除）。白圆骑在蓝段端点上，对比足够。
         with self.canvas.after:
             self._tr_c = Color(0.878, 0.878, 0.894, 1)     # 未播段浅灰
             self._tr = RoundedRectangle(radius=[dp(3)])
             self._fl_c = Color(*C_ACCENT)                   # 已播段系统蓝
             self._fl = RoundedRectangle(radius=[dp(3)])
-            self._ke_c = Color(0.72, 0.72, 0.75, 0.9)       # 描边
-            self._ke = RoundedRectangle(radius=[(self._kn + dp(2)) / 2.0])
             self._kn_c = Color(1, 1, 1, 1)
             self._kn_s = RoundedRectangle(radius=[self._kn / 2.0])
         self.bind(pos=self._redraw, size=self._redraw,
@@ -829,9 +830,6 @@ class SeekBar(Slider):
         self._fl.size = (max(th, w * f), th)
         kx = x0 + w * f
         d1 = self._kn
-        d0 = self._kn + dp(2)
-        self._ke.pos = (kx - d0 / 2.0, cy - d0 / 2.0)
-        self._ke.size = (d0, d0)
         self._kn_s.pos = (kx - d1 / 2.0, cy - d1 / 2.0)
         self._kn_s.size = (d1, d1)
 

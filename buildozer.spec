@@ -12,7 +12,7 @@ source.include_patterns = assets/*, assets/sources/*, assets/fonts/*, sources/*
 # 桌面专用的调试工具不进 APK（它们依赖 dukpy，Android 上没有这个 recipe）
 source.exclude_patterns = test_desktop.py, lx_engine.py, test_ui.py, tests/*
 
-version = 2.8.3
+version = 2.8.4
 
 # release 模式打包成 apk 而不是 aab。
 # buildozer 官方默认 `android.release_artifact = aab`（见 buildozer/
@@ -28,7 +28,7 @@ android.release_artifact = apk
 # `# android.numeric_version = 1`），不显式设置的话每个版本都是 1。
 # Android 要求新包的 versionCode >= 已装版本，显式递增最稳妥。
 # 每次发版把它往上加（跟 version 对应：2.6.7 -> 20607）。
-android.numeric_version = 20803
+android.numeric_version = 20804
 
 # 只用 kivy（不锁版本）。锁 kivy==2.3.x 会拉 thorvg 依赖，
 # 其 recipe 在 NDK r25b 下 glob() 返回空 -> IndexError 导致编译失败。
@@ -52,6 +52,13 @@ android.allow_backup = True
 #    getdefault('app','icon.filename')，相对 root_dir）。
 #    写成 android.icon 会被**静默忽略**——上一版图标没换就是这个原因。
 icon.filename = app_icon.png
+
+# 启动图（splash）：浅底居中圆角图标 —— 不配的话 p4a 用默认
+# Kivy 黑底 logo，那就是用户说的「加载时显示旧图标」。
+# 键名实测自 buildozer 源码：[app] 段 presplash.filename；
+# 补色键 android.presplash_color 值要带 #。
+presplash.filename = presplash.png
+android.presplash_color = #F2F2F6
 
 # 网络 + 存储权限
 # 下载目标为公共 Downloads/落雪音源：
