@@ -778,11 +778,23 @@ class SearchInput(TextInput):
         except Exception:
             return False
 
+    # LxApp 注入的回调：点输入框时通知外界（用来展开搜索历史面板）。
+    touch_hook = None
+
     def on_touch_down(self, touch):
-        if self.collide_point(*touch.pos) and self.focus and self._keyboard_gone():
-            self.focus = False
-            Clock.schedule_once(lambda *_: setattr(self, "focus", True), 0.05)
-            return True
+        if self.collide_point(*touch.pos):
+            # iOS 行为：搜索框**点一下就出历史**，不依赖 focus 事件——
+            # 已聚焦时再点 focus 不变、回调不触发，光靠 focus 面板永远不再展开
+            hk = getattr(self, "touch_hook", None)
+            if hk is not None:
+                try:
+                    hk()
+                except Exception:
+                    log_exc("search touch_hook")
+            if self.focus and self._keyboard_gone():
+                self.focus = False
+                Clock.schedule_once(lambda *_: setattr(self, "focus", True), 0.05)
+                return True
         return super().on_touch_down(touch)
 
 
@@ -1171,6 +1183,9 @@ class LxApp(App):
         self.btn_search.bind(on_release=self._go_search)
         wrap.add_widget(self.btn_search)
 
+        # 点输入框即展开历史（不依赖 focus；focus 事件只负责染底色和
+        # 失焦后的延迟收起）
+        self.ti_search.touch_hook = self._show_hist
         # 聚焦反馈：胶囊底色淡染成蓝（iOS search field 的高亮方式）+
         # 聚焦时展开搜索历史（App Store 搜索页的做法）
         def _focus(ti, focused):
@@ -1298,10 +1313,16 @@ class LxApp(App):
             self._hist_row.add_widget(chip)
             if getattr(self, "_hist_open", False):
                 # 逐个弹入：从 0.93 缩放回位，每个晚 30ms ——
-                # iOS「最近搜索」展开时的那种涟漪感
+                # iOS「最近搜索」展开时的那种涟漪感。
+                # ⚠ Kivy Animation 的坑（2.8.8 点搜索框闪退的元凶）：
+                #   Animation(..., delay=x) —— delay 不是参数，会被当成
+                #   「给控件设 delay 属性」，启动即 AttributeError；
+                #   而 .start_after() 在本工程装的 2.3.0 上**也不存在**。
+                #   唯一可靠写法：Clock 里延迟 start（和列表 stagger 同款）。
                 chip._press = 1.0
-                Animation(_press=0.0, d=0.5, t=spring_t,
-                          delay=0.03 * i).start(chip)
+                _an = Animation(_press=0.0, d=0.5, t=spring_t)
+                Clock.schedule_once(
+                    lambda *_, a=_an, c=chip: a.start(c), 0.03 * i)
 
     def _chip_tap(self, kw):
         """点历史胶囊：填回搜索框并直接重搜"""
