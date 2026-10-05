@@ -976,6 +976,7 @@ class LxApp(App):
         self.main = BoxLayout(orientation="vertical", size_hint=(1, 1))
         self.main.add_widget(self._build_header())
         self.main.add_widget(self._build_search())
+        self.main.add_widget(self._build_hist())
         self.main.add_widget(self._build_results())
         self.main.add_widget(self._build_footer())
         root.add_widget(self.main)
@@ -1085,7 +1086,7 @@ class LxApp(App):
                                      hint_text_color=C_DIM,
                                      cursor_color=C_ACCENT,
                                      cursor_width=dp(2), **self.F)
-        self.ti_search.bind(on_text_validate=self.do_search)
+        self.ti_search.bind(on_text_validate=self._go_search)
         self.ti_box.add_widget(self.ti_search)
         wrap.add_widget(self.ti_box)
 
@@ -1095,16 +1096,172 @@ class LxApp(App):
                                        size=(dp(78), dp(44)),
                                        bg_color=C_ACCENT, pill=True, shadow=True,
                                        color=C_WHITE, **self.F)
-        self.btn_search.bind(on_release=self.do_search)
+        self.btn_search.bind(on_release=self._go_search)
         wrap.add_widget(self.btn_search)
 
-        # 聚焦反馈：胶囊底色淡染成蓝（iOS search field 的高亮方式）
+        # 聚焦反馈：胶囊底色淡染成蓝（iOS search field 的高亮方式）+
+        # 聚焦时展开搜索历史（App Store 搜索页的做法）
         def _focus(ti, focused):
             c = getattr(self.ti_box, "_att_bg_c", None)
             if c is not None:
                 c.rgba = (0.855, 0.905, 1.0, 1) if focused else C_CTRL
+            if focused:
+                self._show_hist()
+            else:
+                # 延迟收起：点胶囊会先让输入框失焦，立刻收就点不到胶囊了
+                Clock.schedule_once(lambda *_: (
+                    self._hide_hist() if not ti.focus else None), 0.18)
         self.ti_search.bind(focus=_focus)
         return wrap
+
+    # ---------- 搜索历史 ----------
+    # 只存关键词、只走 UI 入口：do_search / _search_work 一字未动
+    HIST_MAX = 20
+
+    def _hist_path(self):
+        return os.path.join(appenv.APP_DIR, "search_history.json")
+
+    def _load_history(self):
+        if getattr(self, "_history", None) is not None:
+            return self._history
+        self._history = []
+        try:
+            with open(self._hist_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, list):
+                self._history = [str(x) for x in d][:self.HIST_MAX]
+        except Exception:
+            pass
+        return self._history
+
+    def _save_history(self):
+        try:
+            with open(self._hist_path(), "w", encoding="utf-8") as f:
+                json.dump(self._history[:self.HIST_MAX], f, ensure_ascii=False)
+        except Exception:
+            log_exc("保存搜索历史")
+
+    def _add_history(self, kw):
+        kw = (kw or "").strip()
+        if not kw:
+            return
+        h = self._load_history()
+        if kw in h:
+            h.remove(kw)          # 搜过的挪到最前（iOS 最近搜索的排序）
+        h.insert(0, kw)
+        del h[self.HIST_MAX:]
+        self._save_history()
+        self._rebuild_chips()
+
+    def _clear_history(self, *_):
+        try:
+            vibrate(8)
+            self._history = []
+            self._save_history()
+            self._rebuild_chips()
+        except Exception:
+            log_exc("_clear_history")
+
+    def _go_search(self, *_):
+        """搜索按钮 / 回车的新入口：先记历史，再转原始逻辑 do_search"""
+        kw = (self.ti_search.text or "").strip()
+        if kw:
+            self._add_history(kw)
+            self._hide_hist()
+        self.do_search()
+
+    def _build_hist(self):
+        """历史面板：组标题行（左「搜索历史」右「清除」）+ 胶囊横滑行。
+        默认高度 0 收起；聚焦搜索框时弹簧展开（iOS 搜索页的下推动作）。"""
+        box = BoxLayout(orientation="vertical", size_hint_y=None, height=0,
+                        padding=(dp(16), dp(2), dp(16), dp(4)), spacing=dp(6))
+        head = BoxLayout(size_hint_y=None, height=dp(24))
+        lb = Label(text="搜索历史", font_size=dp(13), color=C_DIM, bold=True,
+                   halign="left", valign="middle", **self.F)
+        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        head.add_widget(lb)
+        head.add_widget(Widget())
+        clr = FlatButton(text="清除", size_hint=(None, None), size=(dp(56), dp(24)),
+                         font_size=dp(13), color=C_ERR, bg_color=(0, 0, 0, 0),
+                         pos_hint={"center_y": 0.5}, **self.F)
+        clr.bind(on_release=self._clear_history)
+        head.add_widget(clr)
+        box.add_widget(head)
+        self._hist_sv = ScrollView(do_scroll_y=False, size_hint_y=None, height=dp(34))
+        self._hist_row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(8),
+                                   padding=(0, 0))
+        self._hist_row.bind(minimum_width=self._hist_row.setter("width"))
+        self._hist_sv.add_widget(self._hist_row)
+        box.add_widget(self._hist_sv)
+        self._hist_box = box
+        self._hist_open = False
+        self._rebuild_chips()
+        return box
+
+    def _rebuild_chips(self):
+        if getattr(self, "_hist_row", None) is None:
+            return                       # build() 早期被调时容错
+        self._hist_row.clear_widgets()
+        h = self._load_history()
+        if not h:
+            tip = Label(text="还没有搜索记录，搜过的歌名会出现在这里",
+                        size_hint_x=None, width=dp(300), font_size=dp(12),
+                        color=C_FAINT, halign="left", valign="middle", **self.F)
+            tip.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+            self._hist_row.add_widget(tip)
+            return
+        from kivy.core.text import Label as CoreLabel
+        for kw in h[:10]:               # 一屏胶囊最多 10 个，横向可滑
+            try:
+                lb = CoreLabel(text=kw, font_size=dp(13), **self.F)
+                lb.refresh()
+                w = min(dp(220), lb.texture_size[0] + dp(26))
+            except Exception:
+                w = dp(26) + dp(13) * len(kw)
+            chip = SpringButton(text=kw, font_size=dp(13),
+                                size_hint=(None, None), size=(w, dp(34)),
+                                bg_color=C_CTRL, color=C_TEXT, pill=True,
+                                pos_hint={"center_y": 0.5}, **self.F)
+            chip.bind(on_release=lambda b, k=kw: self._chip_tap(k))
+            self._hist_row.add_widget(chip)
+
+    def _chip_tap(self, kw):
+        """点历史胶囊：填回搜索框并直接重搜"""
+        try:
+            vibrate(8)
+            self.ti_search.text = kw
+            self._add_history(kw)
+            self._hide_hist()
+            self._go_search()
+        except Exception:
+            log_exc("_chip_tap")
+
+    def _show_hist(self, *_):
+        try:
+            if getattr(self, "_hist_open", False):
+                return
+            self._hist_open = True
+            self._rebuild_chips()
+            self._hist_box.opacity = 0.0
+            Animation(height=dp(96), opacity=1.0, d=0.30,
+                      t=spring_t).start(self._hist_box)
+            # 保险丝：动画没跑起来也落到展开态
+            Clock.schedule_once(
+                lambda *_: setattr(self._hist_box, "height", dp(96)), 0.8)
+        except Exception:
+            log_exc("_show_hist")
+
+    def _hide_hist(self):
+        try:
+            if not getattr(self, "_hist_open", False):
+                return
+            self._hist_open = False
+            Animation(height=0, opacity=0.0, d=0.22,
+                      t="out_cubic").start(self._hist_box)
+            Clock.schedule_once(
+                lambda *_: setattr(self._hist_box, "height", 0), 0.6)
+        except Exception:
+            log_exc("_hide_hist")
 
     # ---- 分组列表小件 ----
     def _group(self):
