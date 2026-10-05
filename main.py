@@ -131,7 +131,9 @@ def spring_t(p):
         return 0.0
     if p >= 1.0:
         return 1.0
-    return 1.0 - math.exp(-5.8 * p) * math.cos(7.2 * p)
+    # 欠阻尼弹簧：冲过终点约 8~10% 再摆回来（衰减 6.2 / 频率 10.4，
+    # 约一个半周期收敛；f(1)≈0.999 的收尾差由各处「保险丝」补成精确值）。
+    return 1.0 - math.exp(-6.2 * p) * math.cos(10.4 * p)
 
 
 # ============================================================
@@ -197,6 +199,7 @@ def attach_shadow(widget, spread=None, alpha=0.13, squash=0.55):
 
     widget.bind(pos=_sync, size=_sync)
     _sync(widget)
+    Clock.schedule_once(lambda *_: _sync(widget), 0)  # 首帧布局后再校准
     widget._shadow_rect = rect
     widget._shadow_color = c
     return widget
@@ -307,6 +310,7 @@ def attach_border(widget, radius=R_MD, color=None, width=1.0):
 
     widget.bind(pos=_sync, size=_sync)
     _sync(widget)
+    Clock.schedule_once(lambda *_: _sync(widget), 0)   # 首帧布局后校准
     # 保持引用，防止被 GC
     widget._border_line = line
     widget._border_color = c
@@ -330,6 +334,7 @@ def attach_glow(widget, color=None, spread=None, alpha=0.30):
 
     widget.bind(pos=_sync, size=_sync)
     _sync(widget)
+    Clock.schedule_once(lambda *_: _sync(widget), 0)  # 首帧布局后再校准
     widget._glow_rect = rect
     widget._glow_color = c
     return widget
@@ -377,6 +382,13 @@ class CNDropdown(DropDown):
         kw.setdefault("max_height", dp(320))
         kw.setdefault("bar_width", 0)          # 隐藏滚动条，靠留白区分
         super().__init__(**kw)
+        # 淡入：DropDown 挂上窗口即出现，从 0.6 起（万一动画没跑也基本可见）
+        try:
+            self.opacity = 0.6
+            Animation(opacity=1.0, d=0.16, t="out_quad").start(self)
+            Clock.schedule_once(lambda *_: setattr(self, "opacity", 1.0), 0.6)
+        except Exception:
+            pass
         try:
             c = self.container
             if c is not None:
@@ -511,21 +523,37 @@ class FlatButton(Button):
 
 
 class SpringButton(FlatButton):
-    """按下去整块「吸」小一点，松手弹簧回位 —— UIKit button 的手感。
+    """真·iOS Q弹：**整个控件**（底、文字、图标）一起缩小再弹簧回位。
 
-    Kivy 的 Widget 没有 scale 变换（那得用 PushMatrix 改 canvas 矩阵），
-    所以这里动画的是**背景形状的内缩比例**：视觉上缩小了，但控件本身的
-    布局尺寸不动 —— 否则会和 BoxLayout 的排布打架。
-
-    回弹用阻尼弹簧（spring_t），比 out_back 的过冲更收敛、更像苹果。
+    旧版只缩背景形状 —— 字和图标不动，弹起来像「壳在抖」，发僵。
+    矩阵做法：canvas.before 最前插 PushMatrix+Translate+Scale，
+    canvas.after 末尾 PopMatrix；布局尺寸全程不动（Scale 只改绘制矩阵，
+    不和 BoxLayout 打架）。围绕中心缩放 = T(c(1-s))·S(s)：
+    p' = s·p + c(1-s) = c + s·(p−c) ✓
     """
-    press_scale = NumericProperty(0.965)
+    press_scale = NumericProperty(0.93)
     _press = NumericProperty(0.0)      # 0=常态 1=完全按下
 
     def __init__(self, **kw):
         self._haptic = kw.pop("haptic", True)
-        super().__init__(**kw)
-        self.bind(state=self._on_state, _press=self._sync)
+        super().__init__(**kw)         # FlatButton 先把背景画进 canvas.before
+        from kivy.graphics import (PopMatrix, PushMatrix, Scale, Translate)
+        self._mt_push = PushMatrix()
+        self._mt_tr = Translate(0, 0, 0)
+        self._mt_scale = Scale(1, 1, 1)
+        self._mt_pop = PopMatrix()
+        cb = self.canvas.before        # insert(0)：矩阵要排在背景图元**之前**
+        cb.insert(0, self._mt_scale)
+        cb.insert(0, self._mt_tr)
+        cb.insert(0, self._mt_push)
+        self.canvas.after.add(self._mt_pop)
+        self.bind(state=self._on_state, _press=self._sync,
+                  pos=self._sync, size=self._sync)
+        # ⚠ 保险丝（和全局动画同一方法论）：KV 会在构造期间就画第一帧，
+        # 那时 pos/size 还是布局前默认值（100x100@0,0）—— 矩阵按错的中心
+        # 缩放过一次，静态场景之后不重画，按钮就永久错位缩小（实测丢在角落）。
+        # 布局完成后强制把矩阵写回正确值。
+        Clock.schedule_once(self._sync, 0)
 
     def _on_state(self, *_):
         down = self.state == "down"
@@ -533,19 +561,27 @@ class SpringButton(FlatButton):
             vibrate(8)
         Animation(
             _press=1.0 if down else 0.0,
-            duration=0.10 if down else 0.45,
+            duration=0.09 if down else 0.52,
             t="out_quad" if down else spring_t,
         ).start(self)
 
     def _sync(self, *_):
-        shape = getattr(self, "_grad_shape", None) or getattr(self, "_bg_shape", None)
-        if shape is None:
+        FlatButton._sync(self)          # ⚠ 先让背景形状跟随 pos/size ——
+        # 这里覆盖了 FlatButton._sync，忘了转调用就会把「形状跟随布局」
+        # 的责任吞掉：按钮永远画在布局前的默认 100x100 处（实测缩在角落）。
+        sc = getattr(self, "_mt_scale", None)
+        tr = getattr(self, "_mt_tr", None)
+        if sc is None or tr is None:
             return
-        grow = 1.0 - self._press * (1.0 - self.press_scale)
-        w, h = self.width * grow, self.height * grow
-        shape.pos = (self.x + (self.width - w) / 2.0,
-                     self.y + (self.height - h) / 2.0)
-        shape.size = (w, h)
+        s = 1.0 - self._press * (1.0 - self.press_scale)
+        sc.x = sc.y = sc.z = s
+        cx = self.x + self.width / 2.0
+        cy = self.y + self.height / 2.0
+        tr.xyz = (cx * (1.0 - s), cy * (1.0 - s), 0)
+        try:
+            self.canvas.ask_update()
+        except Exception:
+            pass
 
 
 def icon_parts(kind, w, h, ox=0.0, oy=0.0, unit=1.0):
@@ -667,6 +703,13 @@ def draw_icon(widget, kind, color=None, size=None):
             grp.add(widget._icon_body)
             grp.add(PopMatrix())
             widget.canvas.after.add(grp)
+            # SpringButton 的「大弹」pop 挂在 canvas.after 末尾；图标组比它晚加，
+            # 必须把 pop 重新挪到最后 —— 否则图标落在 pop 之后不参与缩放，
+            # 弹起来壳动图标不动，就是「乱」。
+            big_pop = getattr(widget, "_mt_pop", None)
+            if big_pop is not None and big_pop in widget.canvas.after.children:
+                widget.canvas.after.remove(big_pop)
+                widget.canvas.after.add(big_pop)
         else:
             widget._icon_tr.xyz = (widget.x, widget.y, 0)
         key = _geom_key()
@@ -737,6 +780,28 @@ class SearchInput(TextInput):
             Clock.schedule_once(lambda *_: setattr(self, "focus", True), 0.05)
             return True
         return super().on_touch_down(touch)
+
+
+class VCenter(FloatLayout):
+    """把一个固定高度的控件**垂直居中**在给定行高里。
+
+    Kivy 的 BoxLayout 交叉轴不会居中固定尺寸的子控件（贴内容底边），
+    且 BoxLayout 里 pos_hint 被**无视** —— 图标钮比行矮一点点就会
+    「偏一点点」（用户反复说的强迫症问题，头部/播放条/列表行都中招）。
+    套一层 FloatLayout 让 pos_hint 生效即可。
+    """
+
+    def __init__(self, inner, w=None, h=None, **kw):
+        if h is None:
+            h = inner.height or dp(44)
+        kw.setdefault("size_hint_y", None)
+        kw.setdefault("height", h)
+        if w is not None:
+            kw.setdefault("size_hint_x", None)
+            kw.setdefault("width", w)
+        super().__init__(**kw)
+        inner.pos_hint = {"center_x": 0.5, "center_y": 0.5}
+        self.add_widget(inner)
 
 
 class Scrim(Widget):
@@ -878,15 +943,14 @@ class ProgressCapsule(ProgressBar):
         self._fl.size = (max(h, self.width * f), h)
 
 
-class PlayButton(FlatButton):
+class PlayButton(SpringButton):
     """圆形播放键：只显示图标，图标跟随按钮文字（播放/暂停）自动切换。
 
     编排代码在播放/暂停/出错/结束时一律用 `btn_play.text = "暂停"/"播放"`
     同步状态 —— 这是它的「逻辑接口」，不能动；这个控件把文本翻译成图形，
     文字本身压成透明，观感就是 Apple Music 底部那个蓝色圆钮。
+    图标切换的瞬间补一发弹簧脉冲（morph 感：状态一变，钮「活」一下）。
     """
-
-    _p = NumericProperty(0.0)          # 0=常态 1=完全按下
 
     def __init__(self, dia=None, **kw):
         if dia is None:
@@ -895,39 +959,22 @@ class PlayButton(FlatButton):
             kw.setdefault(k, v)        # text 是状态载体，字体照样要带（防方块）
         kw.setdefault("size_hint", (None, None))
         kw.setdefault("size", (dia, dia))
-        kw.setdefault("pos_hint", {"center_y": 0.5})
         kw.setdefault("bg_color", C_ACCENT)
         kw.setdefault("color", (0, 0, 0, 0))
         kw.setdefault("halign", "center")
         kw["pill"] = True
-        FlatButton.__init__(self, **kw)
-        self.bind(state=self._press_state, text=self._sync_icon)
+        super().__init__(**kw)
+        self.bind(text=self._sync_icon)
         draw_icon(self, "play", color=C_WHITE)
         self._sync_icon()
-
-    # 复用 SpringButton 的按压感 —— 直接挂同样两套动画
-    def _press_state(self, *_):
-        down = self.state == "down"
-        if down:
-            vibrate(8)
-        Animation(_p=1.0 if down else 0.0, duration=0.10 if down else 0.42,
-                  t="out_quad" if down else spring_t).start(self)
-
-    def on__p(self, *_):
-        shape = getattr(self, "_bg_shape", None)
-        if shape is None:
-            return
-        grow = 1.0 - self._p * 0.045
-        w, h = self.width * grow, self.height * grow
-        shape.pos = (self.x + (self.width - w) / 2.0,
-                     self.y + (self.height - h) / 2.0)
-        shape.size = (w, h)
 
     def _sync_icon(self, *_):
         want = "pause" if (self.text or "") == "暂停" else "play"
         if want != getattr(self, "_icon_kind", "play"):
             self._icon_kind = want
             self._icon_redraw()
+            self._press = 0.5          # 小弹一下：图标形变瞬间的「活着」感
+            Animation(_press=0.0, d=0.52, t=spring_t).start(self)
 
 
 # ============================================================
@@ -974,6 +1021,19 @@ class LxApp(App):
 
         # 主内容（大标题 / 搜索胶囊 / 分组列表 / 迷你播放器）
         self.main = BoxLayout(orientation="vertical", size_hint=(1, 1))
+        # 抽屉打开时主内容**缩到后方**（iOS：presentation 背后的视图
+        # scale 0.965 + 变暗）。矩阵挂在 main 自己的 canvas 两端，
+        # before/after 目前没人用，整组独占、顺序安全。
+        from kivy.graphics import (PopMatrix as _PoP, PushMatrix as _PuS,
+                                   Scale as _Sca, Translate as _Tra)
+        self._main_push = _PuS()
+        self._main_tr = _Tra(0, 0, 0)
+        self._main_scale = _Sca(1, 1, 1)
+        self._main_pop = _PoP()
+        self.main.canvas.before.add(self._main_push)
+        self.main.canvas.before.add(self._main_tr)
+        self.main.canvas.before.add(self._main_scale)
+        self.main.canvas.after.add(self._main_pop)
         self.main.add_widget(self._build_header())
         self.main.add_widget(self._build_search())
         self.main.add_widget(self._build_hist())
@@ -1056,7 +1116,7 @@ class LxApp(App):
         self.btn_set = IconButton("settings", dia=dp(42), icon_color=C_DIM,
                                   shadow=True)
         self.btn_set.bind(on_release=lambda *_: self.open_settings())
-        row.add_widget(self.btn_set)
+        row.add_widget(VCenter(self.btn_set, w=dp(46), h=dp(46)))
         box.add_widget(row)
         self.lbl_sub = Label(text="", size_hint_y=None, height=dp(22),
                              font_size=dp(12), color=C_FAINT,
@@ -1067,8 +1127,8 @@ class LxApp(App):
 
     def _build_search(self):
         """搜索条：iOS 胶囊输入（聚焦染蓝）+ 系统蓝胶囊按钮"""
-        wrap = BoxLayout(size_hint_y=None, height=dp(58),
-                         padding=(dp(16), dp(2), dp(16), dp(8)), spacing=dp(10))
+        wrap = BoxLayout(size_hint_y=None, height=dp(56),
+                         padding=(dp(16), dp(6), dp(16), dp(6)), spacing=dp(10))
 
         # 输入框是 secondarySystemFill 胶囊，放大镜画在它左内侧
         self.ti_box = BoxLayout(size_hint_y=None, height=dp(44))
@@ -1211,7 +1271,7 @@ class LxApp(App):
             self._hist_row.add_widget(tip)
             return
         from kivy.core.text import Label as CoreLabel
-        for kw in h[:10]:               # 一屏胶囊最多 10 个，横向可滑
+        for i, kw in enumerate(h[:10]):   # 一屏胶囊最多 10 个，横向可滑
             try:
                 lb = CoreLabel(text=kw, font_size=dp(13), **self.F)
                 lb.refresh()
@@ -1224,6 +1284,12 @@ class LxApp(App):
                                 pos_hint={"center_y": 0.5}, **self.F)
             chip.bind(on_release=lambda b, k=kw: self._chip_tap(k))
             self._hist_row.add_widget(chip)
+            if getattr(self, "_hist_open", False):
+                # 逐个弹入：从 0.93 缩放回位，每个晚 30ms ——
+                # iOS「最近搜索」展开时的那种涟漪感
+                chip._press = 1.0
+                Animation(_press=0.0, d=0.5, t=spring_t,
+                          delay=0.03 * i).start(chip)
 
     def _chip_tap(self, kw):
         """点历史胶囊：填回搜索框并直接重搜"""
@@ -1377,16 +1443,19 @@ class LxApp(App):
         return panel
 
     def _sheet_head(self):
-        """抽屉顶部：居中抓取条（iOS detents 的小胶囊）+ 右侧关闭圆钮"""
-        row = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8))
-        row.add_widget(Widget())
+        """抽屉顶部：居中抓取条（iOS detents 的小胶囊）+ 右侧关闭圆钮。
+
+        用 FloatLayout：BoxLayout 里抓取条(5px)和关闭钮(34px)都贴底，
+        中心线差 14px —— 「偏一点点」的重灾区。FloatLayout 才认 pos_hint。
+        """
+        row = FloatLayout(size_hint_y=None, height=dp(44))
         g = Widget(size_hint=(None, None), size=(dp(36), dp(5)),
-                   pos_hint={"center_y": 0.5})
+                   pos_hint={"center_x": 0.5, "center_y": 0.5})
         attach_bg(g, (0.78, 0.78, 0.80, 1), radius="pill")
         row.add_widget(g)
-        row.add_widget(Widget())
         btn = IconButton("close", dia=dp(34), icon_color=C_DIM,
                          bg=(0.914, 0.914, 0.925, 1))
+        btn.pos_hint = {"right": 1.0, "center_y": 0.5}
         btn.bind(on_release=lambda *_: self.close_settings())
         row.add_widget(btn)
         return row
@@ -1461,12 +1530,12 @@ class LxApp(App):
         prow = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
         self.btn_play = PlayButton(text="播放", dia=dp(50))
         self.btn_play.bind(on_release=lambda *_: self.toggle_play())
-        prow.add_widget(self.btn_play)
+        prow.add_widget(VCenter(self.btn_play, w=dp(52), h=dp(52)))
 
         self.slider = SeekBar(min=0, max=1000, value=0, step=1)
         self.slider.bind(on_touch_down=self._seek_down,
                          on_touch_up=self._seek_up)
-        prow.add_widget(self.slider)
+        prow.add_widget(VCenter(self.slider, h=dp(52)))
 
         self.lbl_time = Label(text="00:00 / 00:00", size_hint_x=None,
                               width=dp(92), font_size=dp(12), color=C_DIM,
@@ -1508,6 +1577,9 @@ class LxApp(App):
         text = str(text)
 
         def _set(*_):
+            if self.status.text != text:      # 文本变了才淡入（进度高频刷新不闪）
+                self.status.opacity = 0.4
+                Animation(opacity=1.0, d=0.18, t="out_quad").start(self.status)
             self.status.text = text
             if color:
                 self.status.color = color
@@ -1671,11 +1743,35 @@ class LxApp(App):
             vibrate(10)
             Animation(y=0, d=0.5, t=spring_t).start(self.sheet)
             Animation(_scrim_a=0.34, d=0.30, t="out_quad").start(self)
+            self._main_zoom(0.965)
             # 保险丝：动画没跑起来也要落到最终位置，否则抽屉卡在半开
             Clock.schedule_once(
                 lambda *_: setattr(self.sheet, "y", 0), 1.0)
         except Exception:
             log_exc("open_settings")
+
+    def _main_zoom(self, s):
+        """主内容围绕屏幕中心缩放到 s（配 translate 保持锚点在中心）"""
+        try:
+            cx = self.main.x + self.main.width / 2.0
+            cy = self.main.y + self.main.height / 2.0
+            d = 0.45 if s < 1.0 else 0.34
+            t = spring_t if s < 1.0 else "out_cubic"
+            Animation(x=s, y=s, z=s, d=d, t=t).start(self._main_scale)
+            Animation(x=cx * (1 - s), y=cy * (1 - s), z=0, d=d, t=t).start(self._main_tr)
+            Clock.schedule_once(lambda *_: self._main_settle(s), d + 0.4)
+        except Exception:
+            log_exc("main_zoom")
+
+    def _main_settle(self, s):
+        """保险丝：动画没跑起来也把矩阵写到最终值（矩阵停在半路 = 全局错位）"""
+        try:
+            self._main_scale.x = self._main_scale.y = self._main_scale.z = s
+            cx = self.main.x + self.main.width / 2.0
+            cy = self.main.y + self.main.height / 2.0
+            self._main_tr.xyz = (cx * (1 - s), cy * (1 - s), 0)
+        except Exception:
+            pass
 
     def close_settings(self, *_):
         try:
@@ -1684,6 +1780,7 @@ class LxApp(App):
             self._sheet_open = False
             Animation(y=-self._sheet_h, d=0.34, t="out_cubic").start(self.sheet)
             Animation(_scrim_a=0.0, d=0.30, t="out_quad").start(self)
+            self._main_zoom(1.0)
             Clock.schedule_once(
                 lambda *_: setattr(self.sheet, "y", -self._sheet_h), 0.8)
         except Exception:
@@ -1978,7 +2075,7 @@ class LxApp(App):
 
         self.hint.text = "点歌名直接播放，点右侧下载（共 %d 首）" % len(self.songs)
         # 只给前几首做入场动效：几百首全做会明显卡，而且看不到那么远
-        STAGGER = 9
+        STAGGER = 10
         for i, s in enumerate(self.songs):
             row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(4),
                             padding=(0, 0, dp(16), 0))
@@ -1987,9 +2084,10 @@ class LxApp(App):
                 text="%s\n%s · %s" % (s["name"], s["singer"],
                                        s.get("interval") or "--:--"),
                 halign="left", valign="middle", font_size=dp(15),
-                color=C_TEXT, bg_color=C_ITEM, radius=0, **self.F)
+                color=C_TEXT, bg_color=C_ITEM, radius=0,
+                padding=(dp(16), dp(6)), **self.F)
             song_btn.bind(size=lambda b, v: setattr(b, "text_size",
-                                                    (v[0] - dp(28), None)))
+                                                    (v[0] - dp(32), None)))
             song_btn.bind(on_release=lambda b, idx=i: self.play_song(idx))
             row.add_widget(song_btn)
             row._song_btn = song_btn
@@ -1998,19 +2096,19 @@ class LxApp(App):
                             icon_color=C_ACCENT,
                             bg=(0.926, 0.953, 1.0, 1))
             dl.bind(on_release=lambda b, idx=i: self.download_song(idx))
-            row.add_widget(dl)
-            # inset 24 = 和歌名文字起点对齐（行左缘 + btn 内边距 + 字距实测 ≈24）
-            attach_sep(row, inset=dp(24))
+            row.add_widget(VCenter(dl, w=dp(58), h=dp(64)))
+            # inset 16 = 和歌名文字起点对齐（song_btn 左内衬同为 16dp）
+            attach_sep(row, inset=dp(16))
             self.results.add_widget(row)
 
             if i < STAGGER:
                 # 错峰进场：淡入 + 高度弹簧展开，列表像「长」出来而不是一次砸下来
                 row.opacity = 0.0
                 row.height = dp(18)
-                anim = Animation(opacity=1.0, height=dp(64), duration=0.34,
+                anim = Animation(opacity=1.0, height=dp(64), duration=0.42,
                                  t=spring_t)
                 Clock.schedule_once(
-                    lambda *_, r=row, a=anim: a.start(r), 0.026 * i)
+                    lambda *_, r=row, a=anim: a.start(r), 0.036 * i)
 
         # 首/末行底色跟着分组卡做圆角 —— 直角白行会顶穿卡片的圆角
         kids = list(reversed(self.results.children))   # children 是逆序
@@ -2036,7 +2134,7 @@ class LxApp(App):
                 except Exception:
                     log_exc("列表入场收尾")
             Clock.schedule_once(
-                _settle, 0.026 * min(len(self.songs), STAGGER) + 0.7)
+                _settle, 0.036 * min(len(self.songs), STAGGER) + 0.7)
 
         self.set_status("找到 %d 首：点歌名播放，点「下载」保存" % len(self.songs))
 
