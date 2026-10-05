@@ -1273,17 +1273,26 @@ class LxApp(App):
                          pos_hint={"center_y": 0.5}, **self.F)
         clr.bind(on_release=self._clear_history)
         head.add_widget(clr)
-        box.add_widget(head)
         self._hist_sv = ScrollView(do_scroll_y=False, size_hint_y=None, height=dp(34))
         self._hist_row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(8),
                                    padding=(0, 0))
         self._hist_row.bind(minimum_width=self._hist_row.setter("width"))
         self._hist_sv.add_widget(self._hist_row)
-        box.add_widget(self._hist_sv)
+        # ⚠ Kivy 的布局容器**不会裁剪**子控件：高度 0 的面板里，标题行(24dp)
+        # 和胶囊条(34dp)照样画出来、照样收触摸 —— 首屏「搜索框和历史叠在一起」、
+        # 搜过一次后「搜索框点不动」（被收起面板的幽灵区域抢走点击）都是它。
+        # 正确做法：**收起 = 内容摘除**。展开时挂回来，收起动画结束即摘掉。
+        self._hist_parts = (head, self._hist_sv)
         self._hist_box = box
         self._hist_open = False
         self._rebuild_chips()
         return box
+
+    def _hist_attach_parts(self):
+        box = self._hist_box
+        if not box.children:
+            for w in self._hist_parts:
+                box.add_widget(w)
 
     def _rebuild_chips(self):
         if getattr(self, "_hist_row", None) is None:
@@ -1341,6 +1350,7 @@ class LxApp(App):
                 return
             self._hist_open = True
             self._rebuild_chips()
+            self._hist_attach_parts()
             self._hist_box.opacity = 0.0
             Animation(height=dp(96), opacity=1.0, d=0.30,
                       t=spring_t).start(self._hist_box)
@@ -1355,8 +1365,12 @@ class LxApp(App):
             log_exc("_show_hist")
 
     def _hist_fuse(self, h, gen):
-        if getattr(self, "_hist_gen", 0) == gen:
-            self._hist_box.height = h
+        if getattr(self, "_hist_gen", 0) != gen:
+            return
+        self._hist_box.height = h
+        if h == 0:
+            # 收起完成：摘除内容（不裁剪就会叠在搜索框上，还会抢点击）
+            self._hist_box.clear_widgets()
 
     def _hide_hist(self):
         try:
@@ -1384,6 +1398,16 @@ class LxApp(App):
         """分组卡里的一行单元格：左标题 + 右控件（+ 行尾 ›），底部发丝线"""
         row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8),
                         padding=(dp(14), 0))
+        attach_bg(row, C_CARD)   # 白底=按压高亮基色（卡上不可见）
+
+        def _hl(w, st):
+            c = getattr(row, "_att_bg_c", None)
+            if c is not None:
+                c.rgba = (0.905, 0.905, 0.918, 1) if st == "down" else C_CARD
+        try:
+            ctrl.bind(state=_hl)   # iOS 单元格按压反馈：整行轻灰
+        except Exception:
+            pass
         lb = Label(text=label, font_size=dp(15), color=C_TEXT,
                    halign="left", valign="middle", size_hint_x=None,
                    width=dp(84), **self.F)
