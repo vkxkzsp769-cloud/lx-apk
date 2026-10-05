@@ -578,10 +578,14 @@ class SpringButton(FlatButton):
         cx = self.x + self.width / 2.0
         cy = self.y + self.height / 2.0
         tr.xyz = (cx * (1.0 - s), cy * (1.0 - s), 0)
-        try:
-            self.canvas.ask_update()
-        except Exception:
-            pass
+        # 只在按压动画进行中请求重绘：布局/滚动引起的 pos/size 变化
+        # （s 恒为 1）不新增任何重绘 —— 否则 300 行列表每帧几百个
+        # ask_update = 重绘风暴，手机上就是「卡到闪退」（2.8.7 实测）。
+        if s != 1.0:
+            try:
+                self.canvas.ask_update()
+            except Exception:
+                pass
 
 
 def icon_parts(kind, w, h, ox=0.0, oy=0.0, unit=1.0):
@@ -984,6 +988,8 @@ class LxApp(App):
     title = "落雪音源下载器"
     # 模态遮罩的不透明度（动画驱动，Scrim 图元的 alpha 跟着它走）
     _scrim_a = NumericProperty(0.0)
+    # 抽屉打开时主内容的缩放因子（观察者成对驱动 Scale+Translate）
+    _main_zoom_f = NumericProperty(1.0)
 
     def on__scrim_a(self, *_):
         c = getattr(self, "_scrim_c", None)
@@ -1034,6 +1040,12 @@ class LxApp(App):
         self.main.canvas.before.add(self._main_tr)
         self.main.canvas.before.add(self._main_scale)
         self.main.canvas.after.add(self._main_pop)
+        # ⚠ Kivy 的 Translate 只有 tx/ty/tz（xyz 别名），**没有** x/y/z 属性；
+        # Scale 才有 x/y/z。直接 Animation(x=.., y=..).start(translate对象)
+        # 会安静地设上三个废属性（真属性纹丝不动）→ 缩放绕屏幕左下角、
+        # 主内容和标题「叠在一起」（2.8.7 真机事故）。
+        # 正确姿势：只动画一个自定义 NumericProperty，观察者里把
+        # scale 和 translate **成对**写好 —— 一处更新，也省掉每帧双动画。
         self.main.add_widget(self._build_header())
         self.main.add_widget(self._build_search())
         self.main.add_widget(self._build_hist())
@@ -1311,11 +1323,19 @@ class LxApp(App):
             self._hist_box.opacity = 0.0
             Animation(height=dp(96), opacity=1.0, d=0.30,
                       t=spring_t).start(self._hist_box)
-            # 保险丝：动画没跑起来也落到展开态
+            # 保险丝带世代号：快速「展开→收起」时，旧的展开保险丝必须作废，
+            # 否则它会晚半步到达、把已经收起的面板又撑开（2.8.7 现象：
+            # 「不点搜索框历史也叠在那」）。
+            self._hist_gen = getattr(self, "_hist_gen", 0) + 1
+            g = self._hist_gen
             Clock.schedule_once(
-                lambda *_: setattr(self._hist_box, "height", dp(96)), 0.8)
+                lambda *_: self._hist_fuse(dp(96), g), 0.8)
         except Exception:
             log_exc("_show_hist")
+
+    def _hist_fuse(self, h, gen):
+        if getattr(self, "_hist_gen", 0) == gen:
+            self._hist_box.height = h
 
     def _hide_hist(self):
         try:
@@ -1324,8 +1344,9 @@ class LxApp(App):
             self._hist_open = False
             Animation(height=0, opacity=0.0, d=0.22,
                       t="out_cubic").start(self._hist_box)
-            Clock.schedule_once(
-                lambda *_: setattr(self._hist_box, "height", 0), 0.6)
+            self._hist_gen = getattr(self, "_hist_gen", 0) + 1
+            g = self._hist_gen
+            Clock.schedule_once(lambda *_: self._hist_fuse(0, g), 0.6)
         except Exception:
             log_exc("_hide_hist")
 
@@ -1744,32 +1765,48 @@ class LxApp(App):
             Animation(y=0, d=0.5, t=spring_t).start(self.sheet)
             Animation(_scrim_a=0.34, d=0.30, t="out_quad").start(self)
             self._main_zoom(0.965)
-            # 保险丝：动画没跑起来也要落到最终位置，否则抽屉卡在半开
-            Clock.schedule_once(
-                lambda *_: setattr(self.sheet, "y", 0), 1.0)
+            # 保险丝带世代号（同 hist）：旧的一次保险丝不能推翻新状态
+            self._sheet_gen = getattr(self, "_sheet_gen", 0) + 1
+            g = self._sheet_gen
+            Clock.schedule_once(lambda *_: self._sheet_fuse(0, g), 1.0)
         except Exception:
             log_exc("open_settings")
 
+    def _sheet_fuse(self, y, gen):
+        if getattr(self, "_sheet_gen", 0) == gen:
+            self.sheet.y = y
+
     def _main_zoom(self, s):
-        """主内容围绕屏幕中心缩放到 s（配 translate 保持锚点在中心）"""
+        """主内容围绕屏幕中心缩放到 s（动画只驱动 _main_zoom_f 一个属性）"""
         try:
-            cx = self.main.x + self.main.width / 2.0
-            cy = self.main.y + self.main.height / 2.0
             d = 0.45 if s < 1.0 else 0.34
             t = spring_t if s < 1.0 else "out_cubic"
-            Animation(x=s, y=s, z=s, d=d, t=t).start(self._main_scale)
-            Animation(x=cx * (1 - s), y=cy * (1 - s), z=0, d=d, t=t).start(self._main_tr)
-            Clock.schedule_once(lambda *_: self._main_settle(s), d + 0.4)
+            Animation(_main_zoom_f=s, d=d, t=t).start(self)
+            gen = getattr(self, "_main_zoom_gen", 0) + 1
+            self._main_zoom_gen = gen
+            Clock.schedule_once(
+                lambda *_: self._main_settle(s, gen), d + 0.4)
         except Exception:
             log_exc("main_zoom")
 
-    def _main_settle(self, s):
-        """保险丝：动画没跑起来也把矩阵写到最终值（矩阵停在半路 = 全局错位）"""
+    def on__main_zoom_f(self, *_):
+        """缩放因子变了：scale 与 translate 成对写（Translate 只能走 xyz）"""
         try:
+            s = self._main_zoom_f
             self._main_scale.x = self._main_scale.y = self._main_scale.z = s
             cx = self.main.x + self.main.width / 2.0
             cy = self.main.y + self.main.height / 2.0
-            self._main_tr.xyz = (cx * (1 - s), cy * (1 - s), 0)
+            self._main_tr.xyz = (cx * (1.0 - s), cy * (1.0 - s), 0)
+            self.main.canvas.ask_update()
+        except Exception:
+            pass
+
+    def _main_settle(self, s, gen):
+        """保险丝：带世代号 —— 只有最后发起的那次缩放才允许写最终值"""
+        if getattr(self, "_main_zoom_gen", 0) != gen:
+            return
+        try:
+            self._main_zoom_f = s
         except Exception:
             pass
 
@@ -1781,8 +1818,9 @@ class LxApp(App):
             Animation(y=-self._sheet_h, d=0.34, t="out_cubic").start(self.sheet)
             Animation(_scrim_a=0.0, d=0.30, t="out_quad").start(self)
             self._main_zoom(1.0)
-            Clock.schedule_once(
-                lambda *_: setattr(self.sheet, "y", -self._sheet_h), 0.8)
+            self._sheet_gen = getattr(self, "_sheet_gen", 0) + 1
+            g = self._sheet_gen
+            Clock.schedule_once(lambda *_: self._sheet_fuse(-self._sheet_h, g), 0.8)
         except Exception:
             log_exc("close_settings")
     # ---------- 下载目录 ----------
@@ -2065,6 +2103,44 @@ class LxApp(App):
     def _clear_results(self):
         self.results.clear_widgets()
 
+    def _row_of(self, i, s):
+        """建一行搜索结果（iOS 分组卡里的单元格：歌名两行 + 右圆钮 + 发丝线）"""
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(4),
+                        padding=(0, dp(16), 0, 0))
+        # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
+        song_btn = FlatButton(
+            text="%s\n%s · %s" % (s["name"], s["singer"],
+                                   s.get("interval") or "--:--"),
+            halign="left", valign="middle", font_size=dp(15),
+            color=C_TEXT, bg_color=C_ITEM, radius=0,
+            padding=(dp(16), dp(6)), **self.F)
+        song_btn.bind(size=lambda b, v: setattr(b, "text_size",
+                                                (v[0] - dp(32), None)))
+        song_btn.bind(on_release=lambda b, idx=i: self.play_song(idx))
+        row.add_widget(song_btn)
+        row._song_btn = song_btn
+
+        dl = IconButton("download", dia=dp(42),
+                        icon_color=C_ACCENT,
+                        bg=(0.926, 0.953, 1.0, 1))
+        dl.bind(on_release=lambda b, idx=i: self.download_song(idx))
+        row.add_widget(VCenter(dl, w=dp(58), h=dp(64)))
+        attach_sep(row, inset=dp(16))
+        return row, song_btn
+
+    def _finish_rows(self):
+        """首/末行底色跟着分组卡做圆角；最后一行去掉发丝线"""
+        try:
+            kids = list(reversed(self.results.children))   # children 是逆序
+            if kids:
+                kids[0]._song_btn.set_radius([R_LG, R_LG, 0, 0])
+                if len(kids) > 1:
+                    kids[-1]._song_btn.set_radius([0, 0, R_LG, R_LG])
+                    kids[-1]._sep_hidden = True
+                    kids[-1]._sep_rect.size = (0, 0)
+        except Exception:
+            log_exc("列表首末行圆角")
+
     def _show_results(self, songs):
         self.songs = list(songs or [])
         self._clear_results()
@@ -2074,69 +2150,60 @@ class LxApp(App):
             return
 
         self.hint.text = "点歌名直接播放，点右侧下载（共 %d 首）" % len(self.songs)
+        total = len(self.songs)
         # 只给前几首做入场动效：几百首全做会明显卡，而且看不到那么远
         STAGGER = 10
-        for i, s in enumerate(self.songs):
-            row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(4),
-                            padding=(0, 0, dp(16), 0))
-            # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
-            song_btn = FlatButton(
-                text="%s\n%s · %s" % (s["name"], s["singer"],
-                                       s.get("interval") or "--:--"),
-                halign="left", valign="middle", font_size=dp(15),
-                color=C_TEXT, bg_color=C_ITEM, radius=0,
-                padding=(dp(16), dp(6)), **self.F)
-            song_btn.bind(size=lambda b, v: setattr(b, "text_size",
-                                                    (v[0] - dp(32), None)))
-            song_btn.bind(on_release=lambda b, idx=i: self.play_song(idx))
-            row.add_widget(song_btn)
-            row._song_btn = song_btn
+        # 大批量分块填充（iOS 式）：300 首一次性建完要 3 秒+（真机上像卡死），
+        # 首屏先出 36 行，其余每拍 30 行流式补齐 —— 首帧可用提前 ~3 秒。
+        FIRST = 36
+        if total <= FIRST:
+            batches = [list(enumerate(self.songs))]
+        else:
+            batches = [list(enumerate(self.songs[:FIRST]))] + [
+                list(enumerate(self.songs[a:a + 30], start=a))
+                for a in range(FIRST, total, 30)]
 
-            dl = IconButton("download", dia=dp(42),
-                            icon_color=C_ACCENT,
-                            bg=(0.926, 0.953, 1.0, 1))
-            dl.bind(on_release=lambda b, idx=i: self.download_song(idx))
-            row.add_widget(VCenter(dl, w=dp(58), h=dp(64)))
-            # inset 16 = 和歌名文字起点对齐（song_btn 左内衬同为 16dp）
-            attach_sep(row, inset=dp(16))
-            self.results.add_widget(row)
+        def _fill(batch):
+            for i, s in batch:
+                row, _btn = self._row_of(i, s)
+                self.results.add_widget(row)
+                if i < STAGGER:
+                    # 错峰进场：淡入 + 高度弹簧展开，列表像「长」出来
+                    row.opacity = 0.0
+                    row.height = dp(18)
+                    anim = Animation(opacity=1.0, height=dp(64), duration=0.42,
+                                     t=spring_t)
+                    Clock.schedule_once(
+                        lambda *_, r=row, a=anim: a.start(r), 0.036 * i)
 
-            if i < STAGGER:
-                # 错峰进场：淡入 + 高度弹簧展开，列表像「长」出来而不是一次砸下来
-                row.opacity = 0.0
-                row.height = dp(18)
-                anim = Animation(opacity=1.0, height=dp(64), duration=0.42,
-                                 t=spring_t)
-                Clock.schedule_once(
-                    lambda *_, r=row, a=anim: a.start(r), 0.036 * i)
-
-        # 首/末行底色跟着分组卡做圆角 —— 直角白行会顶穿卡片的圆角
-        kids = list(reversed(self.results.children))   # children 是逆序
-        if kids:
+        def _step(k=[0]):
+            """每拍补一批；构建完成再做首末圆角与保险丝收尾"""
             try:
-                kids[0]._song_btn.set_radius([R_LG, R_LG, 0, 0])
-                if len(kids) > 1:
-                    kids[-1]._song_btn.set_radius([0, 0, R_LG, R_LG])
-                kids[-1]._sep_hidden = True            # 最后一行不要发丝线
-                kids[-1]._sep_rect.size = (0, 0)
+                if k[0] >= len(batches):
+                    return
+                _fill(batches[k[0]])
+                k[0] += 1
+                if k[0] < len(batches):
+                    Clock.schedule_once(lambda *_: _step(k), 0)
+                    return
+                self._finish_rows()
+                # 保险丝：入场动画没跑起来的行，到点无条件写回最终态
+                def _settle(*_):
+                    try:
+                        for w in self.results.children:
+                            w.opacity = 1.0
+                            if w.height < dp(64):
+                                w.height = dp(64)
+                    except Exception:
+                        log_exc("列表入场收尾")
+                Clock.schedule_once(
+                    _settle, 0.036 * min(total, STAGGER) + 0.9)
             except Exception:
-                log_exc("列表首末行圆角")
+                log_exc("_step 列表填充")
 
-        # 保险丝：万一入场动画没跑起来，列表会停在全透明/零高度，
-        # 那比没有动效糟得多 —— 到点无条件把最终状态写回去。
-        if self.songs:
-            def _settle(*_):
-                try:
-                    for w in self.results.children:
-                        w.opacity = 1.0
-                        if w.height < dp(64):
-                            w.height = dp(64)
-                except Exception:
-                    log_exc("列表入场收尾")
-            Clock.schedule_once(
-                _settle, 0.036 * min(len(self.songs), STAGGER) + 0.7)
+        _step()
 
-        self.set_status("找到 %d 首：点歌名播放，点「下载」保存" % len(self.songs))
+        self.set_status("找到 %d 首：点歌名播放，点「下载」保存" % total)
 
     # ---------- 列表上的直接操作 ----------
     def play_song(self, idx):
