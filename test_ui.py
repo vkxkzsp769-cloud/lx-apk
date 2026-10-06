@@ -1588,6 +1588,91 @@ def test_no_undefined_names():
     print("  pyflakes 未发现未定义名字 ✓")
 
 
+def test_now_playing():
+    """「正在播放」全屏层：歌词解析 / 频谱数学 / 开合生命周期（桌面模式）。
+    仿字体检查的规矩：每条断言必须**能失败**，不空跑。"""
+    import math as _m
+    import songmedia
+    import visuz as V
+
+    # —— LRC 解析 ——
+    lines = songmedia.parse_lrc(
+        "[00:01.20]第一句\n[ti:标签被跳过]\n[00:05.50]第二句\n"
+        "[01:30.00]副歌 [可含方括号]\n[00:03.00]乱序行")
+    ts = [t for t, _w in lines]
+    assert ts == sorted(ts), "parse_lrc 未按时间升序: %s" % ts
+    assert abs(ts[0] - 1.2) < 0.01, "毫秒换算错: %s" % ts[0]
+    assert all(w for _t, w in lines), "空词行没跳过"
+    assert any("方括号" in w for _t, w in lines), "歌词里的方括号被吞了"
+    assert songmedia.lyric_at(lines, 6.0) >= 1
+    assert songmedia.lyric_at([], 3.0) == -1
+
+    # —— Goertzel：纯音能量必须落在对应频带（喂错数据要能抓出来）——
+    for freq in (220.0, 880.0):
+        sig = [int(120 * _m.sin(2 * _m.pi * freq * i / 11025.0))
+               for i in range(256)]
+        b = V.goertzel_bands(sig, 11025.0)
+        top = V.CENTERS[max(range(len(b)), key=lambda i: b[i])]
+        assert abs(top - freq) / freq < 0.15, "%dHz 判成了 %.0fHz" % (freq, top)
+    silent = V.goertzel_bands([0] * 256, 11025.0)
+    assert max(silent) < 1e-6, "静音喂出了能量"
+    bars = V.spread_to_bars(silent, 96, [0.0] * 96)
+    assert len(bars) == 96 and max(bars) < 0.05, "bars 长度/静音值不对"
+    # 攻击快释放慢（同 stage.js 的参数语义）
+    st = [0.0] * 96
+    pulse = [1.0] + [0.0] * 23
+    up = V.spread_to_bars(pulse, 96, st)
+    rise = max(up)
+    down = V.spread_to_bars([0.0] * 24, 96, st)
+    assert rise > 0.4, "有能量却没起来（attack 坏了）"
+    assert max(down) < rise, "释放没比攻击慢（平滑参数反了）"
+    # 再喂一帧：攻击应继续快速逼近目标（0.5 → ~0.75）
+    rise2 = max(V.spread_to_bars(pulse, 96, st))
+    assert rise2 > rise + 0.15, "第二帧没继续爬升"
+
+    # —— 全屏层生命周期（桌面：Visualizer 不可用必须安静降级）——
+    app = M.LxApp()
+    root = app.build()
+    app.bridge = FakeBridge()
+    # 测试环境没有 App.run()：root 未挂窗口、默认 100x100，它会把 size_hint
+    # 为 (1,1) 的 np 按自己尺寸布局回 100 —— 必须给 root 真实尺寸再 do_layout
+    root.size = (400, 760)
+    root.do_layout()
+    app.np.y = -760
+    v = V.Visuz()
+    assert v.start() is False, "桌面不该能启动 Visualizer"
+    assert v.bands(96) is None, "桌面 bands() 必须返回 None 而不是抛"
+    song = {"id": "x1", "name": "海阔天空", "singer": "Beyond",
+            "platform": "wy", "interval": "03:59", "album": "", "extra": {}}
+    import time as _t
+    def pump(sec):
+        end = _t.time() + sec
+        while _t.time() < end:
+            Clock.tick(); _t.sleep(0.008)
+    # ⚠ Clock.tick 不驱动 Kivy 动画（那靠主循环 on_tick）——
+    # 断言全部押在「保险丝」上：动画卡死也要由保险丝落位，这正是要测的。
+    app._np_show_for(song)
+    assert app.np.opened is True
+    assert app._np_ev is not None, "30Hz 轮询没启动"
+    app.np.set_progress(10, 239.0, [0.5] * 96)     # 喂模拟谱不应炸
+    pump(1.3)                                       # 开保险丝 1.0s 落位 y=0
+    assert abs(app.np.y) < 2, "开保险丝没落位: %.1f" % app.np.y
+    app._np_closed(); app.np.close()
+    assert app._np_ev is None, "关闭后轮询没停（费电）"
+    pump(1.0)                                       # 关保险丝 0.8s 落位 y=-760
+    assert abs(app.np.y + 760) < 2, "关保险丝没落位: %.1f" % app.np.y
+    # 快速开→关→开：世代号必须让最终状态=开（2.8.7 竞态回归）
+    app.np.open()
+    app.np.close()
+    app.np.open()
+    pump(1.3)
+    assert abs(app.np.y) < 2, "世代号失效，y=%.1f" % app.np.y
+    app._np_closed(); app.np.close()
+    pump(1.0)
+    assert abs(app.np.y + 760) < 2, "最终关失效"
+    print("  正在播放层：解析/频谱数学/开合/竞态 全部 ✓")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -1649,6 +1734,7 @@ def main():
     check("draw_icon 几何来自 icon_parts", test_draw_icon_delegates_to_icon_parts)
     check("渐变缓冲字节数", test_gradient_buffer_size)
     check("背景与主题同色系", test_theme_palette_consistent)
+    check("正在播放全屏层（歌词/频谱/生命周期）", test_now_playing)
     check("搜索分页 + 限流识别", test_netease_paging)
     check("内置多个音源", test_bundled_sources)
     check("5 个平台搜索都注册", test_searchers_registry)
