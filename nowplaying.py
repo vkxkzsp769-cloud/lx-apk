@@ -11,15 +11,13 @@
 
 频谱条与封面的几何/配色/平滑逐行复刻自插件
 stage.js drawFrame（见仓库 6ac321b3..._02-画面预设插件 目录，
-已征得原作者同意）；Kivy 侧用 Mesh 顶点色三角带替代 Canvas 渐变线。
+已征得原作者同意）；Kivy 侧用 Fbo+矩阵指令树复刻（零顶点重建）。
 """
 import math
 
 from kivy.animation import Animation
 from kivy.clock import Clock
-from kivy.graphics import (Color, Rectangle, RoundedRectangle)
-from kivy.graphics.texture import Texture
-from PIL import Image as PILImage, ImageDraw, ImageOps
+from kivy.graphics import (Color, Rectangle, RoundedRectangle, Fbo, PushMatrix, PopMatrix, Translate, Rotate, Scale, ClearColor, ClearBuffers, Line)
 from kivy.metrics import dp
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
@@ -91,12 +89,48 @@ class NowPlaying(FloatLayout):
         # 不做临界圆角 tessellation**。真机 2.9.1 的白线放射爆炸（Mesh 每帧
         # 重建缓冲时旧索引读到未初始化原点顶点）到此根治：绘制只剩一个
         # 固定位置的 Rectangle，桌面/手机驱动行为完全一致。
-        self._STAGE_PX = 512                     # 纹理边长（世界尺寸随环半径缩放）
-        self._stage_img = PILImage.new("RGBA", (self._STAGE_PX, self._STAGE_PX),
-                                       (0, 0, 0, 0))
-        self._stage_tex = Texture.create(size=(self._STAGE_PX, self._STAGE_PX),
-                                         colorfmt="rgba")
-        self._stage_dirty = True
+        self._STAGE_PX = 512                     # Fbo 边长
+        self._stage_fbo = Fbo(size=(self._STAGE_PX, self._STAGE_PX))
+        PX = self._STAGE_PX
+        C2 = (PX - 1) / 2.0
+        with self._stage_fbo:
+            ClearColor(0, 0, 0, 0)
+            ClearBuffers()
+            # 光晕：6 圈固定 glow 矩形（尺寸=封面光晕带，layout 时更新 size）
+            self._halos = []
+            for gi in range(6):
+                c = Color(0.59, 0.67, 1.0, 0.05)
+                r = Rectangle(texture=self._glow_tex)
+                self._halos.append((c, r))
+            # 封面（黑胶）：push→translate(心)→rotate→圆纹理→pop
+            self._cv_push = PushMatrix()
+            self._cv_tr = Translate(C2, C2, 0)
+            self._cv_rot = Rotate(axis=(0, 0, 1))
+            self._cv_c = Color(1, 1, 1, 1)
+            self._cv_r = RoundedRectangle(radius=[PX * 0.12])
+            self._cv_pop = PopMatrix()
+            # 占位圆盘（无封面时露出）
+            self._ph_c = Color(0.20, 0.24, 0.36, 0.9)
+            self._ph_r = RoundedRectangle(radius=[PX * 0.12])
+            # 封面白描边：Line circle（仅 layout 时改半径）
+            self._ed_c = Color(1, 1, 1, 0.25)
+            self._edge = Line(width=2.0)
+            # 96 根谱条：每根 [push, translate(心), rotate(角), scale(长),
+            # 固定基准矩形(1×1 沿 +x)] pop —— 播放期**只改 rotate.angle 与
+            # scale.x**，零顶点重建（真机 2.9.1 白线爆炸的根治）
+            self._bars = []
+            n = 96
+            for b in range(n):
+                push = PushMatrix()
+                tr = Translate(C2, C2, 0)
+                rot = Rotate(axis=(0, 0, 1))
+                sc = Scale(1, 1, 1)
+                col = Color(0.47, 0.71, 1.0, 0.9)
+                rect = Rectangle(size=(1, 1))       # 基准 1×1，scale 拉长度与粗细
+                pop = PopMatrix()
+                self._bars.append({"push": push, "tr": tr, "rot": rot,
+                                   "sc": sc, "col": col, "rect": rect,
+                                   "pop": pop, "ang": -90.0 + b * 360.0 / n})
         with self.canvas.before:
             self._bg_c = Color(1, 1, 1, 1)
             self._bg_r = Rectangle(texture=self._bg_tex)
@@ -105,7 +139,7 @@ class NowPlaying(FloatLayout):
             self._a2_c = Color(0.42, 0.24, 0.85, 0.14)
             self._a2_r = Rectangle(texture=self._glow_tex)
             self._st_c = Color(1, 1, 1, 1)
-            self._st_r = Rectangle(texture=self._stage_tex)
+            self._st_r = Rectangle(texture=self._stage_fbo.texture)
 
         # —— 顶部标题 ——
         self.lbl_name = Label(font_size=dp(21), bold=True,
@@ -198,18 +232,18 @@ class NowPlaying(FloatLayout):
         self.lbl_artist.text = _esc(artist or "")
 
     def set_cover(self, texture):
-        """Kivy Texture → 转成 PIL 缓存（舞台由 _render_stage 统一绘制）。
-        None → 占位圆（音符）"""
-        self._cover_pil = None
-        if texture is not None:
-            try:
-                t = texture
-                w, h = int(t.width), int(t.height)
-                mode = "RGBA" if t.colorfmt == "rgba" else "RGB"
-                im = PILImage.frombytes(mode, (w, h), t.pixels)
-                self._cover_pil = im.transpose(PILImage.FLIP_TOP_BOTTOM).convert("RGBA")
-            except Exception:
-                log_exc("set_cover 转 PIL")
+        """封面纹理直接挂进舞台 Fbo 的旋转圆；None → 占位圆盘"""
+        try:
+            if texture is not None:
+                self._cv_r.texture = texture
+                self._cv_c.a = 1.0
+                self._ph_r.size = (0, 0)
+            else:
+                self._cv_r.size = (0, 0)
+                self._ph_c.a = 0.9
+                self._ph_r.size = self._cv_size_hint
+        except Exception:
+            log_exc("set_cover")
         self._stage_dirty = True
 
     def set_playing(self, on):
@@ -400,89 +434,78 @@ class NowPlaying(FloatLayout):
     def _relayout_bottom(self):
         self._update_track()
 
-    # —— 舞台纹理（封面+光晕+频谱环）：PIL 软绘 + blit 原地上传 ——
+    # —— 舞台 Fbo：每帧只改矩阵/颜色参数，然后 fbo.draw() ——
     _SP_N = 96
 
     def _render_stage(self):
-        """把圆封面(旋转)、光晕、96 根频谱条、白描边画进 512² RGBA。
-        只 blit 同一张 Texture：没有任何缓冲重分配 → 无驱动竞态。"""
+        """把 96 根谱条的长度/颜色、封面转角/半径、光晕强度写进静态指令树，
+        再渲染 Fbo。**全程零顶点缓冲重建**：angle/scale/alpha 都是矩阵与
+        状态参数（glUniform 级），不触发任何 buffer 分配 —— 2.9.1 真机
+        '白线放射到左下角'（Mesh 每帧重建缓冲 + 异步分配读到原点顶点）
+        的根治方案。"""
         try:
-            px = self._STAGE_PX
             inner, outer = self._ring()
             if outer <= inner:
                 return
-            side = getattr(self, "_st_side", outer * 2.35)
-            k = (px - 1) / side                      # 世界 px → 纹理 px
-            c = (px - 1) / 2.0
-            rim = outer * k
+            PX = self._STAGE_PX
+            C2 = (PX - 1) / 2.0
+            # Fbo 纹理是 512px 方形；世界 side 与之对应
+            side = getattr(self, "_st_side", 1.0)
+            k = (PX - 1.0) / max(1.0, side)        # 世界 px → Fbo px
             r_in = inner * k
             r_cov = self._cover_r() * k
-            img = self._stage_img
-            img.paste((0, 0, 0, 0), (0, 0, px, px))
-            d = ImageDraw.Draw(img)
-            # 光晕（原版 glowR=1.35R）：几圈递减的半透明蓝做柔和外扩
-            ga = 0.16 + 0.18 * self._vis
-            glow_r = r_cov * 1.35
-            for gi in range(5):
-                rr = r_cov * (1.02 + 0.085 * gi)
-                aa = int(ga * (1.0 - gi / 5.0) * 255 * 0.45)
-                if aa > 3 and rr * 2 < px:
-                    d.ellipse([c - rr, c - rr, c + rr, c + rr],
-                              outline=(150, 170, 255, aa),
-                              width=max(1, int(glow_r * k * 0.04)))
-            # 96 根谱条：内→外 三段插值色（120,180,255 → 180,140,255 → 120,220,255）
-            step = 2.0 * math.pi / self._SP_N
-            line_w = max(2, int(r_in * 0.055 * 2))
-            for b in range(self._SP_N):
-                h = self._bands[b] if b < len(self._bands) else 0.0
+            band = (outer - inner) * k
+            thick = max(3.0, r_in * 0.055)
+            # 封面圆 + 占位盘 + 描边 + 光晕（随 layout 变化的静态几何）
+            d_cov = max(2.0, r_cov * 2.0)
+            self._cv_size_hint = (d_cov, d_cov)
+            self._cv_r.size = (d_cov, d_cov)
+            self._cv_r.pos = (C2 - r_cov, C2 - r_cov)
+            self._cv_r.radius = [d_cov / 2.0 * 0.99]
+            self._ph_r.size = self._cv_r.size
+            self._ph_r.pos = self._cv_r.pos
+            self._ph_r.radius = self._cv_r.radius
+            self._edge.circle = (C2, C2, max(2.0, r_cov + 1), 2.0, 64)
+            self._cv_tr.xyz = (C2, C2, 0)
+            self._cv_rot.angle = math.degrees(self._rot) % 360.0
+            ga = 0.10 + 0.20 * self._vis
+            for gi, (col, rect) in enumerate(self._halos):
+                rr = d_cov * (0.56 + 0.075 * gi) * 2.0
+                rect.size = (rr, rr)
+                rect.pos = (C2 - rr / 2.0, C2 - rr / 2.0)
+                col.a = ga * (1.0 - gi / 6.0) * 0.5
+            # 96 根谱条：角度固定；长度=scale.x、粗细=scale.y、色随高度插值
+            bands = self._bands
+            nb = len(bands)
+            for b, g in enumerate(self._bars):
+                h = bands[b] if b < nb else 0.0
                 try:
                     h = float(h)
                 except Exception:
                     h = 0.0
                 if h != h:
-                    h = 0.0
+                    h = 0.0                       # NaN 自检
                 h = 0.0 if h < 0.0 else (1.0 if h > 1.0 else h)
-                ang = b * step - math.pi / 2.0
-                ca_, sa_ = math.cos(ang), math.sin(ang)
-                bar = (r_in + (rim - r_in) * (0.15 + 0.85 * h)) * 1.0
-                x0, y0 = c + ca_ * r_in, c + sa_ * r_in
-                x1, y1 = c + ca_ * bar, c + sa_ * bar
-                # 三段色（内紫外青）
-                seg = 3
-                for seg_i in range(seg):
-                    t0 = seg_i / float(seg)
-                    t1 = (seg_i + 1) / float(seg)
-                    p0 = (x0 + (x1 - x0) * t0, y0 + (y1 - y0) * t0)
-                    p1 = (x0 + (x1 - x0) * t1, y0 + (y1 - y0) * t1)
-                    col = _bar_color(t1)
-                    d.line([p0, p1], fill=col, width=line_w)
-            # 封面（旋转黑胶）或占位
-            rr = int(r_cov)
-            box = [c - r_cov, c - r_cov, c + r_cov, c + r_cov]
-            src = getattr(self, "_cover_pil", None)
-            if src is not None and r_cov > 4:
-                d_size = max(8, int(r_cov * 2))
-                cover = src if src.size == (d_size, d_size) else src.resize(
-                    (d_size, d_size), PILImage.BICUBIC)
-                cover = cover.rotate(math.degrees(self._rot) % 360,
-                                      resample=PILImage.BILINEAR)
-                mask = PILImage.new("L", cover.size, 0)
-                ImageDraw.Draw(mask).ellipse(
-                    [0, 0, cover.size[0] - 1, cover.size[1] - 1], fill=255)
-                img.paste(cover, (int(c - r_cov), int(c - r_cov)), mask)
-                d = ImageDraw.Draw(img)
-                d.ellipse(box, outline=(255, 255, 255, 64), width=2)
-            else:
-                d.ellipse(box, fill=(51, 61, 92, 230),
-                          outline=(158, 183, 250, 200), width=3)
-                # 占位音符
-                ur = r_cov * 0.3
-                d.ellipse([c - ur * 1.4, c - ur * 0.9, c - ur * 0.2, c + ur * 0.2],
-                          fill=(158, 183, 250, 230))
-                d.line([c - ur * 0.25, c - ur * 0.35,
-                        c - ur * 0.25, c + ur * 2.2],
-                       fill=(158, 183, 250, 230), width=max(2, int(ur * 0.22)))
-            self._stage_tex.blit_buffer(img.tobytes(), origin=(0, 0))
+                L = max(thick, band * (0.15 + 0.85 * h))
+                g["tr"].xyz = (C2, C2, 0)
+                g["rot"].angle = g["ang"]
+                g["sc"].x = L
+                g["sc"].y = thick
+                g["rect"].pos = (r_in, -thick / 2.0)
+                t = h
+                # 三段渐变（同极光原版 120,180,255 → 180,140,255 → 120,220,255）
+                if t < 0.6:
+                    f = t / 0.6
+                    r_ = (120 + 60 * f) / 255.0
+                    gg = (180 - 40 * f) / 255.0
+                    bb = 1.0
+                else:
+                    f = (t - 0.6) / 0.4
+                    r_ = (180 - 60 * f) / 255.0
+                    gg = (140 + 80 * f) / 255.0
+                    bb = 1.0
+                g["col"].rgba = (r_, gg, bb, 0.55 + 0.45 * h)
+            self._stage_fbo.draw()
             self._stage_dirty = False
         except Exception:
             log_exc("_render_stage")
@@ -514,48 +537,63 @@ class NowPlaying(FloatLayout):
             else:
                 lb.text = ""
 
-    # —— 进度条（纹理方案）——
-    # 旧写法每帧给 RoundedRectangle 改 size（fill 宽度跟进度变）= 每帧重建
-    # 64 顶点缓冲，和频谱 Mesh 同款驱动竞态（真机上白色滑块被"拉长成条"
-    # 就是它被爆炸波及）。改：512×48 固定纹理，PIL 画 track/fill/白钮，
-    # blit 原地上传，canvas 只有一个不动的 Rectangle。
+    # —— 进度条：独立小 Fbo（512×64），静态几何 + scale/translate，
+    #    和舞台同款零重建（滑块被白线波及的那条也根治）——
     _PB_PX = 512
-    _PB_PY = 48
+    _PB_PY = 64
 
-    def _update_track(self):
-        if not hasattr(self, "_pb_tex"):
-            self._pb_img = PILImage.new("RGBA", (self._PB_PX, self._PB_PY),
-                                        (0, 0, 0, 0))
-            self._pb_tex = Texture.create(size=(self._PB_PX, self._PB_PY),
-                                          colorfmt="rgba")
+    def _pb_ensure(self):
+        if hasattr(self, "_pb_fbo"):
+            return True
+        try:
+            self._pb_fbo = Fbo(size=(self._PB_PX, self._PB_PY))
+            H2 = self._PB_PY / 2.0
+            with self._pb_fbo:
+                ClearColor(0, 0, 0, 0)
+                ClearBuffers()
+                self._tk_c = Color(1, 1, 1, 0.28)
+                self._tkt = RoundedRectangle(radius=[dp(3)])
+                self._tkt.pos = (8, H2 - 3)
+                self._tkt.size = (self._PB_PX - 16, 6)
+                # fill：push+translate 原点+scale 拉宽度+圆角底 rect+pop
+                self._f_push = PushMatrix()
+                self._f_tr = Translate(8, 0, 0)
+                self._f_sc = Scale(1, 1, 1)
+                self._f_c = Color(0.36, 0.55, 1.0, 1)
+                self._fk = RoundedRectangle(radius=[dp(3)])
+                self._fk.pos = (0, H2 - 3)
+                self._fk.size = (self._PB_PX - 16, 6)
+                self._f_pop = PopMatrix()
+                # 滑块：固定白圆，translate 跟进度走
+                self._k_c = Color(1, 1, 1, 1)
+                self._k = RoundedRectangle(radius=[dp(9)])
+                self._k.pos = (8 - 9, H2 - 9)
+                self._k.size = (18, 18)
             with self.canvas.after:
                 self._pbc_c = Color(1, 1, 1, 1)
-                self._pbc_r = Rectangle(texture=self._pb_tex)
-        x0, w, y = self._seek_x0(), self._seek_w(), self._seek_y()
-        self._pbc_r.pos = (x0 - dp(4), y - dp(14))
-        self._pbc_r.size = (w + dp(8), dp(28))
-        im = self._pb_img
-        im.paste((0, 0, 0, 0), (0, 0, im.size[0], im.size[1]))
-        d = ImageDraw.Draw(im)
-        PW, PH = im.size
-        th = 8
-        yc = PH / 2.0
-        # 轨道（白 28%）
-        d.rounded_rectangle([4, yc - th / 2, PW - 4, yc + th / 2],
-                            radius=th / 2, fill=(255, 255, 255, 72))
-        # 已播（蓝）
-        f = max(0.0, min(1.0, self._pos_frac))
-        fx = 4 + (PW - 8) * f
-        if fx > 10:
-            d.rounded_rectangle([4, yc - th / 2, fx, yc + th / 2],
-                                radius=th / 2, fill=(92, 140, 255, 255))
-        # 白色滑块 + 极淡投影（PIL 里就是柔和一点双层）
-        d.ellipse([fx - 13, yc - 13, fx + 13, yc + 13], fill=(0, 0, 0, 60))
-        d.ellipse([fx - 12, yc - 12, fx + 12, yc + 12], fill=(255, 255, 255, 255))
-        try:
-            self._pb_tex.blit_buffer(im.tobytes(), origin=(0, 0))
+                self._pbc_r = Rectangle(texture=self._pb_fbo.texture)
+            return True
         except Exception:
-            log_exc("pb blit")
+            log_exc("_pb_ensure")
+            return False
+
+    def _update_track(self):
+        if not self._pb_ensure():
+            return
+        x0, w, y = self._seek_x0(), self._seek_w(), self._seek_y()
+        self._pbc_r.pos = (x0 - dp(6), y - dp(15))
+        self._pbc_r.size = (w + dp(12), dp(30))
+        H2 = self._PB_PY / 2.0
+        f = max(0.0, min(1.0, self._pos_frac))
+        usable = self._PB_PX - 32
+        self._f_sc.x = max(0.001, usable * f / max(1.0, usable)) \
+            if f > 0.001 else 0.001
+        self._fk.pos = (0, H2 - 3)
+        self._k.pos = (8 + usable * f - 9, H2 - 9)
+        try:
+            self._pb_fbo.draw()
+        except Exception:
+            log_exc("pb draw")
 
     # —— 自转呼吸（封面持续旋转 + 无数据时的静默） ——
     def _tick_paint(self, dt):

@@ -1113,13 +1113,17 @@ class LxApp(App):
 
         # 「正在播放」全屏层（圆形封面+频谱环+歌词）挂最顶层；
         # 主界面播放条原样不动 —— 这是加法。
-        self.np = nowplaying.NowPlaying(
-            on_close=self._np_closed,
-            on_play_pause=lambda: self.toggle_play(),
-            on_scrub=self._np_scrub,
-            on_retry_vis=lambda: self.np_retry_visualizer())
-        root.add_widget(self.np)
-        self.np.y = -Window_h()           # 屏幕下沿外待命
+        try:
+            self.np = nowplaying.NowPlaying(
+                on_close=self._np_closed,
+                on_play_pause=lambda: self.toggle_play(),
+                on_scrub=self._np_scrub,
+                on_retry_vis=lambda: self.np_retry_visualizer())
+            root.add_widget(self.np)
+            self.np.y = -Window_h()       # 屏幕下沿外待命
+        except Exception:
+            log_exc("创建正在播放层")
+            self.np = None                # 增强层起不来不能拖垮主 App
         self._vis = visuz.Visuz()
         self._vis_perm_asked = False
         self._np_ev = None
@@ -1632,7 +1636,7 @@ class LxApp(App):
 
         self.btn_expand = IconButton("expand", dia=dp(38), icon_color=C_ACCENT,
                                      bg=(0.926, 0.953, 1.0, 1))
-        self.btn_expand.bind(on_release=lambda *_: self._np_show_for(self._cur_song))
+        self.btn_expand.bind(on_release=lambda *_: self._np_show_for(self._cur_song))  # np=None 时内部直接 return
         prow.add_widget(self.btn_expand)
 
         self.lbl_time = Label(text="00:00 / 00:00", size_hint_x=None,
@@ -2638,6 +2642,8 @@ class LxApp(App):
     # ---------- 「正在播放」全屏层（新增；不改既有播放控制） ----------
     def _np_show_for(self, song):
         """弹出全屏层；封面/歌词后台线程取；频谱走 Visualizer（需麦克风权限）"""
+        if getattr(self, "np", None) is None:
+            return
         try:
             song = song or {}
             plat = song.get("platform") or self._current_source()
@@ -2689,7 +2695,9 @@ class LxApp(App):
                         "谱条为跟拍律动，点播放页右上『♪』可再次申请", C_DIM)
 
     def np_retry_visualizer(self, *_):
-        """np 页右上 ♪ 按钮：再申请一次权限并尝试启动"""
+        """np 页右上音波按钮：再申请一次权限并尝试启动"""
+        if getattr(self, "np", None) is None:
+            return
         try:
             vibrate(8)
             self._vis.request_permission()
@@ -2705,6 +2713,8 @@ class LxApp(App):
 
     def _np_closed(self):
         # 收起时停掉 30Hz 轮询省电；Visualizer 保留待命
+        if getattr(self, "np", None) is None:
+            return
         if self._np_ev is not None:
             try:
                 self._np_ev.cancel()
@@ -2713,6 +2723,8 @@ class LxApp(App):
             self._np_ev = None
 
     def _np_tick(self, dt):
+        if getattr(self, "np", None) is None:
+            return
         try:
             pos = self.player.position()
             total = (self._cur_duration or self.player.duration()
@@ -2746,6 +2758,8 @@ class LxApp(App):
 
     def _np_scrub(self, frac):
         """全屏层进度条：拖到哪跳到哪（复用既有 player.seek 契约）"""
+        if getattr(self, "np", None) is None:
+            return
         try:
             total = self._cur_duration or self.player.duration()
             if total:
