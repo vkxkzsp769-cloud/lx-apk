@@ -49,12 +49,14 @@ BG_BOT = (0.020, 0.024, 0.047, 1)        # #05060c
 class NowPlaying(FloatLayout):
     """全屏播放层。open()/close() 从底部弹簧滑入滑出。"""
 
-    def __init__(self, on_close=None, on_play_pause=None, on_scrub=None, **kw):
+    def __init__(self, on_close=None, on_play_pause=None, on_scrub=None,
+                 on_retry_vis=None, **kw):
         kw.setdefault("size_hint", (1, 1))
         super(NowPlaying, self).__init__(**kw)
         self._on_close = on_close
         self._on_play_pause = on_play_pause
         self._on_scrub = on_scrub
+        self._on_retry_vis = on_retry_vis
         self._gen = 0                 # 开合保险丝世代号（吸取 2.8.7 竞态教训）
         self.opened = False
         self._t = 0.0
@@ -134,6 +136,10 @@ class NowPlaying(FloatLayout):
         self.add_widget(self.lbl_t2)
         self.btn_close = _RoundGhost("close", on_press=lambda *_: self.close())
         self.add_widget(self.btn_close)
+        # 右上「音波」小圆钮：点一下重新申请频谱权限；
+        # 亮=真频谱在跳，暗=兜底律动 —— 数据源状态一眼可见
+        self.btn_wave = _RoundGhost("wave", on_press=self._tap_wave)
+        self.add_widget(self.btn_wave)
         self.btn_play = _RoundBig("play", on_press=lambda *_: self._tap_play())
         self.add_widget(self.btn_play)
 
@@ -228,6 +234,20 @@ class NowPlaying(FloatLayout):
         self._bands = bands or self._bands
 
     # ================= 内部 =================
+    def _tap_wave(self, *_):
+        try:
+            if self._on_retry_vis:
+                self._on_retry_vis()
+        except Exception:
+            log_exc("np retry_vis")
+
+    def set_visualizer_live(self, on):
+        # 亮/暗 = 真频谱/兜底律动
+        try:
+            self.btn_wave.set_active(bool(on))
+        except Exception:
+            pass
+
     def _tap_play(self):
         try:
             if self._on_play_pause:
@@ -361,6 +381,7 @@ class NowPlaying(FloatLayout):
         self.lbl_name.size = (w - dp(140), dp(30))
         self.lbl_name.pos = (self.x + dp(70), self.top - dp(94))
         self.btn_close.pos = (self.x + dp(18), self.top - dp(76))
+        self.btn_wave.pos = (self.right - dp(58), self.top - dp(76))
         # 歌词区中心（封面下方与底部控制之间的对称位）
         # 底部控件
         self.btn_play.size = (dp(64), dp(64))
@@ -525,10 +546,26 @@ class _RoundGhost(Widget):
         self._bg.size = self.size
         cx = self.x + self.width / 2.0
         cy = self.y + self.height / 2.0
-        s = min(self.width, self.height) * 0.22
-        self._ln.points = [cx - s, cy - s, cx + s, cy + s,
-                           cx - s, cy + s, cx + s, cy - s]
-        self._ln.width = dp(1.8)
+        if self._kind == "wave":
+            u = min(self.width, self.height)
+            pts = []
+            for dx, hh in ((-0.24, 0.20), (0.0, 0.34), (0.24, 0.26)):
+                pts += [cx + u * dx, cy - u * hh, cx + u * dx, cy + u * hh]
+            self._ln.points = pts
+            self._ln.width = dp(2.2)
+        else:
+            s = min(self.width, self.height) * 0.22
+            self._ln.points = [cx - s, cy - s, cx + s, cy + s,
+                               cx - s, cy + s, cx + s, cy - s]
+            self._ln.width = dp(1.8)
+        self._lc.a = getattr(self, "_alpha", 0.85)
+
+    def set_active(self, on):
+        self._alpha = 1.0 if on else 0.45
+        try:
+            self._draw()
+        except Exception:
+            pass
 
     def on_touch_down(self, touch):
         if self.collide_point(*touch.pos):

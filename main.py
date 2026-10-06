@@ -1116,7 +1116,8 @@ class LxApp(App):
         self.np = nowplaying.NowPlaying(
             on_close=self._np_closed,
             on_play_pause=lambda: self.toggle_play(),
-            on_scrub=self._np_scrub)
+            on_scrub=self._np_scrub,
+            on_retry_vis=lambda: self.np_retry_visualizer())
         root.add_widget(self.np)
         self.np.y = -Window_h()           # 屏幕下沿外待命
         self._vis = visuz.Visuz()
@@ -2657,9 +2658,9 @@ class LxApp(App):
                 if not self._vis_perm_asked:
                     self._vis_perm_asked = True
                     self._vis.request_permission()
-                    Clock.schedule_once(lambda *_: self._vis.start(), 1.2)
+                    Clock.schedule_once(lambda *_: self._np_fallback(), 1.4)
                 else:
-                    self._vis.start()
+                    self._np_fallback()
             def _work():
                 cover = songmedia.download_cover(plat, song)
                 lines = songmedia.parse_lrc(songmedia.lyric_text(plat, song))
@@ -2680,6 +2681,23 @@ class LxApp(App):
         except Exception:
             log_exc("_np_show_for")
 
+    def _np_fallback(self):
+        """没权限/驱动拒绝 → 真频谱不可用。明确告知 + 给再试入口。"""
+        if self._vis.start():
+            return
+        self.set_status("频谱未激活（没拿到麦克风权限或系统不支持）——"
+                        "谱条为跟拍律动，点播放页右上『♪』可再次申请", C_DIM)
+
+    def np_retry_visualizer(self, *_):
+        """np 页右上 ♪ 按钮：再申请一次权限并尝试启动"""
+        try:
+            vibrate(8)
+            self._vis.request_permission()
+            self.set_status("已再次申请权限：允许后回到播放页即跳真频谱")
+            Clock.schedule_once(lambda *_: self._np_fallback(), 1.4)
+        except Exception:
+            log_exc("np_retry_visualizer")
+
     def _np_start_tick(self):
         if self._np_ev is None:
             self._np_ev = Clock.schedule_interval(
@@ -2699,9 +2717,32 @@ class LxApp(App):
             pos = self.player.position()
             total = (self._cur_duration or self.player.duration()
                      or 0)
-            self.np.set_progress(pos, total, self._vis.bands(96))
+            live = self._vis.ok
+            if getattr(self, "_np_live", None) != live:
+                self._np_live = live
+                self.np.set_visualizer_live(live)
+            bands = self._vis.bands(96)
+            if bands is None:
+                # Visualizer 没数据时用「跟拍律动」兜底：按播放进度合成
+                # 频谱形态（明确告知是模拟），谱条不再是死的一动不动
+                bands = self._np_fake_bands(pos)
+            self.np.set_progress(pos, total, bands)
         except Exception:
             log_exc("_np_tick")
+
+    def _np_fake_bands(self, pos):
+        import math as _m
+        t = float(pos)
+        beat = t * 2.1                       # ≈126 BPM 观感节奏
+        kick = max(0.0, 1.0 - (beat % 1.0) * 2.6) ** 2
+        out = []
+        for i in range(96):
+            f = i / 96.0
+            v = (1.0 - f) * (0.22 + 0.85 * kick) \
+                + 0.16 * abs(_m.sin(t * 3.1 + i * 0.55)) * (1 - f * 0.55) \
+                + 0.08 * _m.sin(t * 7.7 + i * 2.1) + 0.05
+            out.append(max(0.0, min(1.0, v)))
+        return out
 
     def _np_scrub(self, frac):
         """全屏层进度条：拖到哪跳到哪（复用既有 player.seek 契约）"""
