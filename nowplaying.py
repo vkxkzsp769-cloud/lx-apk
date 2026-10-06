@@ -17,8 +17,9 @@ import math
 
 from kivy.animation import Animation
 from kivy.clock import Clock
-from kivy.graphics import (Color, Mesh, PushMatrix, PopMatrix, Rectangle,
-                           Rotate, RoundedRectangle)
+from kivy.graphics import (Color, Rectangle, RoundedRectangle)
+from kivy.graphics.texture import Texture
+from PIL import Image as PILImage, ImageDraw, ImageOps
 from kivy.metrics import dp
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
@@ -27,6 +28,20 @@ from kivy.uix.widget import Widget
 import bgfx            # 渐变/光晕贴图工厂（纯装饰层，复用没问题）
 import fonts            # 中文字体：本层每个文本控件自动带上（历史坑：漏传=方块）
 from appenv import log_exc
+
+
+def _bar_color(t):
+    """内→外 三段渐变：(120,180,255)→(180,140,255)→(120,220,255)"""
+    a, b = _C_IN, _C_MID
+    f = t
+    if f > 0.6:
+        a, b, f = _C_MID, _C_OUT, (f - 0.6) / 0.4
+    else:
+        f = f / 0.6
+    return (int((a[0] + (b[0] - a[0]) * f) * 255),
+            int((a[1] + (b[1] - a[1]) * f) * 255),
+            int((a[2] + (b[2] - a[2]) * f) * 255),
+            int((a[3] + (b[3] - a[3]) * f) * 255))
 
 
 def _spring(p):
@@ -71,6 +86,17 @@ class NowPlaying(FloatLayout):
         # —— 背景：竖向渐变 + 两团极光 + 中心光晕 ——
         self._bg_tex = bgfx.make_vgradient_texture(BG_TOP, BG_BOT)
         self._glow_tex = bgfx.make_glow_texture()
+        # 「舞台」= 封面圆+光晕+频谱环+描边 全部画进一张固定 RGBA 纹理，
+        # 每帧 blit_buffer 原地重传（glTexSubImage2D）——**不新建任何顶点缓冲、
+        # 不做临界圆角 tessellation**。真机 2.9.1 的白线放射爆炸（Mesh 每帧
+        # 重建缓冲时旧索引读到未初始化原点顶点）到此根治：绘制只剩一个
+        # 固定位置的 Rectangle，桌面/手机驱动行为完全一致。
+        self._STAGE_PX = 512                     # 纹理边长（世界尺寸随环半径缩放）
+        self._stage_img = PILImage.new("RGBA", (self._STAGE_PX, self._STAGE_PX),
+                                       (0, 0, 0, 0))
+        self._stage_tex = Texture.create(size=(self._STAGE_PX, self._STAGE_PX),
+                                         colorfmt="rgba")
+        self._stage_dirty = True
         with self.canvas.before:
             self._bg_c = Color(1, 1, 1, 1)
             self._bg_r = Rectangle(texture=self._bg_tex)
@@ -78,28 +104,8 @@ class NowPlaying(FloatLayout):
             self._a1_r = Rectangle(texture=self._glow_tex)
             self._a2_c = Color(0.42, 0.24, 0.85, 0.14)
             self._a2_r = Rectangle(texture=self._glow_tex)
-            self._halo_c = Color(0.30, 0.42, 0.95, 0.22)
-            self._halo_r = Rectangle(texture=self._glow_tex)
-            # 封面圆（黑胶旋转组）
-            self._cv_push = PushMatrix()
-            self._cv_rot = Rotate(axis=(0, 0, 1))
-            self._cv_c = Color(1, 1, 1, 1)
-            self._cv_r = RoundedRectangle(radius=[dp(8)])
-            self._cv_pop = PopMatrix()
-            # 无封面占位：暗色圆盘 + 简化音符（圆头+杆）
-            self._ph_c = Color(0.20, 0.24, 0.36, 0.9)
-            self._ph_r = RoundedRectangle(radius=[dp(8)])
-            self._nt_c = Color(0.62, 0.72, 0.98, 0.9)
-            self._note_head = RoundedRectangle(radius=[dp(6)])
-            self._note_stem = Rectangle()
-            # 封面描边（原版 rgba .25 白）
-            from kivy.graphics import Line
-            self._edge_c = Color(1, 1, 1, 0.25)
-            self._edge = Line(rounded_rectangle=(0, 0, 10, 10, dp(8)),
-                              width=dp(1.2))
-            # 频谱环 Mesh（triangles + 顶点色，每帧更新顶点缓冲）
-            self._sp_c = Color(1, 1, 1, 1)
-            self._sp_mesh = Mesh(mode="triangles")
+            self._st_c = Color(1, 1, 1, 1)
+            self._st_r = Rectangle(texture=self._stage_tex)
 
         # —— 顶部标题 ——
         self.lbl_name = Label(font_size=dp(21), bold=True,
@@ -192,9 +198,19 @@ class NowPlaying(FloatLayout):
         self.lbl_artist.text = _esc(artist or "")
 
     def set_cover(self, texture):
-        """texture=None → 占位圆（音符）；否则画进旋转黑胶"""
-        self._cv_tex = texture
-        self._relayout()
+        """Kivy Texture → 转成 PIL 缓存（舞台由 _render_stage 统一绘制）。
+        None → 占位圆（音符）"""
+        self._cover_pil = None
+        if texture is not None:
+            try:
+                t = texture
+                w, h = int(t.width), int(t.height)
+                mode = "RGBA" if t.colorfmt == "rgba" else "RGB"
+                im = PILImage.frombytes(mode, (w, h), t.pixels)
+                self._cover_pil = im.transpose(PILImage.FLIP_TOP_BOTTOM).convert("RGBA")
+            except Exception:
+                log_exc("set_cover 转 PIL")
+        self._stage_dirty = True
 
     def set_playing(self, on):
         self.btn_play.set_kind("pause" if on else "play")
@@ -217,6 +233,7 @@ class NowPlaying(FloatLayout):
         else:
             for i, v in enumerate(self._bands):
                 self._bands[i] = v * 0.90       # 释放慢
+        self._stage_dirty = True
         # 歌词当前行
         if self._lines:
             idx = -1
@@ -342,37 +359,13 @@ class NowPlaying(FloatLayout):
             rr.pos = (cx + math.sin(ph * 0.11 + i * 2.1) * w * 0.18 - bw / 2.0,
                       cy + (h * 0.10 if i == 0 else -h * 0.30) - bh / 2.0)
             rr.size = (bw, bh)
-        # 封面光晕（原版 glowR=1.35R）
-        g = self._cover_r() * 1.35 * 2
-        self._halo_c.a = 0.16 + 0.10 * self._vis
-        self._halo_r.pos = (cx - g / 2.0, cy - g / 2.0)
-        self._halo_r.size = (g, g)
-        # 封面圆
-        r = self._cover_r()
-        tex = getattr(self, "_cv_tex", None)
-        if tex is not None:
-            self._cv_r.texture = tex
-            self._cv_c.a = 1.0
-            self._cv_r.pos = (cx - r, cy - r)
-            self._cv_r.size = (r * 2, r * 2)
-            self._cv_r.radius = [r]
-            self._ph_r.size = (0, 0)
-            self._note_head.size = (0, 0)
-            self._note_stem.size = (0, 0)
-        else:
-            self._cv_r.size = (0, 0)
-            self._ph_r.pos = (cx - r, cy - r)
-            self._ph_r.size = (r * 2, r * 2)
-            self._ph_r.radius = [r]
-            hr = r * 0.30
-            self._note_head.pos = (cx - hr * 1.5, cy - hr * 1.2)
-            self._note_head.size = (hr * 1.8, hr * 1.4)
-            self._note_head.radius = [hr * 0.6]
-            self._note_stem.pos = (cx + hr * 0.15, cy - hr * 0.4)
-            self._note_stem.size = (hr * 0.28, r * 1.1)
-        # 描边（Line.rounded_rectangle = x, y, w, h, radius）
-        self._edge.rounded_rectangle = (cx - r, cy - r, r * 2, r * 2, r)
-        self._edge.width = dp(1.2)
+        # 舞台方形：边长 = 环外半径 × 2.35，位置围绕 (cx, cy)
+        _, outer = self._ring()
+        side = max(4.0, outer * 2.35)
+        self._st_side = side
+        self._st_r.pos = (cx - side / 2.0, cy - side / 2.0)
+        self._st_r.size = (side, side)
+        self._stage_dirty = True
         # 顶部
         self.lbl_artist.size_hint = (None, None)
         self.lbl_artist.size = (w - dp(140), dp(20))
@@ -396,51 +389,103 @@ class NowPlaying(FloatLayout):
         self._seek_zone.pos = (self._seek_x0() - dp(6), self._seek_y() - dp(16))
         self._seek_zone.size = (self._seek_w() + dp(12), dp(36))
         # 歌词位置（在封面与 seek 之间）
-        top = cy - r - min(self.width, self.height) / 2.5 * 0.14 - dp(46)
+        top = cy - self._cover_r() - min(self.width, self.height) / 2.5 \
+            * 0.14 - dp(46)
         self._lyr_top = top
-        # 频谱 + 歌词内容刷新
-        self._update_spectrum()
+        # 频谱（舞台纹理）+ 歌词内容刷新
+        self._render_stage()
         self._update_lyrics()
         self._update_track()
 
     def _relayout_bottom(self):
         self._update_track()
 
-    # —— 频谱环 Mesh ——
-    def _update_spectrum(self):
-        inner, outer = self._ring()
-        cx, cy = self._cx(), self._cy()
-        nb = len(self._bands)
-        n = max(24, min(180, nb))
-        half_gap = math.pi / n
-        verts, idx = [], []
-        step = (math.pi * 2) / n
-        vmin = 0.15
-        for b in range(n):
-            h = self._bands[b] if b < len(self._bands) else 0.0
-            barlen = (outer - inner) * (vmin + max(0.0, min(1.0, h)) * 0.85)
-            ang = b * step - math.pi / 2.0
-            ca, sa = math.cos(ang), math.sin(ang)
-            nx, ny = -sa, ca                       # 切向半宽方向
-            wa = half_gap * inner * 0.62
-            wb = half_gap * (inner + barlen) * 0.30
-            x0, y0 = cx + ca * inner, cy + sa * inner
-            x1, y1 = cx + ca * (inner + barlen), cy + sa * (inner + barlen)
-            p1 = (x0 + nx * wa, y0 + ny * wa)
-            p2 = (x0 - nx * wa, y0 - ny * wa)
-            p3 = (x1 + nx * wb, y1 + ny * wb)
-            p4 = (x1 - nx * wb, y1 - ny * wb)
-            base = len(verts)
-            # 4 顶点 2 三角形：内→外 顶点色三段混合近似渐变
-            for (px, py), col in ((p1, _C_IN), (p2, _C_IN),
-                                  (p3, _C_OUT), (p4, _C_OUT)):
-                verts += (px, py, 0, 0, col[0], col[1], col[2], col[3])
-            idx += [base, base + 1, base + 2, base + 1, base + 3, base + 2]
+    # —— 舞台纹理（封面+光晕+频谱环）：PIL 软绘 + blit 原地上传 ——
+    _SP_N = 96
+
+    def _render_stage(self):
+        """把圆封面(旋转)、光晕、96 根频谱条、白描边画进 512² RGBA。
+        只 blit 同一张 Texture：没有任何缓冲重分配 → 无驱动竞态。"""
         try:
-            self._sp_mesh.vertices = verts
-            self._sp_mesh.indices = idx
+            px = self._STAGE_PX
+            inner, outer = self._ring()
+            if outer <= inner:
+                return
+            side = getattr(self, "_st_side", outer * 2.35)
+            k = (px - 1) / side                      # 世界 px → 纹理 px
+            c = (px - 1) / 2.0
+            rim = outer * k
+            r_in = inner * k
+            r_cov = self._cover_r() * k
+            img = self._stage_img
+            img.paste((0, 0, 0, 0), (0, 0, px, px))
+            d = ImageDraw.Draw(img)
+            # 光晕（原版 glowR=1.35R）：几圈递减的半透明蓝做柔和外扩
+            ga = 0.16 + 0.18 * self._vis
+            glow_r = r_cov * 1.35
+            for gi in range(5):
+                rr = r_cov * (1.02 + 0.085 * gi)
+                aa = int(ga * (1.0 - gi / 5.0) * 255 * 0.45)
+                if aa > 3 and rr * 2 < px:
+                    d.ellipse([c - rr, c - rr, c + rr, c + rr],
+                              outline=(150, 170, 255, aa),
+                              width=max(1, int(glow_r * k * 0.04)))
+            # 96 根谱条：内→外 三段插值色（120,180,255 → 180,140,255 → 120,220,255）
+            step = 2.0 * math.pi / self._SP_N
+            line_w = max(2, int(r_in * 0.055 * 2))
+            for b in range(self._SP_N):
+                h = self._bands[b] if b < len(self._bands) else 0.0
+                try:
+                    h = float(h)
+                except Exception:
+                    h = 0.0
+                if h != h:
+                    h = 0.0
+                h = 0.0 if h < 0.0 else (1.0 if h > 1.0 else h)
+                ang = b * step - math.pi / 2.0
+                ca_, sa_ = math.cos(ang), math.sin(ang)
+                bar = (r_in + (rim - r_in) * (0.15 + 0.85 * h)) * 1.0
+                x0, y0 = c + ca_ * r_in, c + sa_ * r_in
+                x1, y1 = c + ca_ * bar, c + sa_ * bar
+                # 三段色（内紫外青）
+                seg = 3
+                for seg_i in range(seg):
+                    t0 = seg_i / float(seg)
+                    t1 = (seg_i + 1) / float(seg)
+                    p0 = (x0 + (x1 - x0) * t0, y0 + (y1 - y0) * t0)
+                    p1 = (x0 + (x1 - x0) * t1, y0 + (y1 - y0) * t1)
+                    col = _bar_color(t1)
+                    d.line([p0, p1], fill=col, width=line_w)
+            # 封面（旋转黑胶）或占位
+            rr = int(r_cov)
+            box = [c - r_cov, c - r_cov, c + r_cov, c + r_cov]
+            src = getattr(self, "_cover_pil", None)
+            if src is not None and r_cov > 4:
+                d_size = max(8, int(r_cov * 2))
+                cover = src if src.size == (d_size, d_size) else src.resize(
+                    (d_size, d_size), PILImage.BICUBIC)
+                cover = cover.rotate(math.degrees(self._rot) % 360,
+                                      resample=PILImage.BILINEAR)
+                mask = PILImage.new("L", cover.size, 0)
+                ImageDraw.Draw(mask).ellipse(
+                    [0, 0, cover.size[0] - 1, cover.size[1] - 1], fill=255)
+                img.paste(cover, (int(c - r_cov), int(c - r_cov)), mask)
+                d = ImageDraw.Draw(img)
+                d.ellipse(box, outline=(255, 255, 255, 64), width=2)
+            else:
+                d.ellipse(box, fill=(51, 61, 92, 230),
+                          outline=(158, 183, 250, 200), width=3)
+                # 占位音符
+                ur = r_cov * 0.3
+                d.ellipse([c - ur * 1.4, c - ur * 0.9, c - ur * 0.2, c + ur * 0.2],
+                          fill=(158, 183, 250, 230))
+                d.line([c - ur * 0.25, c - ur * 0.35,
+                        c - ur * 0.25, c + ur * 2.2],
+                       fill=(158, 183, 250, 230), width=max(2, int(ur * 0.22)))
+            self._stage_tex.blit_buffer(img.tobytes(), origin=(0, 0))
+            self._stage_dirty = False
         except Exception:
-            log_exc("spectrum mesh")
+            log_exc("_render_stage")
 
     # —— 歌词 ——
     def _update_lyrics(self):
@@ -469,28 +514,48 @@ class NowPlaying(FloatLayout):
             else:
                 lb.text = ""
 
-    # —— 进度条 ——
+    # —— 进度条（纹理方案）——
+    # 旧写法每帧给 RoundedRectangle 改 size（fill 宽度跟进度变）= 每帧重建
+    # 64 顶点缓冲，和频谱 Mesh 同款驱动竞态（真机上白色滑块被"拉长成条"
+    # 就是它被爆炸波及）。改：512×48 固定纹理，PIL 画 track/fill/白钮，
+    # blit 原地上传，canvas 只有一个不动的 Rectangle。
+    _PB_PX = 512
+    _PB_PY = 48
+
     def _update_track(self):
-        f = self._pos_frac
-        x0, w, y = self._seek_x0(), self._seek_w(), self._seek_y()
-        th = dp(4)
-        # track 复用 bg rectangle 组（独立 Color 略），用 edge 之外新增
-        if not hasattr(self, "_tk_done"):
+        if not hasattr(self, "_pb_tex"):
+            self._pb_img = PILImage.new("RGBA", (self._PB_PX, self._PB_PY),
+                                        (0, 0, 0, 0))
+            self._pb_tex = Texture.create(size=(self._PB_PX, self._PB_PY),
+                                          colorfmt="rgba")
             with self.canvas.after:
-                self._tkt_c = Color(1, 1, 1, 0.28)
-                self._tkt = RoundedRectangle(radius=[dp(2)])
-                self._tkf_c = Color(0.36, 0.55, 1.0, 1)
-                self._tkf = RoundedRectangle(radius=[dp(2)])
-                self._tkn_c = Color(1, 1, 1, 1)
-                self._tkn = RoundedRectangle(radius=[dp(9)])
-            self._tk_done = True
-        self._tkt.pos = (x0, y - th / 2.0)
-        self._tkt.size = (w, th)
-        self._tkf.pos = (x0, y - th / 2.0)
-        self._tkf.size = (max(th, w * f), th)
-        kx = x0 + w * f
-        self._tkn.pos = (kx - dp(9), y - dp(9))
-        self._tkn.size = (dp(18), dp(18))
+                self._pbc_c = Color(1, 1, 1, 1)
+                self._pbc_r = Rectangle(texture=self._pb_tex)
+        x0, w, y = self._seek_x0(), self._seek_w(), self._seek_y()
+        self._pbc_r.pos = (x0 - dp(4), y - dp(14))
+        self._pbc_r.size = (w + dp(8), dp(28))
+        im = self._pb_img
+        im.paste((0, 0, 0, 0), (0, 0, im.size[0], im.size[1]))
+        d = ImageDraw.Draw(im)
+        PW, PH = im.size
+        th = 8
+        yc = PH / 2.0
+        # 轨道（白 28%）
+        d.rounded_rectangle([4, yc - th / 2, PW - 4, yc + th / 2],
+                            radius=th / 2, fill=(255, 255, 255, 72))
+        # 已播（蓝）
+        f = max(0.0, min(1.0, self._pos_frac))
+        fx = 4 + (PW - 8) * f
+        if fx > 10:
+            d.rounded_rectangle([4, yc - th / 2, fx, yc + th / 2],
+                                radius=th / 2, fill=(92, 140, 255, 255))
+        # 白色滑块 + 极淡投影（PIL 里就是柔和一点双层）
+        d.ellipse([fx - 13, yc - 13, fx + 13, yc + 13], fill=(0, 0, 0, 60))
+        d.ellipse([fx - 12, yc - 12, fx + 12, yc + 12], fill=(255, 255, 255, 255))
+        try:
+            self._pb_tex.blit_buffer(im.tobytes(), origin=(0, 0))
+        except Exception:
+            log_exc("pb blit")
 
     # —— 自转呼吸（封面持续旋转 + 无数据时的静默） ——
     def _tick_paint(self, dt):
@@ -500,16 +565,12 @@ class NowPlaying(FloatLayout):
         except Exception:
             peak = 0.0
         self._vis += (peak - self._vis) * 0.08
-        rot_speed = 2.0 / 60.0 * 2 * math.pi        # 圈/分钟 → rad/s
-        self._rot += rot_speed * dt
-        try:
-            self._cv_rot.angle = math.degrees(self._rot) % 360
-            self._cv_rot.origin = (self._cx(), self._cy(), 0)
-        except Exception:
-            pass
+        self._rot += (2.0 / 60.0) * (2 * math.pi) * dt   # 黑胶 2 圈/分
         if self.opened:
-            self._update_spectrum()
+            self._stage_dirty = True
             self._update_lyrics()
+            if self._stage_dirty:
+                self._render_stage()
 
 
 def _esc(s):
@@ -525,45 +586,68 @@ def _fmt(sec):
 
 
 class _RoundGhost(Widget):
-    """顶部关闭钮：半透明白圆 + 叉（按钮型，自绘命中）"""
+    """顶部按钮：半透明白圆底 + 静态几何（wave/close）。
+    位置变化**只挪 Translate**，不重建任何顶点缓冲（防驱动竞态）。"""
+
     def __init__(self, kind, on_press=None, **kw):
         kw.setdefault("size_hint", (None, None))
         kw.setdefault("size", (dp(40), dp(40)))
         super(_RoundGhost, self).__init__(**kw)
         self._on_press = on_press
         self._kind = kind
-        from kivy.graphics import Line
+        from kivy.graphics import (Line, PopMatrix, PushMatrix, Translate)
         with self.canvas:
             self._bgc = Color(1, 1, 1, 0.14)
             self._bg = RoundedRectangle(radius=[dp(20)])
+            self._grp = PushMatrix()
+            self._tr = Translate(0, 0, 0)
             self._lc = Color(1, 1, 1, 0.85)
             self._ln = Line(points=[], width=dp(1.8))
-        self.bind(pos=self._draw, size=self._draw)
-        self._draw()
+            self._pop = PopMatrix()
+        self.bind(size=self._layout_bg, pos=self._move_only)
+        self._layout_bg()
+        self._build_glyph()
 
-    def _draw(self, *_):
+    def _layout_bg(self, *_):
         self._bg.pos = self.pos
         self._bg.size = self.size
-        cx = self.x + self.width / 2.0
-        cy = self.y + self.height / 2.0
+        self._build_glyph()
+
+    def _move_only(self, *_):
+        # 圆底跟位置；几何是局部坐标，只需平移
+        self._bg.pos = self.pos
+        try:
+            self._tr.xyz = (self.x, self.y, 0)
+        except Exception:
+            pass
+
+    def _build_glyph(self):
+        """局部坐标 (0..size) 画一次；pos 变化不再进来"""
+        u = min(self.width, self.height)
+        if u < 4:
+            return
+        cx, cy = u / 2.0, u / 2.0
         if self._kind == "wave":
-            u = min(self.width, self.height)
             pts = []
             for dx, hh in ((-0.24, 0.20), (0.0, 0.34), (0.24, 0.26)):
                 pts += [cx + u * dx, cy - u * hh, cx + u * dx, cy + u * hh]
             self._ln.points = pts
             self._ln.width = dp(2.2)
         else:
-            s = min(self.width, self.height) * 0.22
-            self._ln.points = [cx - s, cy - s, cx + s, cy + s,
-                               cx - s, cy + s, cx + s, cy - s]
+            g = u * 0.22
+            self._ln.points = [cx - g, cy - g, cx + g, cy + g,
+                               cx - g, cy + g, cx + g, cy - g]
             self._ln.width = dp(1.8)
-        self._lc.a = getattr(self, "_alpha", 0.85)
+        try:
+            self._tr.xyz = (self.x, self.y, 0)
+            self._lc.a = getattr(self, "_alpha", 0.85)
+        except Exception:
+            pass
 
     def set_active(self, on):
         self._alpha = 1.0 if on else 0.45
         try:
-            self._draw()
+            self._lc.a = self._alpha
         except Exception:
             pass
 
@@ -588,81 +672,108 @@ class _RoundGhost(Widget):
 
 
 class _RoundBig(Widget):
-    """播放大圆钮：极光蓝底 + play/pause 图形（mesh 三角）"""
+    """播放大圆钮：蓝底 + 白 play/pause 图标。
+    图标 mesh 只在 kind/尺寸变化时重建（6-24 顶点），位置变化走 Translate。"""
+
     def __init__(self, kind, on_press=None, **kw):
         kw.setdefault("size_hint", (None, None))
         kw.setdefault("size", (dp(64), dp(64)))
         super(_RoundBig, self).__init__(**kw)
         self._on_press = on_press
         self._kind = kind
-        from kivy.graphics import Mesh
+        from kivy.graphics import (Mesh, PopMatrix, PushMatrix, Translate)
         with self.canvas:
             self._gl_c = Color(0.30, 0.45, 1.0, 0.35)
             self._gl = Rectangle()
             self._bg_c = Color(0.24, 0.42, 1.0, 1)
             self._bg = RoundedRectangle(radius=[dp(32)])
+            self._grp = PushMatrix()
+            self._tr = Translate(0, 0, 0)
             self._ic_c = Color(1, 1, 1, 0.98)
             self._mesh = Mesh(mode="triangles", vertices=[], indices=[])
-        self.bind(pos=self._draw, size=self._draw)
-        self._draw()
+            self._pop = PopMatrix()
+        self._last_key = None
+        self.bind(pos=self._move_only, size=self._layout)
+        self._layout()
 
-    def set_kind(self, k):
-        self._kind = k
-        self._draw()
-
-    def _draw(self, *_):
+    def _layout(self, *_):
         self._bg.pos = self.pos
         self._bg.size = self.size
-        self._bg.radius = [min(self.width, self.height) / 2.0]
+        self._bg.radius = [min(self.width, self.height) / 2.0 * 0.98]
         g = min(self.width, self.height) * 1.9
         self._gl.pos = (self.x + (self.width - g) / 2.0,
                         self.y + (self.height - g) / 2.0)
         self._gl.size = (g, g)
-        cx = self.x + self.width / 2.0
-        cy = self.y + self.height / 2.0
+        self._build_icon()
+
+    def _move_only(self, *_):
+        self._bg.pos = self.pos
+        g = min(self.width, self.height) * 1.9
+        self._gl.pos = (self.x + (self.width - g) / 2.0,
+                        self.y + (self.height - g) / 2.0)
+        try:
+            self._tr.xyz = (self.x, self.y, 0)
+        except Exception:
+            pass
+
+    def _build_icon(self, *_):
         u = min(self.width, self.height) * 0.30
+        if u < 4:
+            return
+        cx, cy = self.width / 2.0, self.height / 2.0
         v, idx = [], []
         if self._kind == "play":
             p = [(cx - u * 0.55, cy + u), (cx - u * 0.55, cy - u),
                  (cx + u * 0.85, cy)]
-            v = [p[0][0], p[0][1], 0, 0, 1, 1, 1, 1,
-                 p[1][0], p[1][1], 0, 0, 1, 1, 1, 1,
-                 p[2][0], p[2][1], 0, 0, 1, 1, 1, 1]
+            for px, py in p:
+                v += [px, py, 0, 0, 1, 1, 1, 1]
             idx = [0, 1, 2]
         else:
             bw = u * 0.42
             for dx in (-u * 0.62, u * 0.18):
-                base = len(idx)
+                base = len(v) // 8
                 x0, x1 = cx + dx, cx + dx + bw
                 y0, y1 = cy - u * 1.05, cy + u * 1.05
-                v += [x0, y0, 0, 0, 1, 1, 1, 1,
-                      x1, y0, 0, 0, 1, 1, 1, 1,
-                      x1, y1, 0, 0, 1, 1, 1, 1,
-                      x0, y0, 0, 0, 1, 1, 1, 1,
-                      x1, y1, 0, 0, 1, 1, 1, 1,
-                      x0, y1, 0, 0, 1, 1, 1, 1]
+                for px, py in ((x0, y0), (x1, y0), (x1, y1),
+                               (x0, y0), (x1, y1), (x0, y1)):
+                    v += [px, py, 0, 0, 1, 1, 1, 1]
                 idx += [base, base + 1, base + 2,
                         base + 3, base + 4, base + 5]
+        key = (self._kind, round(u, 1), round(cx, 1), round(cy, 1))
+        if key == self._last_key:
+            return                      # 同一帧多次 pos/size 触发时**不重建**
+        self._last_key = key
         try:
             self._mesh.vertices = v
             self._mesh.indices = idx
+            self._tr.xyz = (self.x, self.y, 0)
         except Exception:
             pass
+
+    def set_kind(self, k):
+        if k == self._kind:
+            return
+        self._kind = k
+        self._last_key = None
+        self._build_icon()
 
     def on_touch_down(self, touch):
         if self.collide_point(*touch.pos):
             self._down = True
             self._bg_c.rgba = (0.16, 0.32, 0.9, 1)
-            self._bg.size = (self.width * 0.94, self.height * 0.94)
-            self._bg.pos = (self.x + (self.width - self.width * 0.94) / 2.0,
-                            self.y + (self.height - self.height * 0.94) / 2.0)
+            w = self.width * 0.94
+            h = self.height * 0.94
+            self._bg.size = (w, h)
+            self._bg.pos = (self.x + (self.width - w) / 2.0,
+                            self.y + (self.height - h) / 2.0)
             return True
         return False
 
     def on_touch_up(self, touch):
         if getattr(self, "_down", False):
             self._down = False
-            self._draw()
+            self._bg.pos = self.pos
+            self._bg.size = self.size
             if self.collide_point(*touch.pos) and self._on_press:
                 try:
                     self._on_press()
