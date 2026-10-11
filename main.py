@@ -761,105 +761,33 @@ class IconButton(SpringButton):
         draw_icon(self, kind, color=icon_color or C_TEXT)
 
 
-class MarqueeButton(FlatButton):
-    """歌名行按钮：文字超长时**行内裁剪 + 横向滚动**（marquee）。
-
-    治两个问题（用户报告）：
-    1. Kivy 的 canvas 不裁剪子内容 —— 长歌名的 Label 会溢出画到上下行上，
-       看起来"遮挡其他歌曲"。这里用 ScissorPush/Pop 把绘制钉死在本行矩形内。
-    2. 溢出部分不再靠换行硬塞 —— 单行完整显示"歌名 · 歌手 · 时长"，
-       超出的左右往复滚动（iOS 长按标题那种节奏：停顿→滑→停顿→回滑）。
-    """
-    _live = []                     # 当前需要滚动的行（全局调度器驱动）
-
-    def __init__(self, full_text="", **kw):
-        kw.setdefault("text", "")  # 文字由自管的 Label 子控件呈现
-        super(MarqueeButton, self).__init__(**kw)
-        from kivy.graphics import ScissorPop, ScissorPush
-        self._sp = ScissorPush()
-        self.canvas.before.add(self._sp)
-        with self.canvas.after:
-            ScissorPop()
-        self._lb = Label(text=full_text, text_size=(None, None),
-                         halign="left", valign="middle",
-                         font_size=dp(15), color=C_TEXT,
-                         **fonts.font_kwargs())
-        self.add_widget(self._lb)
-        self._full = full_text
-        self._tw = self._th = 0.0
-        self._avail = 1.0
-        self._need = False
-        self._phase = (sum(ord(ch) for ch in full_text) % 97) / 97.0
-        self.bind(pos=self._mq_layout, size=self._mq_layout)
-        self._mq_measure()
-        Clock.schedule_once(self._mq_layout, 0)     # 首帧布局后保险丝
-
-    def _mq_measure(self):
-        try:
-            from kivy.core.text import Label as CoreLabel
-            core = CoreLabel(text=self._full, font_size=dp(15),
-                             **fonts.font_kwargs())
+def clip_text(text, max_px, font_size=dp(15)):
+    """把一行文字截到 max_px 宽以内，超出加省略号——从源头保证不溢出，
+    替代上一版的 scissor+marquee 方案（真机上裁剪指令翻车，这里回退成
+    最朴素的截断：不溢出就不会遮挡其他行，零驱动风险）。"""
+    if not text or max_px <= 0:
+        return text or ""
+    try:
+        from kivy.core.text import Label as CoreLabel
+        core = CoreLabel(text=text, font_size=font_size, **fonts.font_kwargs())
+        core.refresh()
+        if core.texture_size[0] <= max_px:
+            return text
+        lo, hi = 0, len(text)
+        best = ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            trial = text[:mid] + "…"
+            core = CoreLabel(text=trial, font_size=font_size, **fonts.font_kwargs())
             core.refresh()
-            self._tw, self._th = core.texture_size
-        except Exception:
-            self._tw = self._th = 0.0
-
-    def _mq_layout(self, *_):
-        try:
-            avail = self.width - dp(32)
-            self._need = self._tw > avail + dp(3)
-            self._avail = max(1.0, avail)
-            self._sp.rectangle = (self.x + dp(12), self.y + 1,
-                                  max(2.0, self.width - dp(24)),
-                                  max(2.0, self.height - 2))
-            self._mq_apply(0.0)
-            reg = MarqueeButton._live
-            got = any(r is self for r in reg)
-            if self._need and not got:
-                reg.append(self)
-            elif not self._need and got:
-                MarqueeButton._live[:] = [r for r in reg if r is not self]
-        except Exception:
-            log_exc("mq layout")
-
-    def _mq_apply(self, off):
-        try:
-            self._lb.pos = (self.x + dp(16) - (off or 0.0),
-                            self.y + (self.height - self._th) / 2.0)
-        except Exception:
-            pass
-
-
-def _mq_step(dt):
-    """全局 15Hz 滚动调度：只动溢出的行；行被回收自动清名册。"""
-    reg = MarqueeButton._live
-    if not reg:
-        return
-    t = time.time()
-    alive = []
-    for r in reg:
-        try:
-            if r.parent is None or not r._need:
-                continue                     # 列表已清/换页
-            over = r._tw - r._avail
-            cyc = 7.5 + over / 60.0          # 越长滚得越从容
-            ph = (t / cyc + r._phase) % 1.0
-            if ph < 0.18:
-                off = 0.0
-            elif ph < 0.5:
-                off = over * (ph - 0.18) / 0.32
-            elif ph < 0.68:
-                off = over
+            if core.texture_size[0] <= max_px:
+                best = trial
+                lo = mid + 1
             else:
-                off = over * (1.0 - (ph - 0.68) / 0.32)
-            r._mq_apply(off)
-            alive.append(r)
-        except Exception:
-            continue
-    MarqueeButton._live[:] = alive
-
-
-Clock.schedule_interval(_mq_step, 1.0 / 15.0)
+                hi = mid - 1
+        return best or (text[:1] + "…")
+    except Exception:
+        return text
 
 
 class SearchInput(TextInput):
@@ -2255,10 +2183,20 @@ class LxApp(App):
         row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(4),
                         padding=(0, dp(16), 0, 0))
         # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
-        song_btn = MarqueeButton(
-            full_text="%s  ·  %s  ·  %s" % (s["name"], s["singer"],
-                                             s.get("interval") or "--:--"),
-            bg_color=C_ITEM, radius=0, **self.F)
+        try:
+            avail = max(60.0, self.results.width - dp(72))  # 卡宽-内衬-按钮列
+        except Exception:
+            avail = dp(240)
+        name1 = clip_text(s["name"], avail)
+        line2 = "%s · %s" % (s["singer"], s.get("interval") or "--:--")
+        line2 = clip_text(line2, avail, dp(12))
+        song_btn = FlatButton(
+            text="%s\n%s" % (name1, line2),
+            halign="left", valign="middle", font_size=dp(15),
+            color=C_TEXT, bg_color=C_ITEM, radius=0,
+            padding=(dp(16), dp(6)), **self.F)
+        song_btn.bind(size=lambda b, v: setattr(b, "text_size",
+                                                (v[0] - dp(32), None)))
         song_btn.bind(on_release=lambda b, idx=i: self.play_song(idx))
         row.add_widget(song_btn)
         row._song_btn = song_btn

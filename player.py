@@ -194,7 +194,15 @@ class Player:
             def onPrepared(self, mp):
                 try:
                     # 代际校验：这实例出生时的那首歌已被取代 → 不上场，自我了断
-                    if player._gen_of.get(mp, -1) != getattr(player, "_gen", 0):
+                    # ⚠ 不能用 mp 本身当 dict 键——pyjnius 每次跨 JNI 都会把同一
+                    #   个 Java 对象包成**新的 Python 代理**，默认哈希按代理算，
+                    #   注册时和回调时根本对不上（上一版因此把每首都拒播了）。
+                    #   Java 的 Object.hashCode() 才是同一底层对象的稳定身份。
+                    try:
+                        _mk = mp.hashCode()
+                    except Exception:
+                        _mk = id(mp)
+                    if player._gen_of.get(_mk, -1) != getattr(player, "_gen", 0):
                         try:
                             mp.stop()
                         except Exception:
@@ -258,7 +266,10 @@ class Player:
                 mp.setOnErrorListener(err)
                 mp.setOnCompletionListener(done)
                 mp.setDataSource(url)
-                self._gen_of[mp] = my_gen
+                try:
+                    self._gen_of[mp.hashCode()] = my_gen
+                except Exception:
+                    self._gen_of[id(mp)] = my_gen
                 mp.prepareAsync()
                 # 只有仍属当前代际才接管（否则 onPrepared 的代际校验会回收它）
                 if self._gen == my_gen:
