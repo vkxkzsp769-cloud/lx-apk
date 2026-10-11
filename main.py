@@ -790,6 +790,52 @@ def clip_text(text, max_px, font_size=dp(15)):
         return text
 
 
+_MQ_ROWS = {}          # button -> [parts(list), idx, line2]
+_MQ_STEP = 2.6         # 秒/段
+
+
+def _mq_parts(full, avail, font_size):
+    """把长文字切成每段宽度不超 avail 的分段（预留省略号位）。"""
+    per = len(full)
+    while per > 8:
+        trial = full[:per + 1]
+        if len(clip_text(trial, avail, font_size)) - 1 <= per:   # 能容 per+省略号
+            break
+        per = int(per * 0.85)
+    per = max(8, per)
+    parts = [full[i:i + per] for i in range(0, len(full), per)]
+    out = []
+    for k, seg in enumerate(parts):
+        p = seg
+        if k > 0:
+            p = "…" + p
+        if k < len(parts) - 1:
+            p = p + "…"
+        out.append(p)
+    return out
+
+
+def _mq_scroll(dt):
+    """全局定时器：溢出的行每隔 _MQ_STEP 换一段 —— 视觉上就是横向滚动。
+    纯换 text（截断保证每段不超行宽）→ 无裁剪指令、无缓冲，驱动零风险。"""
+    if not _MQ_ROWS:
+        return
+    for b, st in list(_MQ_ROWS.items()):
+        try:
+            if b.parent is None:
+                _MQ_ROWS.pop(b, None)
+                continue
+            parts, idx, line2 = st
+            idx = (idx + 1) % len(parts)
+            st[1] = idx
+            b.text = "%s\n%s" % (parts[idx], line2)
+        except Exception:
+            _MQ_ROWS.pop(b, None)
+
+
+Clock.schedule_interval(_mq_scroll, _MQ_STEP)
+
+
 class SearchInput(TextInput):
     """搜索输入框。
 
@@ -2184,10 +2230,12 @@ class LxApp(App):
                         padding=(0, dp(16), 0, 0))
         # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
         try:
-            avail = max(60.0, self.results.width - dp(72))  # 卡宽-内衬-按钮列
+            # 文字区精确预算：行宽 - 下载列(58+4) - 左右内衬(32)
+            avail = max(60.0, self.results.width - dp(94))
         except Exception:
-            avail = dp(240)
-        name1 = clip_text(s["name"], avail)
+            avail = dp(220)
+        full_name = s["name"]
+        name1 = clip_text(full_name, avail)
         line2 = "%s · %s" % (s["singer"], s.get("interval") or "--:--")
         line2 = clip_text(line2, avail, dp(12))
         song_btn = FlatButton(
@@ -2195,9 +2243,14 @@ class LxApp(App):
             halign="left", valign="middle", font_size=dp(15),
             color=C_TEXT, bg_color=C_ITEM, radius=0,
             padding=(dp(16), dp(6)), **self.F)
+        # 上一版遮挡真因：截断预算比真实文字区宽了 22dp，截完仍超 → 换行
+        # 撑出第三行 → 纵向溢出盖住别的歌。这里 text_size 高度**封顶**，
+        # 即便截断估计有出入也只会在框内，绝不外溢；预算同时改对。
         song_btn.bind(size=lambda b, v: setattr(b, "text_size",
-                                                (v[0] - dp(32), None)))
+                                                (v[0] - dp(32), dp(58))))
         song_btn.bind(on_release=lambda b, idx=i: self.play_song(idx))
+        if name1 != full_name:                      # 溢出 → 注册分段横向滚动
+            _MQ_ROWS[song_btn] = [_mq_parts(full_name, avail, dp(15)), 0, line2]
         row.add_widget(song_btn)
         row._song_btn = song_btn
 
