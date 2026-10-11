@@ -33,6 +33,14 @@ class Player:
 
     def __init__(self):
         self._mp = None            # android.media.MediaPlayer
+        # 播放代际号：每次 play/stop 递增。修复“快速换歌双首重叠”——
+        # _build 是投到 UI 线程执行的，self._mp 要等它在 UI 线程跑完才被赋值；
+        # 在它跑完前用户又点了下一首，stop() 看到的 _mp 还是旧的/None，
+        # 什么都没释放 → 两首歌各自 start()，而界面只握得住后创建的实例
+        # （前一首成孤儿，停不掉）。所有 MediaPlayer 都带出生时的号，
+        # 号不对 = 已被取代 → 拒绝 start 并自我释放。
+        self._gen = 0
+        self._gen_of = {}          # mp -> 出生代际
         self._sound = None         # 桌面兜底
         self._state = self.IDLE
         self._duration = 0.0
@@ -119,6 +127,9 @@ class Player:
         finally:
             self._state = self.IDLE
             self._listeners = []
+            # 在途的“正在创建/已 prepare 未播”的实例全部作废
+            self._gen = getattr(self, "_gen", 0) + 1
+            self._gen_of = {}
 
     # ---------- 错误确认 ----------
     def _note_error(self, what, extra, delay=2.5):
@@ -154,6 +165,7 @@ class Player:
         界面记得用 ui() 转回主线程。
         """
         self.stop()
+        self._gen = getattr(self, "_gen", 0) + 1
         self._on_event = on_event
         self._state = self.BUFFERING
         if IS_ANDROID:
@@ -181,6 +193,17 @@ class Player:
             @java_method("(Landroid/media/MediaPlayer;)V")
             def onPrepared(self, mp):
                 try:
+                    # 代际校验：这实例出生时的那首歌已被取代 → 不上场，自我了断
+                    if player._gen_of.get(mp, -1) != getattr(player, "_gen", 0):
+                        try:
+                            mp.stop()
+                        except Exception:
+                            pass
+                        try:
+                            mp.release()
+                        except Exception:
+                            pass
+                        return
                     # 作废可能已经排上的错误确认（见 _note_error）
                     player._error_gen = getattr(player, "_error_gen", 0) + 1
                     player._duration = max(0.0, mp.getDuration() / 1000.0)
@@ -216,8 +239,12 @@ class Player:
         prep, err, done = _Prepared(), _Error(), _Done()
         self._listeners = [prep, err, done]     # 保活，防 GC
 
+        my_gen = getattr(self, "_gen", 0)
+
         def _build():
             try:
+                if self._gen != my_gen:
+                    return          # 排队期间已被新播放取代，不再创建
                 mp = MediaPlayer()
                 try:
                     b = AudioAttributesBuilder()
@@ -231,8 +258,11 @@ class Player:
                 mp.setOnErrorListener(err)
                 mp.setOnCompletionListener(done)
                 mp.setDataSource(url)
+                self._gen_of[mp] = my_gen
                 mp.prepareAsync()
-                self._mp = mp
+                # 只有仍属当前代际才接管（否则 onPrepared 的代际校验会回收它）
+                if self._gen == my_gen:
+                    self._mp = mp
                 diag("MediaPlayer 已创建并 prepareAsync: %s" % url[:80])
             except Exception as e:
                 log_exc("MediaPlayer 创建")
