@@ -44,9 +44,6 @@ from kivy.uix.floatlayout import FloatLayout
 import appenv
 import bgfx
 import downloader
-import nowplaying
-import songmedia
-import visuz
 import fonts
 import searchers
 import player as player_mod
@@ -104,15 +101,6 @@ COUNT_VALUE = {"20 首": 20, "50 首": 50, "100 首": 100,
                "200 首": 200, "300 首": 300, "全部": None}
 
 TIME_FMT = "%02d:%02d"
-
-
-def Window_h():
-    """窗口高度（np 待命位置用）；拿不到窗口时给个安全值"""
-    try:
-        from kivy.core.window import Window as _W
-        return _W.height
-    except Exception:
-        return dp(760)
 
 
 def fmt_time(sec):
@@ -1111,23 +1099,6 @@ class LxApp(App):
         root.add_widget(self.sheet)
         self._sheet_open = False
 
-        # 「正在播放」全屏层（圆形封面+频谱环+歌词）挂最顶层；
-        # 主界面播放条原样不动 —— 这是加法。
-        try:
-            self.np = nowplaying.NowPlaying(
-                on_close=self._np_closed,
-                on_play_pause=lambda: self.toggle_play(),
-                on_scrub=self._np_scrub,
-                on_retry_vis=lambda: self.np_retry_visualizer())
-            root.add_widget(self.np)
-            self.np.y = -Window_h()       # 屏幕下沿外待命
-        except Exception:
-            log_exc("创建正在播放层")
-            self.np = None                # 增强层起不来不能拖垮主 App
-        self._vis = visuz.Visuz()
-        self._vis_perm_asked = False
-        self._np_ev = None
-
         Clock.schedule_once(self._guard(self._boot), 0.2)
         Clock.schedule_interval(self._guard(self._tick), 0.5)
 
@@ -1381,7 +1352,6 @@ class LxApp(App):
             self._rebuild_chips()
             self._hist_attach_parts()
             self._hist_box.opacity = 0.0
-            Animation.cancel_all(self._hist_box)   # 开/关抢 height 同理
             Animation(height=dp(96), opacity=1.0, d=0.30,
                       t=spring_t).start(self._hist_box)
             # 保险丝带世代号：快速「展开→收起」时，旧的展开保险丝必须作废，
@@ -1407,7 +1377,6 @@ class LxApp(App):
             if not getattr(self, "_hist_open", False):
                 return
             self._hist_open = False
-            Animation.cancel_all(self._hist_box)
             Animation(height=0, opacity=0.0, d=0.22,
                       t="out_cubic").start(self._hist_box)
             self._hist_gen = getattr(self, "_hist_gen", 0) + 1
@@ -1634,11 +1603,6 @@ class LxApp(App):
                          on_touch_up=self._seek_up)
         prow.add_widget(VCenter(self.slider, h=dp(52)))
 
-        self.btn_expand = IconButton("expand", dia=dp(38), icon_color=C_ACCENT,
-                                     bg=(0.926, 0.953, 1.0, 1))
-        self.btn_expand.bind(on_release=lambda *_: self._np_show_for(self._cur_song))  # np=None 时内部直接 return
-        prow.add_widget(self.btn_expand)
-
         self.lbl_time = Label(text="00:00 / 00:00", size_hint_x=None,
                               width=dp(92), font_size=dp(12), color=C_DIM,
                               halign="right", valign="middle", **self.F)
@@ -1843,7 +1807,6 @@ class LxApp(App):
             self._fill_dir_presets()
             self._refresh_proxy_label()
             vibrate(10)
-            Animation.cancel_all(self.sheet)   # 防开/关动画抢同一个 y
             Animation(y=0, d=0.5, t=spring_t).start(self.sheet)
             Animation(_scrim_a=0.34, d=0.30, t="out_quad").start(self)
             self._main_zoom(0.965)
@@ -1897,7 +1860,6 @@ class LxApp(App):
             if not getattr(self, "_sheet_open", False):
                 return
             self._sheet_open = False
-            Animation.cancel_all(self.sheet)
             Animation(y=-self._sheet_h, d=0.34, t="out_cubic").start(self.sheet)
             Animation(_scrim_a=0.0, d=0.30, t="out_quad").start(self)
             self._main_zoom(1.0)
@@ -2639,135 +2601,6 @@ class LxApp(App):
         self._popup.open()
         Animation(opacity=1.0, duration=0.22, t=spring_t).start(self._popup)
 
-    # ---------- 「正在播放」全屏层（新增；不改既有播放控制） ----------
-    def _np_show_for(self, song):
-        """弹出全屏层；封面/歌词后台线程取；频谱走 Visualizer（需麦克风权限）"""
-        if getattr(self, "np", None) is None:
-            return
-        try:
-            song = song or {}
-            plat = song.get("platform") or self._current_source()
-            self.np.set_song(song.get("name", ""), song.get("singer", ""))
-            self.np.set_cover(None)            # 先清掉上一首的图
-            self.np.set_lyrics([])
-            dur = self._cur_duration or 0
-            try:
-                parts = (song.get("interval") or "").split(":")
-                if len(parts) == 2 and not dur:
-                    dur = int(parts[0]) * 60 + int(parts[1])
-            except Exception:
-                pass
-            self.np.set_progress(0, dur)
-            self.np.open()
-            self._np_start_tick()
-            if not self._vis.ok:
-                if not self._vis_perm_asked:
-                    self._vis_perm_asked = True
-                    self._vis.request_permission()
-                    Clock.schedule_once(lambda *_: self._np_fallback(), 1.4)
-                else:
-                    self._np_fallback()
-            def _work():
-                cover = songmedia.download_cover(plat, song)
-                lines = songmedia.parse_lrc(songmedia.lyric_text(plat, song))
-                def _apply():
-                    try:
-                        tex = None
-                        if cover:
-                            from kivy.core.image import Image as CoreImage
-                            tex = CoreImage(cover).texture
-                        self.np.set_cover(tex)
-                        self.np.set_lyrics(lines)
-                        if not lines:
-                            diag("这首歌没有歌词（%s）" % plat)
-                    except Exception:
-                        log_exc("np 封面/歌词应用")
-                self.ui(_apply)
-            self.bg(_work, "np-media")
-        except Exception:
-            log_exc("_np_show_for")
-
-    def _np_fallback(self):
-        """没权限/驱动拒绝 → 真频谱不可用。明确告知 + 给再试入口。"""
-        if self._vis.start():
-            return
-        self.set_status("频谱未激活（没拿到麦克风权限或系统不支持）——"
-                        "谱条为跟拍律动，点播放页右上『♪』可再次申请", C_DIM)
-
-    def np_retry_visualizer(self, *_):
-        """np 页右上音波按钮：再申请一次权限并尝试启动"""
-        if getattr(self, "np", None) is None:
-            return
-        try:
-            vibrate(8)
-            self._vis.request_permission()
-            self.set_status("已再次申请权限：允许后回到播放页即跳真频谱")
-            Clock.schedule_once(lambda *_: self._np_fallback(), 1.4)
-        except Exception:
-            log_exc("np_retry_visualizer")
-
-    def _np_start_tick(self):
-        if self._np_ev is None:
-            self._np_ev = Clock.schedule_interval(
-                self._guard(self._np_tick), 1.0 / 30.0)
-
-    def _np_closed(self):
-        # 收起时停掉 30Hz 轮询省电；Visualizer 保留待命
-        if getattr(self, "np", None) is None:
-            return
-        if self._np_ev is not None:
-            try:
-                self._np_ev.cancel()
-            except Exception:
-                pass
-            self._np_ev = None
-
-    def _np_tick(self, dt):
-        if getattr(self, "np", None) is None:
-            return
-        try:
-            pos = self.player.position()
-            total = (self._cur_duration or self.player.duration()
-                     or 0)
-            live = self._vis.ok
-            if getattr(self, "_np_live", None) != live:
-                self._np_live = live
-                self.np.set_visualizer_live(live)
-            bands = self._vis.bands(96)
-            if bands is None:
-                # Visualizer 没数据时用「跟拍律动」兜底：按播放进度合成
-                # 频谱形态（明确告知是模拟），谱条不再是死的一动不动
-                bands = self._np_fake_bands(pos)
-            self.np.set_progress(pos, total, bands)
-        except Exception:
-            log_exc("_np_tick")
-
-    def _np_fake_bands(self, pos):
-        import math as _m
-        t = float(pos)
-        beat = t * 2.1                       # ≈126 BPM 观感节奏
-        kick = max(0.0, 1.0 - (beat % 1.0) * 2.6) ** 2
-        out = []
-        for i in range(96):
-            f = i / 96.0
-            v = (1.0 - f) * (0.22 + 0.85 * kick) \
-                + 0.16 * abs(_m.sin(t * 3.1 + i * 0.55)) * (1 - f * 0.55) \
-                + 0.08 * _m.sin(t * 7.7 + i * 2.1) + 0.05
-            out.append(max(0.0, min(1.0, v)))
-        return out
-
-    def _np_scrub(self, frac):
-        """全屏层进度条：拖到哪跳到哪（复用既有 player.seek 契约）"""
-        if getattr(self, "np", None) is None:
-            return
-        try:
-            total = self._cur_duration or self.player.duration()
-            if total:
-                self.player.seek(frac * total)
-                self.slider.value = max(0, min(1000, frac * 1000))
-        except Exception:
-            log_exc("_np_scrub")
-
     # ---------- 播放 ----------
     def play_current(self):
         if not getattr(self, "_cur_url", None):
@@ -2778,7 +2611,6 @@ class LxApp(App):
         self.player.play(self._cur_url, on_event=self._on_player_event)
         self.btn_play.text = "暂停"
         self._bg_playing(True)
-        self._np_show_for(self._cur_song)      # 播放即弹「正在播放」（用户要求）
 
     def _bg_playing(self, on):
         """把播放状态同步给动态背景（没建背景时静默跳过）"""
@@ -2807,19 +2639,11 @@ class LxApp(App):
         self.pb.value = 0
         self._cur_duration = float(duration or 0) or float(self._cur_dur or 0)
         self.btn_play.text = "暂停"
-        try:
-            self.np.set_playing(True)
-        except Exception:
-            pass
         self.set_status("正在播放: %s" % (self._cur_song or {}).get("name", ""),
                         C_OK)
 
     def _player_error(self, msg):
         self.btn_play.text = "播放"
-        try:
-            self.np.set_playing(False)
-        except Exception:
-            pass
         self._bg_playing(False)
         self.set_status("播放失败: %s" % msg, C_ERR)
 
@@ -2868,10 +2692,6 @@ class LxApp(App):
 
     def _player_finished(self):
         self.btn_play.text = "播放"
-        try:
-            self.np.set_playing(False)
-        except Exception:
-            pass
         self._bg_playing(False)
         self.slider.value = 0
         self.lbl_time.text = "00:00 / 00:00"
