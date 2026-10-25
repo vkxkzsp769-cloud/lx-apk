@@ -69,7 +69,11 @@ android.presplash_color = #F2F2F6
 #       android.permission.MANAGE_EXTERNAL_STORAGE，正是官方权限名，可直接用。
 #       不要用 android.extra_manifest_xml —— buildozer 把它当「文件路径」open()，
 #       填内联 XML 会 FileNotFoundError 导致编译失败。
-android.permissions = INTERNET, ACCESS_NETWORK_STATE, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE, MANAGE_EXTERNAL_STORAGE
+android.permissions = INTERNET, ACCESS_NETWORK_STATE, READ_EXTERNAL_STORAGE, WRITE_EXTERNAL_STORAGE, MANAGE_EXTERNAL_STORAGE, POST_NOTIFICATIONS, REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+
+# 原生 MediaSession.Callback/通知接收器（进程内，无前台服务）。
+# Java 由 p4a 编译，不依赖 source.include_exts 将其打入 Python 资源包。
+android.add_src = android_src
 
 # 明文 HTTP（音源有 11 个 http:// 主机）不能靠
 # android.extra_manifest_application_arguments 配置 ——

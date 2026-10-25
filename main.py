@@ -50,6 +50,8 @@ import searchers
 import player as player_mod
 import qqresolve
 import songinfo
+from music_library import MusicLibrary, PlaybackQueue, song_key
+from media_notification import MediaNotification
 from appenv import (IS_ANDROID, SOURCE_FILE, default_source_path, diag,
                     download_dir, ensure_source, extract_bundled_sources, log,
                     log_exc, preset_dirs, request_all_files_access,
@@ -761,6 +763,19 @@ class IconButton(SpringButton):
         draw_icon(self, kind, color=icon_color or C_TEXT)
 
 
+def fit_text(label, pad_x=0.0):
+    """把 Label 的文字宽度锁到控件宽度（再减 pad_x），高度交给 Kivy 自动。
+
+    替代散落各处的 `bind(size=lambda b, v: setattr(b,'text_size',(v[0]-x,None)))`：
+    多行/中文标签必须等控件排好宽度再重排，否则首帧会按默认宽度渲染、
+    换行位置不对（历史踩过）。返回 label，方便链式调用。
+    """
+    def _on_size(b, size):
+        b.text_size = (max(0.0, size[0] - pad_x), None)
+    label.bind(size=_on_size)
+    return label
+
+
 def clip_text(text, max_px, font_size=dp(15)):
     """把一行文字截到 max_px 宽以内，超出加省略号——从源头保证不溢出，
     替代上一版的 scissor+marquee 方案（真机上裁剪指令翻车，这里回退成
@@ -1088,12 +1103,25 @@ class LxApp(App):
     def build(self):
         self.bridge = LxBridge()
         self.player = player_mod.Player()
+        self.library = MusicLibrary(self.user_data_dir)
+        self.queue = PlaybackQueue()
+        self.media = MediaNotification(self._media_action)
+        self._view = 'discover'
+        self._view_gen = 0
+        self._rows_gen = 0
+        self._search_songs = []
+        self._playing_song = None
+        self._playing_url = None
+        self._playing_dur = 0.0
+        self._daily_loading = False
+        self._daily_offset = 0          # 每日推荐「换一批」批次号（0=当天首批）
         self.songs = []           # 搜索结果
         self.platforms = []       # [{source,name,qualitys}]
         self.busy = False
         self._asked_permission = False
         self._cur_duration = 0.0  # 当前播放时长（秒）
         self._dragging = False    # 用户正在拖进度条
+        self._ending = False      # _tick 已判定本曲结束（防 ended 重复切歌）
         self._cur_song = None
         self._cur_url = None
         self._cur_ext = None
@@ -1137,6 +1165,7 @@ class LxApp(App):
         self.main.add_widget(self._build_header())
         self.main.add_widget(self._build_search())
         self.main.add_widget(self._build_hist())
+        self.main.add_widget(self._build_navigation())
         self.main.add_widget(self._build_results())
         self.main.add_widget(self._build_footer())
         root.add_widget(self.main)
@@ -1208,9 +1237,9 @@ class LxApp(App):
         box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(94),
                         padding=(dp(20), dp(10), dp(20), dp(2)), spacing=dp(0))
         row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(10))
-        t = Label(text="落雪音源", bold=True, font_size=dp(27),
+        t = Label(text="落雪 · 音乐", bold=True, font_size=dp(27),
                   halign="left", valign="middle", color=C_TEXT, **self.F)
-        t.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        fit_text(t)
         row.add_widget(t)
         row.add_widget(Widget())
         self.btn_set = IconButton("settings", dia=dp(42), icon_color=C_DIM,
@@ -1221,9 +1250,236 @@ class LxApp(App):
         self.lbl_sub = Label(text="", size_hint_y=None, height=dp(22),
                              font_size=dp(12), color=C_FAINT,
                              halign="left", valign="middle", **self.F)
-        self.lbl_sub.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        fit_text(self.lbl_sub)
         box.add_widget(self.lbl_sub)
         return box
+
+    def _build_navigation(self):
+        wrap = BoxLayout(size_hint_y=None, height=dp(52),
+                         padding=(dp(16), dp(4), dp(16), dp(6)), spacing=dp(6))
+        self.nav_buttons = {}
+        for key, text in [('discover', '发现'), ('daily', '每日推荐'),
+                          ('favorites', '我的收藏')]:
+            btn = SpringButton(text=text, font_size=dp(14), pill=True,
+                               bg_color=C_ACCENT if key == self._view else C_CTRL,
+                               color=C_WHITE if key == self._view else C_TEXT, **self.F)
+            btn.bind(on_release=lambda b, k=key: self.show_library_view(k))
+            self.nav_buttons[key] = btn
+            wrap.add_widget(btn)
+        return wrap
+
+    def show_library_view(self, view):
+        self._hide_hist()
+        self._view = view
+        self._view_gen += 1
+        # 刷新按钮默认收起，仅每日推荐视图显示
+        try:
+            self.btn_daily_refresh.opacity = 0.0
+            self.btn_daily_refresh.disabled = True
+        except Exception:
+            pass
+        for key, btn in self.nav_buttons.items():
+            btn.bg_color = C_ACCENT if key == view else C_CTRL
+            btn.color = C_WHITE if key == view else C_TEXT
+        if view == 'favorites':
+            self._show_results(self.library.favorites)
+            self.hint.text = '我的收藏 · %d 首，点星标可移除' % len(self.songs)
+            self.lbl_sub.text = '我的收藏 · %d 首' % len(self.library.favorites)
+            if not self.songs:
+                self._empty_results('还没有收藏\n点歌曲右侧的星标，把喜欢留在这里')
+        elif view == 'daily':
+            platform = self._current_source()
+            cached = self.library.cached_daily(platform, offset=self._daily_offset)
+            self._show_results(cached)
+            self.hint.text = '每日推荐 · %s · 每天更新，非平台私人推荐' % time.strftime('%m/%d')
+            self.lbl_sub.text = '每日推荐 · %s' % time.strftime('%m/%d')
+            try:
+                self.btn_daily_refresh.opacity = 1.0
+                self.btn_daily_refresh.disabled = False
+            except Exception:
+                pass
+            if cached:
+                return
+            if self._daily_loading:
+                self._empty_results('正在整理今天的推荐，请稍候…')
+                return
+            self._empty_results('正在寻找今天值得听的歌…')
+            self._daily_loading = True
+            terms = self.library.daily_terms(platform, offset=self._daily_offset)
+            def work():
+                songs, errors = [], []
+                for term in terms:
+                    try:
+                        songs.extend(searchers.search(platform, term, 10))
+                    except Exception as exc:
+                        errors.append(str(exc))
+                self.ui(lambda: self._daily_ready(platform, songs, errors,
+                                                  self._daily_offset))
+            self.bg(work, 'daily-recommendations')
+        else:
+            self._show_results(self._search_songs)
+            if not self.songs:
+                self._empty_results('遇见下一首喜欢的歌\n搜索歌名、歌手，或打开每日推荐')
+                self.hint.text = '发现音乐 · 搜索你喜欢的声音'
+            self.lbl_sub.text = '发现音乐 · %d 个平台' % len(self.platforms)
+
+    def _daily_ready(self, platform, songs, errors, offset=0):
+        self._daily_loading = False
+        try:
+            self.btn_daily_refresh.disabled = False
+        except Exception:
+            pass
+        songs = self.library._unique(songs)
+        if songs:
+            try:
+                self.library.store_daily(platform, songs, offset=offset)
+            except OSError:
+                self.set_status('日推缓存写入失败，本次仍可收听', C_ERR)
+        if self._view != 'daily':
+            return
+        if platform != self._current_source():
+            self.show_library_view('daily')
+            return
+        self._show_results(songs[:30])
+        self.hint.text = '每日推荐 · %s · 根据收藏歌手与每日主题生成' % time.strftime('%m/%d')
+        if not songs:
+            self._empty_results('暂时没有获取到推荐\n检查网络后，点「换一批」重试')
+            self.set_status('推荐获取失败: ' + (errors[0] if errors else '暂无结果'), C_ERR)
+
+    def refresh_daily(self, *_):
+        """每日推荐「换一批」：绕过当天缓存，用新批次号重新生成推荐。
+
+        批次号 +1 后 daily_terms 的种子变了，关键词不同 → 得到另一批歌。
+        刷新中给加载态；失败时保留可重试入口（按钮仍在）。
+        不触碰收藏、切歌、通知等已有逻辑。
+        """
+        if self._view != 'daily':
+            return
+        if self._daily_loading:
+            self.set_status("正在换一批，请稍候…")
+            return
+        platform = self._current_source()
+        self._daily_loading = True
+        try:
+            self.btn_daily_refresh.disabled = True
+        except Exception:
+            pass
+        self._daily_offset += 1
+        self.hint.text = '每日推荐 · %s · 正在换一批…' % time.strftime('%m/%d')
+        self._empty_results('正在寻找下一批值得听的歌…')
+        terms = self.library.daily_terms(platform, offset=self._daily_offset)
+        def work():
+            songs, errors = [], []
+            for term in terms:
+                try:
+                    songs.extend(searchers.search(platform, term, 10))
+                except Exception as exc:
+                    errors.append(str(exc))
+            self.ui(lambda: self._daily_ready(platform, songs, errors,
+                                              self._daily_offset))
+        self.bg(work, 'daily-recommendations-refresh')
+
+    def _empty_results(self, text):
+        self._clear_results()
+        label = Label(text=text, size_hint_y=None, height=dp(150),
+                      color=C_DIM, font_size=dp(14), halign='center',
+                      valign='middle', **self.F)
+        label.bind(size=lambda b, v: setattr(b, 'text_size', (max(0, v[0]-dp(24)), v[1])))
+        self.results.add_widget(label)
+
+    def toggle_favorite(self, song):
+        try:
+            added = self.library.toggle(song)
+        except (OSError, ValueError) as exc:
+            self.set_status('收藏保存失败: %s' % exc, C_ERR)
+            return
+        self.set_status('已加入收藏' if added else '已取消收藏', C_OK)
+        if self._view == 'favorites':
+            self._show_results(self.library.favorites)
+            self.hint.text = '我的收藏 · %d 首' % len(self.songs)
+            if not self.songs:
+                self._empty_results('还没有收藏\n点歌曲右侧的星标，把喜欢留在这里')
+        else:
+            for row in self.results.children:
+                if hasattr(row, '_favorite'):
+                    s, btn = row._favorite
+                    btn.text = '★' if self.library.contains(s) else '☆'
+        self._sync_now_playing()
+
+    def _sync_now_playing(self):
+        song = self._playing_song
+        self.now_title.text = song.get('name', '') if song else '还没有播放歌曲'
+        self.now_artist.text = ('%s · %s' % (song.get('singer', ''),
+                               PLATFORM_LABEL.get(song.get('platform'), '音乐'))) if song else '选一首歌，让音乐开始'
+        self.btn_fav.disabled = not bool(song)
+        self.btn_fav.text = '★' if song and self.library.contains(song) else '☆'
+        for btn in (self.btn_prev, self.btn_next):
+            btn.disabled = not bool(self.queue.songs)
+
+    def _sync_media_notification(self):
+        """把当前播放状态/进度同步给通知中心。
+
+        无界面/无 Android 时 `MediaNotification` 是安全的空操作。
+        只在 Kivy 主线程调用（由 `_tick` 驱动）。
+        """
+        try:
+            song = self._cur_song if self.player.is_active() else None
+            self.media.update(song, self.player.state,
+                              self.player.position(), self.player.duration())
+        except Exception:
+            log_exc("_sync_media_notification")
+
+    def _media_action(self, action):
+        if action == 'previous':
+            self.skip_song(-1)
+        elif action == 'next':
+            self.skip_song(1)
+        elif action == 'toggle':
+            self.toggle_play()
+        elif action == 'play' and self.player.state != self.player.PLAYING:
+            self.toggle_play()
+        elif action == 'pause' and self.player.state == self.player.PLAYING:
+            self.toggle_play()
+        elif action == 'stop':
+            self.player.stop()
+            self._player_finished(advance=False)
+        elif action.startswith('seek:'):
+            self.player.seek(float(action.split(':', 1)[1]))
+
+    def skip_song(self, step):
+        if self.busy:
+            self.set_status('正在准备歌曲，请稍候…')
+            return
+        song = self.queue.move(step)
+        if song is None:
+            self.set_status('先从列表选一首歌，即可切换歌曲')
+            return
+        self._start_song_action(song, 'play')
+
+    def on_pause(self):
+        # Android 退到后台时保留进程内播放器与媒体通知。
+        return True
+
+    def on_start(self):
+        """窗口可见后申请通知权限（Android 13+）。
+
+        结果不影响播放：`MediaNotificationHelper` 无权限时只不显示通知，
+        `MediaSession` 与音频照常工作。这里绝不抛出，绝不阻塞启动。
+        """
+        try:
+            self.media.request_permission()
+        except Exception:
+            log_exc("on_start: request_permission")
+
+    def on_resume(self):
+        # 回前台先取走后台期间攒下的通知命令，再补一次状态（后台时
+        # Kivy 时钟可能停摆，通知上的进度/状态需要回来后立刻对齐）。
+        self.media.poll()
+        self._sync_media_notification()
+
+    def on_stop(self):
+        self.player.stop()
+        self.media.close()
 
     def _build_search(self):
         """搜索条：iOS 胶囊输入（聚焦染蓝）+ 系统蓝胶囊按钮"""
@@ -1341,7 +1597,7 @@ class LxApp(App):
         head = BoxLayout(size_hint_y=None, height=dp(24))
         lb = Label(text="搜索历史", font_size=dp(13), color=C_DIM, bold=True,
                    halign="left", valign="middle", **self.F)
-        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        fit_text(lb)
         head.add_widget(lb)
         head.add_widget(Widget())
         clr = FlatButton(text="清除", size_hint=(None, None), size=(dp(56), dp(24)),
@@ -1379,7 +1635,7 @@ class LxApp(App):
             tip = Label(text="还没有搜索记录，搜过的歌名会出现在这里",
                         size_hint_x=None, width=dp(300), font_size=dp(12),
                         color=C_FAINT, halign="left", valign="middle", **self.F)
-            tip.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+            fit_text(tip)
             self._hist_row.add_widget(tip)
             return
         from kivy.core.text import Label as CoreLabel
@@ -1487,7 +1743,7 @@ class LxApp(App):
         lb = Label(text=label, font_size=dp(15), color=C_TEXT,
                    halign="left", valign="middle", size_hint_x=None,
                    width=dp(84), **self.F)
-        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        fit_text(lb)
         row.add_widget(lb)
         row.add_widget(ctrl)
         if chevron:
@@ -1581,7 +1837,15 @@ class LxApp(App):
         g4.add_widget(self.btn_proxy)
         panel.add_widget(g4)
 
-        self._fix_group(g1, g2, g3, g4)
+        # ---- 保活 ----
+        panel.add_widget(self._section("保活"))
+        g5 = self._group()
+        btn_battery = self._action_cell("申请电池优化白名单")
+        btn_battery.bind(on_release=self.request_battery_optimization)
+        g5.add_widget(btn_battery)
+        panel.add_widget(g5)
+
+        self._fix_group(g1, g2, g3, g4, g5)
         return panel
 
     def _sheet_head(self):
@@ -1608,7 +1872,7 @@ class LxApp(App):
                    font_size=dp(13), color=C_DIM, bold=True,
                    halign="left", valign="bottom",
                    padding=(dp(6), 0), **self.F)
-        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        fit_text(lb)
         return lb
 
     def _btn(self, text, color=None, w=None, bold=False, fs=None, h=None):
@@ -1627,18 +1891,32 @@ class LxApp(App):
         lb = Label(text=text, size_hint_x=None, width=w or dp(42),
                    font_size=dp(14),
                    color=C_DIM, halign="left", valign="middle", **self.F)
-        lb.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        fit_text(lb)
         return lb
 
     def _build_results(self):
         """结果区：一整张白色分组卡（iOS 列表），行与行靠发丝线分隔"""
         wrap = BoxLayout(orientation="vertical",
-                         padding=(dp(16), dp(2), dp(16), dp(6)), spacing=dp(6))
+                          padding=(dp(16), dp(2), dp(16), dp(6)), spacing=dp(6))
+        # 标题行：左 hint，右「换一批」刷新按钮（仅每日推荐视图显示）
+        top = BoxLayout(size_hint_y=None, height=dp(24), spacing=dp(8))
         self.hint = Label(text="搜索后点结果即可播放或下载", size_hint_y=None,
                           height=dp(24), font_size=dp(12), color=C_FAINT,
                           halign="left", valign="middle", **self.F)
-        self.hint.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
-        wrap.add_widget(self.hint)
+        fit_text(self.hint)
+        top.add_widget(self.hint)
+        top.add_widget(Widget(size_hint_x=1))
+        self.btn_daily_refresh = SpringButton(text="换一批", font_size=dp(13),
+                                              size_hint=(None, None),
+                                              size=(dp(74), dp(24)),
+                                              bg_color=C_ACCENT, color=C_WHITE,
+                                              pill=True, **self.F)
+        self.btn_daily_refresh.bind(on_release=self.refresh_daily)
+        # 默认隐藏：只在每日推荐视图显示（opacity 0 + disabled 双保险）
+        self.btn_daily_refresh.opacity = 0.0
+        self.btn_daily_refresh.disabled = True
+        top.add_widget(self.btn_daily_refresh)
+        wrap.add_widget(top)
         self.sv = ScrollView(bar_width=dp(2),
                              bar_color=(0.557, 0.557, 0.576, 0.55),
                              bar_inactive_color=(0, 0, 0, 0),
@@ -1668,21 +1946,31 @@ class LxApp(App):
         box.bind(minimum_height=box.setter("height"))
         outer.add_widget(box)
 
-        # ---- 播放条 ----
-        prow = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        self.btn_play = PlayButton(text="播放", dia=dp(50))
-        self.btn_play.bind(on_release=lambda *_: self.toggle_play())
-        prow.add_widget(VCenter(self.btn_play, w=dp(52), h=dp(52)))
-
+        # 信息、播放控制、进度分层，小屏不再挤在同一行。
+        info = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(6))
+        labels = BoxLayout(orientation='vertical')
+        self.now_title = Label(text='还没有播放歌曲', bold=True, font_size=dp(15),
+                               color=C_TEXT, halign='left', valign='middle',
+                               shorten=True, shorten_from='right', **self.F)
+        self.now_artist = Label(text='选一首歌，让音乐开始', font_size=dp(11),
+                                color=C_DIM, halign='left', valign='middle',
+                                shorten=True, shorten_from='right', **self.F)
+        for label in (self.now_title, self.now_artist):
+            label.bind(size=lambda b, v: setattr(b, 'text_size', v))
+            labels.add_widget(label)
+        info.add_widget(labels)
+        self.btn_fav = self._btn('☆', w=dp(44), fs=dp(23))
+        self.btn_fav.disabled = True
+        self.btn_fav.bind(on_release=lambda *_: self.toggle_favorite(self._playing_song) if self._playing_song else None)
+        info.add_widget(self.btn_fav)
+        box.add_widget(info)
+        box.add_widget(self._playback_controls())
+        prow = BoxLayout(size_hint_y=None, height=dp(24), spacing=dp(8))
         self.slider = SeekBar(min=0, max=1000, value=0, step=1)
-        self.slider.bind(on_touch_down=self._seek_down,
-                         on_touch_up=self._seek_up)
-        prow.add_widget(VCenter(self.slider, h=dp(52)))
-
-        self.lbl_time = Label(text="00:00 / 00:00", size_hint_x=None,
-                              width=dp(92), font_size=dp(12), color=C_DIM,
-                              halign="right", valign="middle", **self.F)
-        self.lbl_time.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        self.slider.bind(on_touch_down=self._seek_down, on_touch_up=self._seek_up)
+        prow.add_widget(VCenter(self.slider, h=dp(24)))
+        self.lbl_time = Label(text='00:00 / 00:00', size_hint_x=None, width=dp(90),
+                              font_size=dp(11), color=C_DIM, **self.F)
         prow.add_widget(self.lbl_time)
         box.add_widget(prow)
 
@@ -1693,9 +1981,27 @@ class LxApp(App):
         self.status = Label(text="正在启动…", size_hint_y=None, height=dp(34),
                             font_size=dp(12), color=C_DIM,
                             halign="left", valign="middle", **self.F)
-        self.status.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        fit_text(self.status)
         box.add_widget(self.status)
         return outer
+
+    def _playback_controls(self):
+        """上一首 / 播放（圆形）/ 下一首 一行。"""
+        controls = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(12))
+        controls.add_widget(Widget())
+        self.btn_prev = self._btn('上一首', w=dp(76), fs=dp(13))
+        self.btn_prev.disabled = True
+        self.btn_prev.bind(on_release=lambda *_: self.skip_song(-1))
+        controls.add_widget(self.btn_prev)
+        self.btn_play = PlayButton(text='播放', dia=dp(48))
+        self.btn_play.bind(on_release=lambda *_: self.toggle_play())
+        controls.add_widget(VCenter(self.btn_play, w=dp(50), h=dp(50)))
+        self.btn_next = self._btn('下一首', w=dp(76), fs=dp(13))
+        self.btn_next.disabled = True
+        self.btn_next.bind(on_release=lambda *_: self.skip_song(1))
+        controls.add_widget(self.btn_next)
+        controls.add_widget(Widget())
+        return controls
 
     # ---------- 线程工具 ----------
     def ui(self, fn):
@@ -1759,6 +2065,7 @@ class LxApp(App):
             self._refresh_proxy_label()
         except Exception:
             log_exc("_refresh_proxy_label")
+        self.show_library_view('discover')
         self.set_status("正在启动 JS 引擎…")
         if IS_ANDROID:
             self.bridge.start(on_ready=self._on_engine_ready)
@@ -1861,7 +2168,7 @@ class LxApp(App):
             "version": meta.get("version") or "",
         }
         ver = (" v%s" % ctx["version"]) if ctx["version"] else ""
-        self.lbl_sub.text = "%d 个平台" % len(labels)
+        self.lbl_sub.text = "发现音乐 · %d 个平台" % len(labels)
         self.set_status("音源: %s%s · %d 个平台"
                         % (ctx["name"], ver, len(labels)), C_OK)
         if self.hint.text.startswith("搜索后"):
@@ -1944,6 +2251,103 @@ class LxApp(App):
             Clock.schedule_once(lambda *_: self._sheet_fuse(-self._sheet_h, g), 0.8)
         except Exception:
             log_exc("close_settings")
+
+    # ---------- 后台保活：电池优化白名单 ----------
+    def request_battery_optimization(self, *_):
+        """用户主动申请「忽略电池优化」白名单（保活）。
+
+        流程：先弹文字说明，用户点「去授权」后才跳系统电池优化白名单页
+        （ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS），绝不静默强跳。
+        被拒 / 系统不支持 / 非 Android / 任何异常都只提示，不影响播放。
+
+        说明：加入白名单只能降低被系统杀后台的概率，不能保证进程永活。
+        """
+        if not IS_ANDROID:
+            self.set_status("仅 Android 支持电池优化白名单", C_DIM)
+            return
+        try:
+            from jnius import autoclass
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            if self._battery_optimization_ignored(act):
+                self.set_status("已加入电池优化白名单", C_OK)
+                return
+        except Exception:
+            log_exc("request_battery_optimization")
+        self._show_battery_confirm()
+
+    @staticmethod
+    def _battery_optimization_ignored(act):
+        """当前 App 是否已在电池优化白名单里（读 PowerManager）。"""
+        try:
+            from jnius import autoclass
+            if autoclass("android.os.Build$VERSION").SDK_INT < 23:
+                return True
+            pm = act.getSystemService("power")
+            return bool(pm.isIgnoringBatteryOptimizations(
+                act.getPackageName()))
+        except Exception:
+            return False
+
+    def _show_battery_confirm(self):
+        kw = dict(self.F)
+        content = BoxLayout(orientation="vertical", spacing=dp(10),
+                            padding=(dp(20), dp(4), dp(20), dp(16)))
+        body = Label(
+            text=("后台播放时，系统可能为了省电清理 App。\n\n"
+                  "加入电池优化白名单能降低被清理的概率，"
+                  "但不能保证进程永远存活。"),
+            size_hint_y=None, height=dp(130), font_size=dp(14),
+            color=C_TEXT, halign="left", valign="middle", **kw)
+        fit_text(body)
+        content.add_widget(body)
+        btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
+        cancel = SpringButton(text="取消", font_size=dp(16),
+                              bg_color=C_CTRL, color=C_TEXT, pill=True, **kw)
+        cancel.bind(on_release=lambda *_: self._dismiss_battery_popup())
+        btns.add_widget(cancel)
+        ok = SpringButton(text="去授权", font_size=dp(16), bold=True,
+                          bg_color=C_ACCENT, color=C_WHITE, pill=True,
+                          shadow=True, **kw)
+        ok.bind(on_release=self._on_battery_confirm)
+        btns.add_widget(ok)
+        content.add_widget(btns)
+        self._popup = Popup(title="电池优化白名单", content=content,
+                            size_hint=(0.88, None), height=dp(260),
+                            title_size=dp(17), title_color=C_TEXT,
+                            separator_color=(0, 0, 0, 0),
+                            background_color=C_WHITE, **self.P)
+        try:
+            self._popup.canvas.before.clear()
+            attach_shadow(self._popup, spread=dp(22), alpha=0.22, squash=0.5)
+            attach_bg(self._popup, C_CARD, radius=R_LG)
+        except Exception:
+            log_exc("电池弹窗底样式")
+        self._popup.open()
+
+    def _dismiss_battery_popup(self):
+        p = getattr(self, "_popup", None)
+        if p is not None:
+            p.dismiss()
+
+    def _on_battery_confirm(self, *_):
+        self._dismiss_battery_popup()
+        self._launch_battery_intent()
+
+    def _launch_battery_intent(self):
+        """跳系统电池优化白名单页（仅在用户确认后调用）。"""
+        try:
+            from jnius import autoclass
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            Intent = autoclass("android.content.Intent")
+            Uri = autoclass("android.net.Uri")
+            intent = Intent(
+                "android.os.PowerManager.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS")
+            intent.setData(Uri.parse("package:" + act.getPackageName()))
+            act.startActivity(intent)
+            self.set_status("已打开电池优化授权页，请允许后返回", C_OK)
+        except Exception:
+            log_exc("_launch_battery_intent")
+            self.set_status("无法打开授权页（系统不支持或被拒），不影响播放", C_ERR)
     # ---------- 下载目录 ----------
     def _fill_dir_presets(self):
         """填「保存位置」下拉：预设目录 + 当前生效项"""
@@ -2185,6 +2589,7 @@ class LxApp(App):
             if self.busy:
                 self.set_status("正在处理中，请稍候…")
                 return
+            self.show_library_view('discover')
             self.busy = True
             self.set_status("搜索中: %s" % keyword)
             self._clear_results()
@@ -2219,19 +2624,25 @@ class LxApp(App):
         if err:
             self.set_status("搜索失败: %s" % err, C_ERR)
             return
-        self._show_results(songs)
+        self._search_songs = list(songs)
+        if self._view == 'discover':
+            self._show_results(songs)
 
     def _clear_results(self):
+        self._rows_gen += 1
         self.results.clear_widgets()
 
     def _row_of(self, i, s):
         """建一行搜索结果（iOS 分组卡里的单元格：歌名两行 + 右圆钮 + 发丝线）"""
-        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(4),
-                        padding=(0, dp(16), 0, 0))
+        row = BoxLayout(size_hint_y=None, height=dp(72), spacing=dp(2),
+                        padding=(0, dp(4), dp(4), dp(4)))
         # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
         try:
-            # 文字区精确预算：行宽 - 下载列(58+4) - 左右内衬(32)
-            avail = max(60.0, self.results.width - dp(94))
+            # 文字区精确预算：行宽 - 收藏列(44) - 间距(2) - 下载列(58)
+            # - 行右内衬(4) - 按钮左右内衬(32) = 行宽 - 140。
+            # 预算必须 **≤** text_size 实际宽度（见下），否则 clip_text
+            # 放行的文字仍会在按钮里换行、撑出第三行盖住下一行。
+            avail = max(60.0, self.results.width - dp(140))
         except Exception:
             avail = dp(220)
         full_name = s["name"]
@@ -2254,6 +2665,10 @@ class LxApp(App):
         row.add_widget(song_btn)
         row._song_btn = song_btn
 
+        fav = self._btn('★' if self.library.contains(s) else '☆', w=dp(42), fs=dp(22))
+        fav.bind(on_release=lambda b, song=s: self.toggle_favorite(song))
+        row._favorite = (s, fav)
+        row.add_widget(VCenter(fav, w=dp(44), h=dp(64)))
         dl = IconButton("download", dia=dp(42),
                         icon_color=C_ACCENT,
                         bg=(0.926, 0.953, 1.0, 1))
@@ -2283,7 +2698,7 @@ class LxApp(App):
             self.set_status("没有找到结果")
             return
 
-        self.hint.text = "点歌名直接播放，点右侧下载（共 %d 首）" % len(self.songs)
+        self.hint.text = "点歌名播放 · 星标收藏 · 箭头下载（共 %d 首）" % len(self.songs)
         total = len(self.songs)
         # 只给前几首做入场动效：几百首全做会明显卡，而且看不到那么远
         STAGGER = 10
@@ -2297,6 +2712,8 @@ class LxApp(App):
                 list(enumerate(self.songs[a:a + 30], start=a))
                 for a in range(FIRST, total, 30)]
 
+        rows_gen = self._rows_gen
+
         def _fill(batch):
             for i, s in batch:
                 row, _btn = self._row_of(i, s)
@@ -2305,7 +2722,7 @@ class LxApp(App):
                     # 错峰进场：淡入 + 高度弹簧展开，列表像「长」出来
                     row.opacity = 0.0
                     row.height = dp(18)
-                    anim = Animation(opacity=1.0, height=dp(64), duration=0.42,
+                    anim = Animation(opacity=1.0, height=dp(72), duration=0.42,
                                      t=spring_t)
                     Clock.schedule_once(
                         lambda *_, r=row, a=anim: a.start(r), 0.036 * i)
@@ -2313,7 +2730,7 @@ class LxApp(App):
         def _step(k=[0]):
             """每拍补一批；构建完成再做首末圆角与保险丝收尾"""
             try:
-                if k[0] >= len(batches):
+                if rows_gen != self._rows_gen or k[0] >= len(batches):
                     return
                 _fill(batches[k[0]])
                 k[0] += 1
@@ -2323,11 +2740,13 @@ class LxApp(App):
                 self._finish_rows()
                 # 保险丝：入场动画没跑起来的行，到点无条件写回最终态
                 def _settle(*_):
+                    if rows_gen != self._rows_gen:
+                        return
                     try:
                         for w in self.results.children:
                             w.opacity = 1.0
-                            if w.height < dp(64):
-                                w.height = dp(64)
+                            if w.height < dp(72):
+                                w.height = dp(72)
                     except Exception:
                         log_exc("列表入场收尾")
                 Clock.schedule_once(
@@ -2350,17 +2769,28 @@ class LxApp(App):
 
     def _act_on_song(self, idx, action):
         try:
-            if idx >= len(self.songs):
+            if not 0 <= idx < len(self.songs):
                 return
             if self.busy:
                 self.set_status("正在处理中，请稍候…")
                 return
-            song = self.songs[idx]
+            if action == 'play':
+                self.queue.set(self.songs, idx)
+            self._start_song_action(self.songs[idx], action)
+        except Exception as e:
+            self.busy = False
+            log_exc('_act_on_song')
+            self.set_status('操作失败: %s' % e, C_ERR)
+
+    def _start_song_action(self, song, action):
+        try:
             self.busy = True
             self._cur_song = song
+            self._playing_song = song
             self._cur_url = None
             self._pre_meta = None
             self._pending_action = action
+            self._sync_now_playing()
             self.set_status(("正在准备播放: " if action == "play"
                              else "正在准备下载: ") + song["name"])
             self.bg(lambda: self._resolve_song(song), "resolve")
@@ -2471,7 +2901,7 @@ class LxApp(App):
         order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
         order = order[:3]
 
-        source = self._current_source()
+        source = song.get('platform') or self._current_source()
         self.ui(lambda: self.set_status(
             "正在解析 (%s)…" % PLATFORM_LABEL.get(source, source)))
 
@@ -2644,14 +3074,14 @@ class LxApp(App):
 
         name = Label(text="%s\n%s" % (song["name"], song["singer"]),
                      size_hint_y=None, height=dp(56), font_size=dp(17),
-                     bold=True, color=C_TEXT, halign="left", valign="middle",
-                     **kw)
-        name.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+                      bold=True, color=C_TEXT, halign="left", valign="middle",
+                      **kw)
+        fit_text(name)
         content.add_widget(name)
 
         self._pop_info = Label(text="解析中…", font_size=dp(13), color=C_DIM,
                                halign="left", valign="top", **kw)
-        self._pop_info.bind(size=lambda b, v: setattr(b, "text_size", (v[0], None)))
+        fit_text(self._pop_info)
         content.add_widget(self._pop_info)
 
         btns = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
@@ -2697,9 +3127,16 @@ class LxApp(App):
             return
         if self._popup:
             self._popup.dismiss()
+        # 首次播放时再申请一次通知权限（用户在前台点了播放，是自然的申请时机）。
+        # 已授权/已拒绝/被拒过都只是返回 False，绝不影响播放。
+        try:
+            self.media.request_permission()
+        except Exception:
+            log_exc("play_current: request_permission")
         self.player.play(self._cur_url, on_event=self._on_player_event)
         self.btn_play.text = "暂停"
         self._bg_playing(True)
+        self._sync_media_notification()
 
     def _bg_playing(self, on):
         """把播放状态同步给动态背景（没建背景时静默跳过）"""
@@ -2719,6 +3156,8 @@ class LxApp(App):
             self.ui(lambda: self._player_ready(payload))
         elif kind == "error":
             self.ui(lambda: self._player_error(payload))
+        elif kind == "ended":
+            self.ui(self._player_ended)
 
     def _player_buffering(self, pct):
         self.pb.value = pct * 100
@@ -2763,9 +3202,14 @@ class LxApp(App):
         return False
 
     def _tick(self, dt):
-        """定时刷新播放进度（0.5s 一次）"""
+        """定时刷新播放进度（0.5s 一次），并轮询通知中心发来的命令。"""
+        try:
+            self.media.poll()
+        except Exception:
+            log_exc("_tick media.poll")
         try:
             if not self.player.is_active():
+                self._sync_media_notification()
                 return
             pos = self.player.position()
             total = self._cur_duration or self.player.duration()
@@ -2774,17 +3218,33 @@ class LxApp(App):
             self.lbl_time.text = "%s / %s" % (fmt_time(pos), fmt_time(total))
             if (self.player.state == player_mod.Player.PLAYING
                     and total > 0 and pos >= total - 0.7):
+                self._ending = True
                 self.player.stop()
-                self._player_finished()
+                self._player_finished(advance=True)
+            else:
+                self._sync_media_notification()
         except Exception:
             log_exc("_tick")
 
-    def _player_finished(self):
+    def _player_ended(self):
+        """自然播放结束（player 的 onCompletion）。
+
+        `_tick` 已判定本曲结束并切歌时，这里只复位标志，避免重复切一首。
+        """
+        if getattr(self, "_ending", False):
+            self._ending = False
+            return
+        self._player_finished(advance=True)
+
+    def _player_finished(self, advance=True):
         self.btn_play.text = "播放"
         self._bg_playing(False)
         self.slider.value = 0
         self.lbl_time.text = "00:00 / 00:00"
-        self.set_status("播放结束")
+        if advance and self.queue.songs:
+            self.skip_song(1)
+        else:
+            self.set_status("播放结束")
 
     # ---------- 下载 ----------
     def download_current(self):

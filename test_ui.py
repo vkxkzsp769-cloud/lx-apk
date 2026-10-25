@@ -146,6 +146,7 @@ def test_runtime(app):
     check("歌曲详情填充", test_song_detail)
     check("fmt_time", test_fmt_time)
     check("播放器状态机", test_player_state)
+    check("上一首/下一首 + 通知命令", test_playback_controls)
 
 
 def test_source_info(app):
@@ -475,6 +476,73 @@ def test_player_state():
     if pl.position() != 0.0 or pl.duration() < 0:
         raise AssertionError("无音源时的查询值不对")
     print("  空播放器控制安全 ✓")
+
+
+def test_playback_controls():
+    """上一首/下一首 + 通知中心命令 + 结束自动切歌。
+
+    这些以前是「改到一半停工」的部分：
+      * _player_finished 被通知中心以 advance=False 调用却没这个参数 -> TypeError
+      * _playing_song 从没被赋值 -> 迷你播放条/收藏星标一直是空的
+      * media.update/poll 没接进 _tick -> 通知中心收不到状态、命令排着队没人取
+    """
+    app = make_app()
+    songs = [
+        {"id": "1", "name": "海阔天空", "singer": "Beyond",
+         "interval": "03:59", "album": ""},
+        {"id": "2", "name": "晴天", "singer": "周杰伦",
+         "interval": "04:29", "album": ""},
+        {"id": "3", "name": "光辉岁月", "singer": "Beyond",
+         "interval": "05:12", "album": ""},
+    ]
+    app.queue.set(songs, 0)
+    # 打桩 _start_song_action：它会给 busy=True 并起网络解析，
+    # 这里只验证队列移动，不需要真的解析。
+    app._start_song_action = lambda *a, **k: None
+
+    # 队列非空 -> 上一首/下一首应可用（以前 _sync_now_playing 从没在播放后调过）
+    app._sync_now_playing()
+    if app.btn_prev.disabled or app.btn_next.disabled:
+        raise AssertionError("队列非空时上一首/下一首按钮应可用")
+
+    # 通知中心 next/previous 走队列
+    app._media_action("next")
+    if app.queue.index != 1:
+        raise AssertionError("next 没切到第 2 首: %d" % app.queue.index)
+    app._media_action("previous")
+    if app.queue.index != 0:
+        raise AssertionError("previous 没回到第 1 首: %d" % app.queue.index)
+
+    # stop：以前这里会抛 TypeError（_player_finished 没有 advance 参数）
+    app._media_action("stop")
+    if app.btn_play.text != "播放":
+        raise AssertionError("stop 后播放键应回到「播放」: %r" % app.btn_play.text)
+
+    # 结束自动切歌
+    app.queue.set(songs, 1)
+    app._player_finished(advance=True)
+    if app.queue.index != 2:
+        raise AssertionError("结束时应切到下一首: %d" % app.queue.index)
+
+    # _tick 已判定结束并切歌时，onCompletion 的 ended 不该再切一次
+    called = []
+    app._player_finished = lambda advance=True: called.append(advance)
+    app._ending = True
+    app._player_ended()
+    if called:
+        raise AssertionError("_ending 已置位时 _player_ended 不应再切歌")
+    if app._ending is not False:
+        raise AssertionError("_player_ended 应复位 _ending")
+
+    # 通知中心命令必须从 _tick 里轮询；空播放器跑一拍不能炸
+    app._tick(0.5)
+    if app.player.is_active():
+        raise AssertionError("没开始播不该是活动状态")
+
+    # 桌面没有 MediaNotification 后端，权限申请是安全的 False
+    if app.media.request_permission():
+        raise AssertionError("桌面端不该申请通知权限")
+    print("  上一首/下一首 + 通知命令 + 结束切歌 + _tick 轮询 ✓")
 
 
 def test_all_widgets_use_cn_font():
