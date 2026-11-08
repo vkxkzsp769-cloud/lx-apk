@@ -226,15 +226,40 @@ jobs:
           python3 -m pip install --only-binary=:all: "kivy==2.3.1" pyflakes
           python3 -c "import kivy; print('kivy', kivy.__version__)"
 
+          echo "=== 环境自检 ==="
+          # Kivy 在 CI 上起窗口时，缺 SDL/GL 库的表现是
+          # 「logger.critical + sys.exit(1)」——如果这时日志被关掉，
+          # 就只能看到「进程 exit 1、零输出」，完全无从排查。
+          # 所以这里先把关键库与运行时信息打出来。
+          # 注意：这里**不要**用 `python3 - <<EOF` 的 heredoc —— YAML 块里
+          # heredoc 的结束符必须顶格，而这一步整体又要缩进 10 格，
+          # 两者冲突，很容易把 YAML 弄坏。写成 -c 一行更稳。
+          python3 -c "
+          import ctypes, os, sys
+          print('python:', sys.version.split()[0])
+          print('SDL_VIDEODRIVER:', os.environ.get('SDL_VIDEODRIVER'))
+          for lib in ('libSDL2-2.0.so.0', 'libSDL2_ttf-2.0.so.0',
+                      'libSDL2_image-2.0.so.0', 'libSDL2_mixer-2.0.so.0',
+                      'libGL.so.1', 'libEGL.so.1'):
+              try:
+                  ctypes.CDLL(lib)
+                  print('  %-24s OK' % lib)
+              except OSError as e:
+                  print('  %-24s 缺失 (%s)' % (lib, str(e)[:60]))
+          " || true
+
           echo "=== 跑测试 ==="
           # tee 到文件：这一步失败时 GitHub 只显示 "exit code 1"，
           # 之前就是因为没有日志文件而完全不知道发生了什么。
           set +e
-          SDL_VIDEODRIVER=offscreen python3 test_ui.py 2>&1 | tee test-ui.log
+          # KIVY_NO_CONSOLELOG=0：让 Kivy 自己的 CRITICAL/ERROR 打出来。
+          # 没有它的话，「窗口起不来」只是一个静默的 exit 1。
+          KIVY_NO_CONSOLELOG=0 SDL_VIDEODRIVER=offscreen \
+            python3 -u test_ui.py 2>&1 | tee test-ui.log
           RC=${PIPESTATUS[0]}
           echo "test_ui 退出码: $RC"
           echo "--- test-ui.log 里失败的项 ---"
-          grep -E "\[FAIL\]|✗" test-ui.log || true
+          grep -E "\[FAIL\]|✗|CRITICAL|FATAL" test-ui.log || true
           exit $RC
 
       - name: 上传测试日志

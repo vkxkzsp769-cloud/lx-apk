@@ -25,7 +25,12 @@ os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ.setdefault("SDL_VIDEODRIVER", "offscreen")
 os.environ.setdefault("KIVY_WINDOW", "sdl2")
 os.environ.setdefault("KIVY_TEXT", "sdl2")
-os.environ["KIVY_NO_CONSOLELOG"] = "1"
+# 用 setdefault 而不是硬写 "1"：CI 里排查「窗口起不来」时必须能看到
+# Kivy 自己的 CRITICAL 日志。
+# ⚠ 曾经踩过：这里硬写 1，结果 CI 上 Kivy 初始化失败时会 sys.exit(1)，
+# 而它唯一的提示（Logger.critical 那条）被完全吞掉 —— 表现为
+# 「test_ui.py 0.2 秒退出、退出码 1、一个字都没输出」，完全无从下手。
+os.environ.setdefault("KIVY_NO_CONSOLELOG", "1")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -1826,6 +1831,17 @@ def main():
     print("=" * 56)
     print("界面 / 线程契约冒烟测试")
     print("=" * 56)
+    print("  视频驱动 = %s" % os.environ.get("SDL_VIDEODRIVER"),
+          flush=True)
+    try:
+        from kivy.core.window import Window
+        print("  窗口 = %r" % (Window,), flush=True)
+    except SystemExit:
+        # Kivy 找不到可用的窗口 provider 时会 logger.critical + sys.exit(1)
+        print("  [FAIL] Kivy 起不了窗口（SDL/GL 库缺失？）", flush=True)
+        print("         在 CI 里用 KIVY_NO_CONSOLELOG=0 跑一次看 Kivy 的报错",
+              flush=True)
+        return 1
 
     print("[1] 中文字体")
     check("中文字体渲染", test_font)
@@ -1902,4 +1918,14 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException:
+        # 兜底：任何未捕获异常都要留下堆栈。
+        # 之前出现过「进程 exit 1 但日志空白」—— 排查成本极高，
+        # 在 CI 里更是完全瞎猜。宁可多打一坨堆栈。
+        traceback.print_exc()
+        print("\n[FATAL] test_ui.py 异常退出（见上面的堆栈）", flush=True)
+        sys.exit(2)
