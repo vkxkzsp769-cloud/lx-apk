@@ -21,6 +21,26 @@ import sys
 import threading
 import traceback
 
+# ── 最早的探针 ────────────────────────────────────────────────
+# CI 上出现过「进程 exit 1、日志 0 字节、连第一行 print 都没有」。
+# 那种现象只可能发生在**非常早**的阶段（解释器/import 期），
+# 所以这里在任何重活之前先绝对同步地把信息刷出去 ——
+# 后面一旦死掉，至少能证明「走到过这里」。
+def _probe(msg):
+    """绝对同步地输出一行（stderr 也写，防止 stdout 被 tee 缓冲吃掉）"""
+    line = "[probe] %s\n" % msg
+    for stream in (sys.stderr, sys.stdout):
+        try:
+            stream.write(line)
+            stream.flush()
+        except Exception:
+            pass
+
+
+_probe("文件开始执行 pid=%d" % os.getpid())
+_probe("python %s" % sys.version.split()[0])
+_probe("cwd=%s" % os.getcwd())
+
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 os.environ.setdefault("SDL_VIDEODRIVER", "offscreen")
 os.environ.setdefault("KIVY_WINDOW", "sdl2")
@@ -35,11 +55,15 @@ os.environ.setdefault("KIVY_NO_CONSOLELOG", "1")
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+_probe("准备 import kivy.config")
 from kivy.config import Config  # noqa: E402
+_probe("kivy.config 已导入")
 Config.set("graphics", "width", "400")
 Config.set("graphics", "height", "760")
+_probe("Config 已设置")
 
 import kivy  # noqa: E402
+_probe("kivy %s" % getattr(kivy, "__version__", "?"))
 from kivy.core.text import Label as CoreLabel  # noqa: E402
 from kivy.clock import Clock  # noqa: E402
 from kivy.uix.button import Button  # noqa: E402
@@ -47,9 +71,13 @@ from kivy.uix.label import Label  # noqa: E402
 from kivy.uix.spinner import Spinner  # noqa: E402
 from kivy.uix.textinput import TextInput  # noqa: E402
 
+_probe("kivy 子模块已导入")
 import appenv  # noqa: E402
+_probe("appenv 已导入")
 import fonts  # noqa: E402
+_probe("fonts 已导入")
 import main as M  # noqa: E402
+_probe("main 已导入")
 
 appenv.IS_ANDROID = False
 M.IS_ANDROID = False
