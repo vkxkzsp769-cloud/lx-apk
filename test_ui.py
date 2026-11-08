@@ -60,7 +60,18 @@ from kivy.config import Config  # noqa: E402
 _probe("kivy.config 已导入")
 Config.set("graphics", "width", "400")
 Config.set("graphics", "height", "760")
-_probe("Config 已设置")
+# 光设 SDL_VIDEODRIVER 环境变量**不够**：Kivy 读的是自己的 Config，
+# 而 Config 里 window 段的默认值会覆盖掉环境变量。CI 上没有 X server，
+# 一旦走到真窗口就是 "Couldn't connect to X server" + exit 102。
+# 这里在 Config 层面直接把窗口后端钉成 sdl2，并把 SDL 驱动设成 offscreen。
+try:
+    Config.set("graphics", "fullscreen", "0")
+    Config.set("kivy", "window", "sdl2")
+except Exception:
+    pass
+os.environ["SDL_VIDEODRIVER"] = "offscreen"
+os.environ.setdefault("KIVY_WINDOW", "sdl2")
+_probe("Config 已设置（graphics 400x760, SDL offscreen）")
 
 import kivy  # noqa: E402
 _probe("kivy %s" % getattr(kivy, "__version__", "?"))

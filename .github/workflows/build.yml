@@ -226,6 +226,14 @@ jobs:
           python3 -m pip install --only-binary=:all: "kivy==2.3.1" pyflakes
           python3 -c "import kivy; print('kivy', kivy.__version__)"
 
+          # ⚠ SDL_VIDEODRIVER 必须 **export**：写成 `VAR=x python3 ...`
+          # 只对那一条命令生效，环境自检里就打印成 None，
+          # 后面的 test_ui 也拿不到 —— CI 上就是这样去连 X server 然后
+          # 报 "Couldn't connect to X server"（exit 102）。
+          export SDL_VIDEODRIVER=offscreen
+          export KIVY_NO_CONSOLELOG=0
+          export KIVY_WINDOW=sdl2
+
           echo "=== 环境自检 ==="
           # Kivy 在 CI 上起窗口时，缺 SDL/GL 库的表现是
           # 「logger.critical + sys.exit(1)」——如果这时日志被关掉，
@@ -250,7 +258,7 @@ jobs:
 
           echo "=== 单独 import main（分离真正的失败点）==="
           set +e
-          KIVY_NO_CONSOLELOG=0 SDL_VIDEODRIVER=offscreen python3 -u -c "
+          python3 -u -c "
           import traceback
           try:
               import main
@@ -268,8 +276,7 @@ jobs:
           set +e
           # KIVY_NO_CONSOLELOG=0：让 Kivy 自己的 CRITICAL/ERROR 打出来。
           # 没有它的话，「窗口起不来」只是一个静默的 exit 1。
-          KIVY_NO_CONSOLELOG=0 SDL_VIDEODRIVER=offscreen \
-            python3 -u test_ui.py 2>&1 | tee test-ui.log
+          python3 -u test_ui.py 2>&1 | tee test-ui.log
           RC=${PIPESTATUS[0]}
           echo "test_ui 退出码: $RC"
           echo "--- test-ui.log 里失败的项 ---"
