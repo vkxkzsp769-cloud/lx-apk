@@ -29,3 +29,6 @@ sources/default.js
 .vscode/
 .idea/
 *.swp
+
+# mp3slim 压缩产物（测试/日常用都会生成）
+*.slim.mp3

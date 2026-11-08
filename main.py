@@ -46,6 +46,7 @@ import appenv
 import bgfx
 import downloader
 import fonts
+import mp3slim
 import searchers
 import player as player_mod
 import qqresolve
@@ -92,6 +93,11 @@ R_SM = 11
 # Kivy 拿不到背后像素，做不了真 backdrop-blur，观感靠半透明白 + 分层。
 GLASS_FILL = (1, 1, 1, 0.82)
 GLASS_HI = (1, 1, 1, 0.35)
+
+# MP3 压缩页的列表状态：整页在「工具」视图里展开
+SLIM_VIEW = "slim"
+VIEW_TITLES = {"discover": "发现音乐", "daily": "每日推荐",
+               "favorites": "我的收藏", SLIM_VIEW: "MP3 压缩"}
 
 PLATFORM_LABEL = {"wy": "网易云", "tx": "QQ音乐", "kw": "酷我",
                   "kg": "酷狗", "mg": "咪咕", "qsvip": "企鹅SVIP"}
@@ -654,6 +660,28 @@ def icon_parts(kind, w, h, ox=0.0, oy=0.0, unit=1.0):
                                         cx, cy + s * 0.36,
                                         cx + s * 0.5, cy - s * 0.12],
                              "width": 1.8 * unit}))
+    elif kind == "folder":
+        # 「选文件夹」：一个带小折角的方框
+        out.append(("line", {"points": [cx - s * 0.56, cy + s * 0.30,
+                                        cx - s * 0.16, cy + s * 0.30,
+                                        cx, cy + s * 0.50,
+                                        cx + s * 0.56, cy + s * 0.50,
+                                        cx + s * 0.56, cy - s * 0.46,
+                                        cx - s * 0.56, cy - s * 0.46,
+                                        cx - s * 0.56, cy + s * 0.30],
+                             "width": 1.6 * unit}))
+    elif kind == "slim":
+        # 「压缩」图标：上下两条内收箭头 + 中间一道横线
+        out.append(("line", {"points": [cx - s * 0.46, cy + s * 0.50,
+                                        cx, cy + s * 0.16,
+                                        cx + s * 0.46, cy + s * 0.50],
+                             "width": 1.7 * unit}))
+        out.append(("line", {"points": [cx - s * 0.46, cy - s * 0.50,
+                                        cx, cy - s * 0.16,
+                                        cx + s * 0.46, cy - s * 0.50],
+                             "width": 1.7 * unit}))
+        out.append(("line", {"points": [cx - s * 0.30, cy, cx + s * 0.30, cy],
+                             "width": 1.7 * unit}))
     elif kind == "chevron":
         # iOS 表格行尾的「›」
         out.append(("line", {"points": [cx - s * 0.22, cy + s * 0.50,
@@ -1127,6 +1155,14 @@ class LxApp(App):
         self._cur_ext = None
         self._cur_dur = 0.0
         self._popup = None
+        # ---- MP3 压缩页状态 ----
+        self._slim_rows = []          # [{path,size,info,state,pct,result}]
+        self._slim_busy = False       # 是否有压缩任务在跑
+        self._slim_active = None      # 当前在压第几行
+        self._slim_pending = []       # 待压队列
+        self._slim_stop_flag = False
+        self._slim_out_dir = ""       # 用户选的输出目录（空=同源目录）
+        self._slim_out_labels = {}
         self.F = fonts.font_kwargs()
         self.P = fonts.popup_kwargs()      # Popup 标题的字体参数名是 title_font
 
@@ -1163,7 +1199,17 @@ class LxApp(App):
         # 正确姿势：只动画一个自定义 NumericProperty，观察者里把
         # scale 和 translate **成对**写好 —— 一处更新，也省掉每帧双动画。
         self.main.add_widget(self._build_header())
-        self.main.add_widget(self._build_search())
+        self.search_bar = self._build_search()
+        self.main.add_widget(self.search_bar)
+        # 压缩页的工具栏与搜索栏**同一行位置**，靠高度在 56/0 之间切换。
+        # 不两个都占位：BoxLayout 里多一条隐形行会白吃 56dp，
+        # 小屏上就是「列表凭空少两行」。
+        self.slim_bar = self._build_slim_bar()
+        self.slim_bar.height = 0
+        self.slim_bar.opacity = 0.0
+        self.slim_bar.disabled = True
+        self.main.add_widget(self.slim_bar)
+        self.main.add_widget(self._build_slim_actions())
         self.main.add_widget(self._build_hist())
         self.main.add_widget(self._build_navigation())
         self.main.add_widget(self._build_results())
@@ -1259,7 +1305,7 @@ class LxApp(App):
                          padding=(dp(16), dp(4), dp(16), dp(6)), spacing=dp(6))
         self.nav_buttons = {}
         for key, text in [('discover', '发现'), ('daily', '每日推荐'),
-                          ('favorites', '我的收藏')]:
+                          ('favorites', '我的收藏'), (SLIM_VIEW, '压缩')]:
             btn = SpringButton(text=text, font_size=dp(14), pill=True,
                                bg_color=C_ACCENT if key == self._view else C_CTRL,
                                color=C_WHITE if key == self._view else C_TEXT, **self.F)
@@ -1281,6 +1327,10 @@ class LxApp(App):
         for key, btn in self.nav_buttons.items():
             btn.bg_color = C_ACCENT if key == view else C_CTRL
             btn.color = C_WHITE if key == view else C_TEXT
+        if view == SLIM_VIEW:
+            self.show_slim_view()
+            return
+        self._leave_slim_view()
         if view == 'favorites':
             self._show_results(self.library.favorites)
             self.hint.text = '我的收藏 · %d 首，点星标可移除' % len(self.songs)
@@ -1845,7 +1895,29 @@ class LxApp(App):
         g5.add_widget(btn_battery)
         panel.add_widget(g5)
 
-        self._fix_group(g1, g2, g3, g4, g5)
+        # ---- MP3 压缩 ----
+        panel.add_widget(self._section("MP3 压缩"))
+        g6 = self._group()
+        self.sp_slim_level = CNSpinner(
+            text=mp3slim.DEFAULT_LEVEL[0], values=mp3slim.levels(),
+            font_size=dp(14), **self.F)
+        self.sp_slim_level.bind(text=lambda *_: self._refresh_slim_estimate())
+        g6.add_widget(self._cell("音质档位", self.sp_slim_level))
+        self.sp_slim_out = CNSpinner(
+            text="同目录（.slim.mp3）", values=["同目录（.slim.mp3）"],
+            font_size=dp(14), **self.F)
+        g6.add_widget(self._cell("输出位置", self.sp_slim_out))
+        btn_slim_dir = self._action_cell("选择输出文件夹")
+        btn_slim_dir.bind(on_release=lambda *_: self.pick_slim_out())
+        g6.add_widget(btn_slim_dir)
+        self.lbl_slim_engine = Label(
+            text="", size_hint_y=None, height=dp(28), font_size=dp(11),
+            color=C_FAINT, halign="left", valign="middle", **self.F)
+        fit_text(self.lbl_slim_engine, pad_x=dp(14))
+        g6.add_widget(self.lbl_slim_engine)
+        panel.add_widget(g6)
+
+        self._fix_group(g1, g2, g3, g4, g5, g6)
         return panel
 
     def _sheet_head(self):
@@ -1893,6 +1965,74 @@ class LxApp(App):
                    color=C_DIM, halign="left", valign="middle", **self.F)
         fit_text(lb)
         return lb
+
+    # ================= MP3 压缩（mp3slim）=================
+    # 说明：原来 mp3slim 是个独立网页工具（ffmpeg + 本地 http 服务）。
+    # 这里把它整个搬进 App：原生 .so 做编解码（见 mp3slim.py），
+    # 界面复用落雪现有的「大标题 + 分组卡 + 底部抽屉」布局语言，
+    # 不引入任何新的视觉元素 —— 用户不用学第二套操作。
+    def _build_slim_bar(self):
+        """压缩页的工具栏：目录胶囊 + 扫描/设置按钮（一行，52dp）
+
+        单独一行而不是塞进搜索栏：搜索栏的输入框在压缩页里没有意义，
+        复用会让「搜索」和「选目录」两个语义打架。
+        """
+        wrap = BoxLayout(size_hint_y=None, height=dp(56),
+                         padding=(dp(16), dp(6), dp(16), dp(6)), spacing=dp(10))
+
+        pill = BoxLayout(size_hint_y=None, height=dp(44), spacing=0)
+        attach_bg(pill, C_CTRL, radius="pill")
+        ico = Widget(size_hint=(None, None), size=(dp(30), dp(44)),
+                     pos_hint={"center_y": 0.5})
+        draw_icon(ico, "folder" if self._icon_has("folder") else "slim",
+                  color=C_DIM)
+        pill.add_widget(ico)
+
+        self.ti_dir = SearchInput(
+            hint_text="音乐文件夹路径", multiline=False, font_size=dp(14),
+            padding=(dp(4), dp(11)), background_color=(0, 0, 0, 0),
+            foreground_color=C_TEXT, cursor_color=C_ACCENT,
+            hint_text_color=C_FAINT, **self.F)
+        self.ti_dir.bind(on_text_validate=lambda *_: self.slim_scan())
+        pill.add_widget(self.ti_dir)
+        wrap.add_widget(pill)
+
+        self.btn_slim_scan = SpringButton(text="扫描", font_size=dp(14),
+                                          bold=True, size_hint=(None, None),
+                                          size=(dp(64), dp(44)),
+                                          bg_color=C_ACCENT, color=C_WHITE,
+                                          pill=True, shadow=True, **self.F)
+        self.btn_slim_scan.bind(on_release=lambda *_: self.slim_scan())
+        wrap.add_widget(self.btn_slim_scan)
+        return wrap
+
+    def _build_slim_actions(self):
+        """压缩页的批量操作条（扫描出文件后才显示，平时高度 0）
+
+        放页面里而不是抽屉里：批量压缩是这个功能的主操作，
+        藏进设置抽屉等于让用户去翻菜单 —— 与「主操作一眼可见」相悖。
+        """
+        row = BoxLayout(size_hint_y=None, height=0, opacity=0.0,
+                        disabled=True,
+                        padding=(dp(16), dp(2), dp(16), dp(2)), spacing=dp(8))
+        self.btn_slim_all = SpringButton(
+            text="压缩全部", font_size=dp(13), bold=True, pill=True,
+            bg_color=C_ACCENT, color=C_WHITE, **self.F)
+        self.btn_slim_all.bind(on_release=lambda *_: self.slim_run_all())
+        row.add_widget(self.btn_slim_all)
+        self.btn_slim_stop = SpringButton(
+            text="停止", font_size=dp(13), pill=True,
+            bg_color=C_CTRL, color=C_ERR, size_hint_x=None, width=dp(76),
+            **self.F)
+        self.btn_slim_stop.bind(on_release=lambda *_: self.slim_stop())
+        row.add_widget(self.btn_slim_stop)
+        self.slim_actions = row
+        return row
+
+    def _icon_has(self, kind):
+        """icon_parts 支持哪些图形（防止手写一个不存在的图标名）"""
+        return kind in ("settings", "search", "close", "play", "pause",
+                        "download", "expand", "slim", "chevron", "folder")
 
     def _build_results(self):
         """结果区：一整张白色分组卡（iOS 列表），行与行靠发丝线分隔"""
@@ -2526,6 +2666,8 @@ class LxApp(App):
                 return self._on_dir_picked(result_code, intent)
             if request_code == 0x1236:
                 return self._on_proxies_picked(result_code, intent)
+            if request_code == 0x1237:
+                return self._on_slim_out_picked(result_code, intent)
             if request_code != 0x1234:
                 return
             if result_code != -1 or intent is None:
@@ -2757,6 +2899,507 @@ class LxApp(App):
         _step()
 
         self.set_status("找到 %d 首：点歌名播放，点「下载」保存" % total)
+
+    # ================= MP3 压缩：行为 =================
+    def show_slim_view(self):
+        """切到压缩页：换成工具栏 + 设置卡 + 文件列表
+
+        不新建 Screen：整个 App 只有一套「大标题 + 一行工具栏 + 列表 +
+        底部播放条」的骨架，压缩页只是把中段的两块内容换掉 ——
+        这样底部播放条、状态栏、抽屉全都继续可用（边压边听）。
+        """
+        self._hide_hist()
+        self._clear_results()
+        # 一整行换掉：搜索栏收起（高度 0），工具栏撑开（56dp）
+        self.search_bar.height = 0
+        self.search_bar.opacity = 0.0
+        self.search_bar.disabled = True
+        self.slim_bar.height = dp(56)
+        self.slim_bar.opacity = 1.0
+        self.slim_bar.disabled = False
+        self.hint.text = "选一个文件夹，扫描后点「压缩」"
+        if not (self.ti_dir.text or "").strip():
+            # 默认就指向下载目录 —— 用户刚下完歌最想压的就是那里
+            try:
+                self.ti_dir.text = download_dir()
+            except Exception:
+                log_exc("slim 默认目录")
+        lbl = getattr(self, "lbl_slim_engine", None)
+        if lbl is not None:
+            lbl.text = mp3slim.engine_info()
+            lbl.color = C_FAINT if mp3slim.available() else C_ERR
+        # 引擎不可用就别让按钮假装能用（这是本项目反复强调的原则：
+        # 宁可如实报错，也不要静默给出一个「点了没反应」的按钮）
+        self.btn_slim_scan.disabled = not mp3slim.available()
+        self._slim_actions_visible(bool(self._slim_rows))
+        self.lbl_sub.text = "MP3 压缩 · 输出仍是 .mp3，任何播放器都能播"
+        self._refresh_slim_estimate()
+        if self._slim_rows:
+            self._render_slim_rows()
+        else:
+            self._empty_results("还没有扫描到文件\n填一个文件夹路径，点右上角「扫描」")
+
+    def _slim_actions_visible(self, show):
+        """批量操作条：有文件才展开，没文件就收成 0 高（不留死空间）"""
+        try:
+            row = self.slim_actions
+        except AttributeError:
+            return
+        if show:
+            row.height = dp(46)
+            row.opacity = 1.0
+            row.disabled = False
+        else:
+            row.height = 0
+            row.opacity = 0.0
+            row.disabled = True
+
+    def _leave_slim_view(self):
+        """离开压缩页：搜索栏回来、工具栏收起
+
+        高度必须显式归零（不是只改 opacity）—— BoxLayout 会照常按
+        size_hint_y 分高度，透明控件照样占地方，列表就被永久挤掉 56dp。
+        """
+        self.search_bar.height = dp(56)
+        self.search_bar.opacity = 1.0
+        self.search_bar.disabled = False
+        self.slim_bar.height = 0
+        self.slim_bar.opacity = 0.0
+        self.slim_bar.disabled = True
+
+    def slim_scan(self, *_):
+        """扫描输入框里的目录（后台做，避免大目录卡界面）"""
+        if not mp3slim.available():
+            self.set_status(mp3slim.engine_info(), C_ERR)
+            return
+        folder = (getattr(self, "ti_dir", None) and self.ti_dir.text or "").strip()
+        if not folder:
+            self.set_status("先填一个文件夹路径，例如 /storage/emulated/0/Download")
+            return
+        self.set_status("正在扫描 %s …" % folder)
+
+        def work():
+            items = mp3slim.scan(folder)
+            self.ui(lambda: self._slim_scanned(folder, items))
+
+        self.bg(work, "slim-scan")
+
+    def _slim_scanned(self, folder, items):
+        if not items:
+            self._slim_rows = []
+            self._render_slim_rows()
+            self._empty_results("这个文件夹里没有可压缩的音频\n支持 .mp3 / .flac / .wav")
+            self.set_status("没找到音频文件: %s" % folder, C_ERR)
+            return
+        self._slim_rows = [{"path": p, "size": n, "info": None,
+                            "state": "idle", "out": None, "result": None}
+                           for p, n in items]
+        self._render_slim_rows()
+        self._slim_actions_visible(True)
+        total = sum(x["size"] for x in self._slim_rows)
+        self.set_status("找到 %d 个文件，共 %s · 选档位后点「压缩」"
+                        % (len(self._slim_rows), mp3slim.human(total)), C_OK)
+        self.hint.text = "点右侧按钮压缩单个 · 或点上方「压缩全部」"
+        self.bg(lambda: self._slim_probe_all(folder), "slim-probe")
+
+    def _slim_probe_all(self, folder):
+        """后台探测每个文件的时长/采样率（列表里要显示原始信息）
+
+        单文件 probe 只要几毫秒（只读帧头 + 算帧数），几十个文件也就
+        一瞬间；但目录里可能有 300 首，所以仍然放后台线程。
+        """
+        rows = getattr(self, "_slim_rows", None) or []
+        out = []
+        for item in rows:
+            try:
+                item["info"] = mp3slim.probe(item["path"])
+            except Exception:
+                item["info"] = None
+            out.append(item)
+        self.ui(lambda: self._slim_probed(out))
+
+    def _slim_probed(self, rows):
+        if self._view == SLIM_VIEW:
+            self._render_slim_rows()
+            self._refresh_slim_estimate()
+
+    def _render_slim_rows(self):
+        self._clear_results()
+        for i, item in enumerate(self._slim_rows):
+            self.results.add_widget(self._slim_row_of(i, item))
+        self._finish_slim_rows()
+
+    def _finish_slim_rows(self):
+        """首/末行圆角 + 去掉最后一行的发丝线（与搜索结果同一套处理）"""
+        try:
+            kids = list(reversed(self.results.children))
+            if kids:
+                kids[0]._slim_btn.set_radius([R_LG, R_LG, 0, 0])
+                if len(kids) > 1:
+                    kids[-1]._slim_btn.set_radius([0, 0, R_LG, R_LG])
+                    kids[-1]._sep_hidden = True
+                    kids[-1]._sep_rect.size = (0, 0)
+        except Exception:
+            log_exc("压缩列表圆角")
+
+    def _slim_row_of(self, idx, item):
+        """一行文件：文件名 + 体积/状态 + 右侧压缩钮"""
+        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(2),
+                        padding=(0, dp(4), dp(4), dp(4)))
+        name = os.path.basename(item["path"])
+        sub = mp3slim.human(item["size"])
+        if item.get("state") == "done" and item.get("result"):
+            r = item["result"]
+            saved = 0.0
+            if r.get("src_size"):
+                saved = 100.0 * (1.0 - float(r["size"]) / max(r["src_size"], 1))
+            sub = "%s → %s（省 %.0f%%）" % (mp3slim.human(r["src_size"]),
+                                          mp3slim.human(r["size"]), saved)
+        elif item.get("state") == "running":
+            sub = "正在压缩… %d%%" % int(item.get("pct", 0))
+        elif item.get("state") == "error":
+            sub = item.get("error") or "压缩失败"
+        elif item.get("state") == "skip":
+            sub = item.get("error") or "无需压缩"
+        elif item.get("info"):
+            info = item["info"]
+            sub = "%s · %s · %d 声道" % (
+                mp3slim.human(item["size"]),
+                "%dkbps" % info.get("kbps", 0) if info.get("kbps") else
+                "%dHz" % info.get("sample_rate", 0),
+                info.get("channels", 0))
+
+        try:
+            avail = max(80.0, self.results.width - dp(84))
+        except Exception:
+            avail = dp(220)
+        line1 = clip_text(name, avail)
+        line2 = clip_text(sub, avail, dp(12))
+        btn = FlatButton(
+            text="%s\n%s" % (line1, line2), halign="left", valign="middle",
+            font_size=dp(15), color=C_TEXT, bg_color=C_ITEM, radius=0,
+            padding=(dp(16), dp(6)), **self.F)
+        btn.bind(size=lambda b, v: setattr(b, "text_size",
+                                           (v[0] - dp(32), dp(52))))
+        btn.bind(on_release=lambda b, i=idx: self.slim_compress_one(i))
+        row.add_widget(btn)
+        row._slim_btn = btn
+        row._slim_idx = idx
+
+        state = item.get("state", "idle")
+        if state == "done":
+            ico = IconButton("download", dia=dp(38), icon_color=C_OK,
+                             bg=(0.90, 0.97, 0.92, 1))
+            ico.opacity = 0.55
+        elif state == "running":
+            ico = IconButton("pause", dia=dp(38), icon_color=C_FAINT,
+                             bg=C_CTRL)
+            ico.opacity = 0.55
+        else:
+            ico = IconButton("slim", dia=dp(38), icon_color=C_ACCENT,
+                             bg=(0.926, 0.953, 1.0, 1))
+        ico.bind(on_release=lambda b, i=idx: self.slim_compress_one(i))
+        row.add_widget(VCenter(ico, w=dp(54), h=dp(56)))
+        attach_sep(row, inset=dp(16))
+        return row
+
+    def _slim_level(self):
+        """当前选中的档位 (显示名, 码率, 单声道)"""
+        try:
+            label = self.sp_slim_level.text
+        except Exception:
+            label = mp3slim.DEFAULT_LEVEL[0]
+        return mp3slim.level_by_label(label)
+
+    def _refresh_slim_estimate(self):
+        """档位变了就把「大概能压到多大」写进说明行 —— 用户最关心这个"""
+        try:
+            _label, br, mono = self._slim_level()
+        except Exception:
+            return
+        if not mp3slim.available():
+            lbl0 = getattr(self, "lbl_slim_engine", None)
+            if lbl0 is not None:
+                lbl0.text = mp3slim.engine_info()
+            return
+        rows = getattr(self, "_slim_rows", None) or []
+        total = 0.0
+        for item in rows:
+            info = item.get("info") or {}
+            dur = info.get("duration_ms") or 0
+            if dur:
+                total += mp3slim.estimate_bytes(dur, br, mono)
+        tail = ("　·　整批约 %s" % mp3slim.human(total)) if total > 0 else ""
+        warn = "　·　单声道" if mono else ""
+        text = "%s 档　目标 %dkbps%s%s" % (
+            _label.split("·")[0].strip(), br, warn, tail)
+        lbl = getattr(self, "lbl_slim_engine", None)
+        if lbl is not None:
+            lbl.text = text
+            lbl.color = C_DIM
+
+    def pick_slim_out(self, *_):
+        """选输出文件夹（复用系统目录选择器，回调码 0x1237）"""
+        if not IS_ANDROID:
+            self.set_status("桌面端默认输出到源文件同目录")
+            return
+        try:
+            from jnius import autoclass
+            from android import activity as android_activity
+
+            Intent = autoclass("android.content.Intent")
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            if not getattr(self, "_picker_bound", False):
+                android_activity.bind(on_activity_result=self._on_picked)
+                self._picker_bound = True
+            intent = Intent("android.intent.action.OPEN_DOCUMENT_TREE")
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            act.startActivityForResult(intent, 0x1237)
+        except Exception as e:
+            log_exc("pick_slim_out")
+            self.set_status("打开目录选择器失败: %s" % e, C_ERR)
+
+    def _on_slim_out_picked(self, result_code, intent):
+        try:
+            if result_code != -1 or intent is None or intent.getData() is None:
+                self.set_status("已取消选择输出文件夹")
+                return
+            path = tree_uri_to_path(intent.getData())
+            if not path:
+                self.set_status("这个目录用不了（只支持手机内置存储）", C_ERR)
+                return
+            self._slim_out_dir = path
+            label = "自定义: " + (os.path.basename(path.rstrip("/")) or path)
+            self._slim_out_labels = {label: path}
+            sp = getattr(self, "sp_slim_out", None)
+            if sp is not None:
+                sp.values = ["同目录（.slim.mp3）", label]
+                sp.text = label
+            self.set_status("输出到: %s" % path, C_OK)
+        except Exception as e:
+            log_exc("_on_slim_out_picked")
+            self.set_status("设置输出目录失败: %s" % e, C_ERR)
+
+    def _slim_target_dir(self, src):
+        label = ""
+        sp = getattr(self, "sp_slim_out", None)
+        if sp is not None:
+            label = sp.text or ""
+        mapping = getattr(self, "_slim_out_labels", {}) or {}
+        if label in mapping:
+            return mapping[label]
+        return os.path.dirname(os.path.abspath(src))
+
+    # ---- 压缩执行 ----
+    def slim_compress_one(self, idx):
+        """压缩列表里的第 idx 个文件"""
+        if not mp3slim.available():
+            self.set_status(mp3slim.engine_info(), C_ERR)
+            return
+        rows = getattr(self, "_slim_rows", None) or []
+        if not 0 <= idx < len(rows):
+            return
+        item = rows[idx]
+        if item.get("state") == "running":
+            self.set_status("这个文件正在压缩中")
+            return
+        if self._slim_busy:
+            self.set_status("正在压缩另一个文件，稍候…（可点「停止」）")
+            return
+        item["state"] = "queued"
+        self._slim_busy = True
+        self._slim_stop_flag = False
+        self._slim_pending = [idx]
+        self._slim_pump_next()
+
+    def slim_run_all(self):
+        """批量压缩列表里所有还没成功的文件"""
+        if not mp3slim.available():
+            self.set_status(mp3slim.engine_info(), C_ERR)
+            return
+        rows = getattr(self, "_slim_rows", None) or []
+        if not rows:
+            self.set_status("先扫描一个文件夹")
+            return
+        todo = [i for i, it in enumerate(rows)
+                if it.get("state") not in ("done", "skip")]
+        if not todo:
+            self.set_status("列表里的文件都压完了")
+            return
+        if self._slim_busy:
+            self.set_status("已经在压缩了，先点「停止」再重新开始")
+            return
+        self._slim_busy = True
+        self._slim_stop_flag = False
+        self._slim_pending = todo
+        self._slim_total = len(todo)
+        self._slim_done = 0
+        self.set_status("开始批量压缩 %d 个文件…" % len(todo))
+        self._slim_pump_next()
+
+    def slim_stop(self, *_):
+        """停止当前批（当前文件压完就停，不留半截文件）"""
+        if not self._slim_busy:
+            self.set_status("没有在压缩")
+            return
+        self._slim_stop_flag = True
+        self._slim_pending = []
+        self.set_status("正在停止…（当前文件结束就停）")
+
+    def _slim_pump_next(self):
+        """取下一个待压文件开工；队列空了就收尾"""
+        if self._slim_stop_flag:
+            self._slim_finish_batch("已停止")
+            return
+        pending = getattr(self, "_slim_pending", [])
+        if not pending:
+            self._slim_finish_batch("全部完成")
+            return
+        idx = pending.pop(0)
+        rows = getattr(self, "_slim_rows", None) or []
+        if not 0 <= idx < len(rows):
+            self._slim_pump_next()
+            return
+        item = rows[idx]
+        if item.get("state") == "done":
+            self._slim_pump_next()
+            return
+        item["state"] = "running"
+        item["pct"] = 0
+        self._slim_active = idx
+        self._render_slim_rows()
+        self.bg(lambda: self._slim_work(idx, item), "slim-compress")
+
+    def _slim_work(self, idx, item):
+        """后台线程：真正压缩（阻塞调用，进度通过轮询回传）"""
+        src = item["path"]
+        out_dir = self._slim_target_dir(src)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError:
+            out_dir = os.path.dirname(os.path.abspath(src))
+        label, br, mono = self._slim_level()
+        dst = mp3slim.unique_path(mp3slim.default_out_path(src, out_dir))
+
+        # 先探一次信息（界面上要显示原始体积/码率，顺便验证文件没坏）
+        try:
+            info = mp3slim.probe(src)
+        except Exception:
+            info = None
+
+        # 不值得压就如实跳过：已经是低码率的文件再削一遍只会更糊，
+        # 体积也省不下来（有损转码的损伤还是叠加的）。
+        why = mp3slim.should_skip(info, br, mono)
+        if why:
+            self.ui(lambda: self._slim_one_skipped(idx, info, why))
+            return
+
+        last = [0.0]
+
+        def on_progress(frac):
+            # 每 2% 才刷一次界面：一首歌上千次回调，全刷会把 UI 线程淹了
+            if frac - last[0] < 0.02 and frac < 1.0:
+                return
+            last[0] = frac
+            pct = int(frac * 100)
+            self.ui(lambda: self._slim_progress(idx, pct))
+
+        try:
+            result = mp3slim.compress(src, dst, bitrate=br, mono=mono,
+                                      on_progress=on_progress)
+            self.ui(lambda: self._slim_one_done(idx, info, result))
+        except Exception as exc:
+            msg = str(exc)
+            log_exc("slim 压缩 %s" % os.path.basename(src))
+            self.ui(lambda: self._slim_one_failed(idx, msg))
+
+    def _slim_progress(self, idx, pct):
+        rows = getattr(self, "_slim_rows", None) or []
+        if not 0 <= idx < len(rows):
+            return
+        rows[idx]["pct"] = pct
+        # 进度条复用底部的下载进度胶囊 —— 它是这个 App 唯一的「百分比」入口
+        self.pb.value = pct
+        self.set_status("压缩中 %s: %d%%" % (
+            os.path.basename(rows[idx]["path"]), pct))
+        # 就地更新小字，避免整表重建（重建会闪、还会丢滚动位置）
+        row = self._slim_row_widget(idx)
+        if row is not None:
+            name = os.path.basename(rows[idx]["path"])
+            try:
+                avail = max(80.0, self.results.width - dp(84))
+            except Exception:
+                avail = dp(220)
+            row._slim_btn.text = "%s\n%s" % (
+                clip_text(name, avail), "正在压缩… %d%%" % pct)
+
+    def _slim_row_widget(self, idx):
+        """按行号找已经建好的行控件（就地刷新用，找不到返回 None）"""
+        try:
+            for child in self.results.children:
+                if getattr(child, "_slim_btn", None) is not None:
+                    if child._slim_idx == idx:
+                        return child
+        except Exception:
+            pass
+        return None
+
+    def _slim_one_done(self, idx, info, result):
+        rows = getattr(self, "_slim_rows", None) or []
+        if not 0 <= idx < len(rows):
+            return
+        rows[idx].update({"state": "done", "result": result, "info": info,
+                          "out": result.get("path"), "pct": 100})
+        self._slim_done = getattr(self, "_slim_done", 0) + 1
+        self._render_slim_rows()
+        saved = 0.0
+        if result.get("src_size"):
+            saved = 100.0 * (1.0 - float(result["size"]) / max(result["src_size"], 1))
+        self.pb.value = 100
+        self.set_status("完成 %s → %s（省 %.0f%%）" % (
+            os.path.basename(rows[idx]["path"]),
+            os.path.basename(result.get("path", "")), saved), C_OK)
+        self._slim_pump_next()
+
+    def _slim_one_skipped(self, idx, info, why):
+        """跳过（不压）：状态留在 idle，但把原因写在副标题上"""
+        rows = getattr(self, "_slim_rows", None) or []
+        if not 0 <= idx < len(rows):
+            return
+        rows[idx].update({"state": "skip", "info": info, "error": why})
+        self._render_slim_rows()
+        self.set_status(why, C_DIM)
+        self._slim_pump_next()
+
+    def _slim_one_failed(self, idx, msg):
+        rows = getattr(self, "_slim_rows", None) or []
+        if not 0 <= idx < len(rows):
+            return
+        rows[idx].update({"state": "error", "error": msg})
+        self._render_slim_rows()
+        self.set_status("压缩失败: %s" % msg, C_ERR)
+        self._slim_pump_next()
+
+    def _slim_finish_batch(self, why):
+        self._slim_busy = False
+        self._slim_active = None
+        self._slim_pending = []
+        rows = getattr(self, "_slim_rows", None) or []
+        done = len([x for x in rows if x.get("state") == "done"])
+        failed = len([x for x in rows if x.get("state") == "error"])
+        skipped = len([x for x in rows if x.get("state") == "skip"])
+        parts = []
+        if done:
+            parts.append("成功 %d 个" % done)
+        if failed:
+            parts.append("失败 %d 个" % failed)
+        if skipped:
+            parts.append("跳过 %d 个（已够小）" % skipped)
+        if parts:
+            self.set_status("%s：%s" % (why, "，".join(parts)),
+                            C_OK if not failed else C_ERR)
+        else:
+            self.set_status(why)
 
     # ---------- 列表上的直接操作 ----------
     def play_song(self, idx):

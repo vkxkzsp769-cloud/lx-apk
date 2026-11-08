@@ -149,6 +149,40 @@ workflow 里已经加了 `android.accept_sdk_license = True`。
 
 ---
 
+## 加了 MP3 压缩功能后，编译链多了什么
+
+`requirements` 里多了 **`mp3slimcore`** —— 这是**本仓库自带**的 p4a recipe
+（`recipes/mp3slimcore/__init__.py`），把 `native/mp3slim/` 下的 C 源码
+（dr_libs 解码器 + LAME 3.100 编码器）编成一个 `libmp3slim.so` 打进 APK。
+
+需要知道的几件事：
+
+| 事项 | 说明 |
+|---|---|
+| 构建机要不要联网下依赖 | **不用**。C 源码全在仓库里，recipe 里 `download_if_necessary()` 是空的 |
+| 编译时间 | 增加约 1~2 分钟（20 个 C 文件，NDK -O3） |
+| APK 体积 | 增加约 500KB |
+| 首次编译要清缓存吗 | 不用。但如果改了 `native/` 下的代码却没生效，把 `recipes/mp3slimcore/__init__.py` 里的 `version` 往上加一位即可强制重建 |
+| `extractNativeLibs` | workflow 的 manifest 补丁会加 `android:extractNativeLibs="true"`，保证 `.so` 是解出来的真文件（ctypes dlopen 需要） |
+
+### 改了 native 代码怎么验证
+
+本地（Termux/桌面，有 clang 就行）：
+
+```bash
+clang -O2 -fPIC -shared -DHAVE_CONFIG_H \
+  -Inative/mp3slim -Inative/mp3slim/codec/lame -Inative/mp3slim/codec/lame/vector \
+  -o /tmp/libmp3slim.so \
+  native/mp3slim/mp3slim_core.c $(ls native/mp3slim/codec/lame/*.c | grep -v mpglib_interface) -lm
+
+MP3SLIM_LIB=/tmp/libmp3slim.so python3 test_mp3slim.py
+```
+
+CI 里也有这两步（「编译 native 引擎 + 跑引擎测试」「跑界面冒烟测试」），
+**在 buildozer 之前**跑，native 有问题 3 秒就红，不用白等 20 分钟。
+
+---
+
 ## 本地先测一遍（推荐，省得白等编译）
 
 在 Termux 里：
@@ -175,6 +209,10 @@ python test_desktop.py "海阔天空"
 | `.github/workflows/build.yml` | 云端自动编译脚本 |
 | `assets/default_source.js` | 内置默认音源 |
 | `test_desktop.py` | 本地链路测试（不装 Kivy 也能跑） |
+| `mp3slim.py` | MP3 压缩引擎的 Python 封装（ctypes 调 libmp3slim.so） |
+| `test_mp3slim.py` | 压缩引擎测试（编解码/体积/边界，不装 Kivy 也能跑） |
+| `native/mp3slim/` | 压缩引擎 C 源码（core + LAME + dr_libs 解码器） |
+| `recipes/mp3slimcore/` | p4a 本地 recipe：把上面这些编成 libmp3slim.so |
 
 ---
 

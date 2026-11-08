@@ -10,9 +10,12 @@ source.include_exts = py,png,jpg,kv,atlas,js,json,otf,ttf
 source.include_patterns = assets/*, assets/sources/*, assets/fonts/*, sources/*
 
 # 桌面专用的调试工具不进 APK（它们依赖 dukpy，Android 上没有这个 recipe）
-source.exclude_patterns = test_desktop.py, lx_engine.py, test_ui.py, tests/*
+# native/ 和 recipes/ 是**编译期**用的（p4a 从源码编译 libmp3slim.so，
+# 见 recipes/mp3slimcore/），不要打进 APK 的 Python 资产里 —— 那会把
+# 2MB 的 C 源码白白塞进 apk（对运行没有任何帮助）。
+source.exclude_patterns = test_desktop.py, lx_engine.py, test_ui.py, tests/*, native/*, recipes/*
 
-version = 2.8.14
+version = 2.9.0
 
 # release 模式打包成 apk 而不是 aab。
 # buildozer 官方默认 `android.release_artifact = aab`（见 buildozer/
@@ -28,11 +31,21 @@ android.release_artifact = apk
 # `# android.numeric_version = 1`），不显式设置的话每个版本都是 1。
 # Android 要求新包的 versionCode >= 已装版本，显式递增最稳妥。
 # 每次发版把它往上加（跟 version 对应：2.6.7 -> 20607）。
-android.numeric_version = 20914
+android.numeric_version = 20900
 
 # 只用 kivy（不锁版本）。锁 kivy==2.3.x 会拉 thorvg 依赖，
 # 其 recipe 在 NDK r25b 下 glob() 返回空 -> IndexError 导致编译失败。
-requirements = python3,kivy,pyjnius,android
+# requirements：
+#   mp3slimcore 是**本仓库自带的 recipe**（recipes/mp3slimcore/），
+#   源码在 native/mp3slim/ —— 把 LAME 3.100 + dr_libs 解码器编成一个
+#   libmp3slim.so 打进 APK，供 mp3slim.py 用 ctypes 调用。
+#   不用 p4a 官方 ffmpeg recipe 的原因：它产出的是可执行文件，
+#   而 Android 应用目录 noexec，exec 不了；而且它要连带编译
+#   libx264/libvpx，20 分钟起步（见 recipes/mp3slimcore/__init__.py）。
+requirements = python3,kivy,pyjnius,android,mp3slimcore
+
+# 让 p4a 去仓库里的 recipes/ 找 recipe（buildozer 1.5.0 支持这个键）
+p4a.local_recipes = recipes
 
 orientation = portrait
 fullscreen = 0

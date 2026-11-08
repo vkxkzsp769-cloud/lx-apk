@@ -109,30 +109,46 @@ jobs:
           cat > /tmp/patch_manifest.py <<'PYEOF'
           import io, sys
 
-          ATTRS = ('android:usesCleartextTraffic="true" '
-                   'android:requestLegacyExternalStorage="true" ')
+          # 需要补进 <application> 的属性。逐个判断 —— 只判其中一个的话，
+          # 老版本已经打过 usesCleartextTraffic 的缓存 manifest 会被整段跳过，
+          # 新加的 extractNativeLibs 就永远打不上（libmp3slim.so 加载不到）。
+          ATTRS = [
+              ('usesCleartextTraffic', 'android:usesCleartextTraffic="true"'),
+              ('requestLegacyExternalStorage',
+               'android:requestLegacyExternalStorage="true"'),
+              # extractNativeLibs=true：p4a 新版默认声明成 false（.so 留在
+              # apk 里直接 mmap）。我们 load 的 libmp3slim.so 是 ctypes dlopen，
+              # 解到 nativeLibraryDir 的真文件最稳（详见 mp3slim.py 的注释）。
+              ('extractNativeLibs', 'android:extractNativeLibs="true"'),
+          ]
+
+          def missing(src):
+              return [a for key, a in ATTRS if key not in src]
 
           def patch_template(path):
               src = io.open(path, encoding='utf-8').read()
-              if 'usesCleartextTraffic' in src:
+              need = missing(src)
+              if not need:
                   return 'skip'
               anchor = 'android:hardwareAccelerated="true"'
               if anchor not in src:
                   return 'no-anchor'
               src = src.replace(anchor, anchor + '\n                 ' +
-                                ATTRS.strip(), 1)
+                                ' '.join(need), 1)
               io.open(path, 'w', encoding='utf-8').write(src)
-              return 'patched'
+              return 'patched(%d)' % len(need)
 
           def patch_manifest(path):
               src = io.open(path, encoding='utf-8').read()
-              if 'usesCleartextTraffic' in src:
+              need = missing(src)
+              if not need:
                   return 'skip'
               if '<application ' not in src:
                   return 'no-app-tag'
-              src = src.replace('<application ', '<application ' + ATTRS, 1)
+              src = src.replace('<application ', '<application ' +
+                                ' '.join(need) + ' ', 1)
               io.open(path, 'w', encoding='utf-8').write(src)
-              return 'patched'
+              return 'patched(%d)' % len(need)
 
           kind, path = sys.argv[1], sys.argv[2]
           fn = patch_template if kind == 'tmpl' else patch_manifest
@@ -155,6 +171,51 @@ jobs:
                 python3 /tmp/patch_manifest.py manifest "$M"
               done
           echo "=== 补丁完成 ==="
+
+      - name: 编译 native 引擎 + 跑引擎测试
+        run: |
+          # ── 为什么在这里单独编一遍 libmp3slim.so ────────────────────
+          # p4a 编译 APK 时也会用 NDK 编译它（recipes/mp3slimcore）。
+          # 但那是十几分钟之后的事，而且一旦失败，日志埋在几千行
+          # buildozer 输出里，很难看出来**究竟**是 native 的问题还是
+          # p4a 的问题。这里先用宿主机 clang 快速编一份 **x86_64 版**
+          # 来跑引擎测试（解码/编码/重采样逻辑与架构无关），
+          # 3 秒出结果 —— 真有问题在这里就红，不浪费一次 20 分钟的编译。
+          set -e
+          sudo apt-get install -y clang > /dev/null 2>&1 || true
+          echo "=== 编译 libmp3slim.so（宿主机 x86_64，仅供测试） ==="
+          clang -O2 -fPIC -shared -DHAVE_CONFIG_H \
+            -Inative/mp3slim \
+            -Inative/mp3slim/codec/lame \
+            -Inative/mp3slim/codec/lame/vector \
+            -o /tmp/libmp3slim.so \
+            native/mp3slim/mp3slim_core.c \
+            $(ls native/mp3slim/codec/lame/*.c | grep -v mpglib_interface) \
+            -lm
+          ls -lh /tmp/libmp3slim.so
+
+          echo "=== 生成测试用 MP3（ffmpeg 合成，不依赖外部素材） ==="
+          sudo apt-get install -y ffmpeg > /dev/null 2>&1 || true
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i "sine=frequency=440:duration=12" \
+            -f lavfi -i "sine=frequency=660:duration=12" \
+            -filter_complex "[0:a][1:a]amerge=inputs=2[a]" -map "[a]" \
+            -c:a libmp3lame -b:a 320k /tmp/testcase.mp3
+          ls -lh /tmp/testcase.mp3
+
+          echo "=== 引擎测试 ==="
+          MP3SLIM_LIB=/tmp/libmp3slim.so MP3SLIM_SAMPLE=/tmp/testcase.mp3 \
+            python3 test_mp3slim.py
+
+      - name: 跑界面冒烟测试
+        run: |
+          # test_ui.py 用 SDL offscreen 在没有显示器的机器上真跑 Kivy 界面。
+          # 它挡的是「启动即崩」「控件漏接」「线程契约被破坏」这类事故 ——
+          # 这些在真机上表现为闪退，在这里是几秒的测试。
+          sudo apt-get install -y libsdl2-2.0-0 libsdl2-image-2.0-0 \
+            libsdl2-mixer-2.0-0 libsdl2-ttf-2.0-0 > /dev/null 2>&1 || true
+          python3 -m pip install --quiet "kivy[base]" pyflakes
+          SDL_VIDEODRIVER=offscreen python3 test_ui.py
 
       - name: 编译 APK
         run: |
