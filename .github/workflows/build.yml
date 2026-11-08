@@ -248,6 +248,20 @@ jobs:
                   print('  %-24s 缺失 (%s)' % (lib, str(e)[:60]))
           " || true
 
+          echo "=== 单独 import main（分离真正的失败点）==="
+          set +e
+          KIVY_NO_CONSOLELOG=0 SDL_VIDEODRIVER=offscreen python3 -u -c "
+          import traceback
+          try:
+              import main
+              print('import main OK')
+          except BaseException:
+              traceback.print_exc()
+              raise
+          " 2>&1 | tail -40
+          echo "单测 import 退出码: ${PIPESTATUS[0]}"
+          set -e
+
           echo "=== 跑测试 ==="
           # tee 到文件：这一步失败时 GitHub 只显示 "exit code 1"，
           # 之前就是因为没有日志文件而完全不知道发生了什么。

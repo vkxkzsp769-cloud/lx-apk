@@ -76,7 +76,33 @@ import appenv  # noqa: E402
 _probe("appenv 已导入")
 import fonts  # noqa: E402
 _probe("fonts 已导入")
+
+# import main 在 CI 上会**无声无息地退出**（exit 1，没有 traceback）。
+# 这类「不是异常、而是进程直接结束」的死法只有两种可能：
+#   1) 代码里 sys.exit()/os._exit()；
+#   2) 原生库在 import 期崩溃（段错误被 CI 报成 exit 1）。
+# faulthandler 能抓住第 2 种；这里同时把 sys.exit 也变成可打印的异常。
+import faulthandler as _fh  # noqa: E402
+_fh.enable(all_threads=True)
+
+_orig_exit = sys.exit
+
+
+def _loud_exit(code=0):
+    """把任何 sys.exit() 变成带堆栈的可诊断输出"""
+    if code not in (0, None):
+        import traceback as _tb
+        sys.stderr.write("[probe] 有人在 import 期调用了 sys.exit(%r)\n" % (code,))
+        _tb.print_stack(file=sys.stderr)
+        sys.stderr.flush()
+    return _orig_exit(code)
+
+
+sys.exit = _loud_exit
+
+_probe("准备 import main")
 import main as M  # noqa: E402
+sys.exit = _orig_exit
 _probe("main 已导入")
 
 appenv.IS_ANDROID = False
