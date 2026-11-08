@@ -259,14 +259,23 @@ jobs:
           echo "=== 单独 import main（分离真正的失败点）==="
           set +e
           python3 -u -c "
-          import traceback
+          import faulthandler, sys, traceback
+          faulthandler.enable(all_threads=True)
+          _orig = sys.exit
+          def _loud(code=0):
+              if code not in (0, None):
+                  sys.stderr.write('[diag] sys.exit(%r) 被调用:\n' % (code,))
+                  traceback.print_stack(file=sys.stderr)
+                  sys.stderr.flush()
+              return _orig(code)
+          sys.exit = _loud
           try:
               import main
               print('import main OK')
           except BaseException:
               traceback.print_exc()
               raise
-          " 2>&1 | tail -40
+          " 2>&1 | tail -50
           echo "单测 import 退出码: ${PIPESTATUS[0]}"
           set -e
 
