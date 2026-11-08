@@ -212,10 +212,40 @@ jobs:
           # test_ui.py 用 SDL offscreen 在没有显示器的机器上真跑 Kivy 界面。
           # 它挡的是「启动即崩」「控件漏接」「线程契约被破坏」这类事故 ——
           # 这些在真机上表现为闪退，在这里是几秒的测试。
-          sudo apt-get install -y libsdl2-2.0-0 libsdl2-image-2.0-0 \
-            libsdl2-mixer-2.0-0 libsdl2-ttf-2.0-0 > /dev/null 2>&1 || true
-          python3 -m pip install --quiet "kivy[base]" pyflakes
-          SDL_VIDEODRIVER=offscreen python3 test_ui.py
+          #
+          # 注意几次踩坑（都让这一步「8 秒就红、日志一片空白」）：
+          #   1. 不加 set -x / 不把 pip 的输出打出来，失败时完全看不到原因；
+          #   2. kivy 有 cp310 manylinux wheel，但**必须** --only-binary，
+          #      否则 pip 会去下 sdist 现场编译（缺 GL 头文件直接失败）；
+          #   3. 管道会吃掉退出码，得用 pipefail。
+          set -o pipefail
+          sudo apt-get install -y -qq libsdl2-2.0-0 libsdl2-image-2.0-0 \
+            libsdl2-mixer-2.0-0 libsdl2-ttf-2.0-0 || echo "（SDL 包安装失败，继续）"
+
+          echo "=== 安装 Kivy ==="
+          python3 -m pip install --only-binary=:all: "kivy==2.3.1" pyflakes
+          python3 -c "import kivy; print('kivy', kivy.__version__)"
+
+          echo "=== 跑测试 ==="
+          # tee 到文件：这一步失败时 GitHub 只显示 "exit code 1"，
+          # 之前就是因为没有日志文件而完全不知道发生了什么。
+          set +e
+          SDL_VIDEODRIVER=offscreen python3 test_ui.py 2>&1 | tee test-ui.log
+          RC=${PIPESTATUS[0]}
+          echo "test_ui 退出码: $RC"
+          echo "--- test-ui.log 里失败的项 ---"
+          grep -E "\[FAIL\]|✗" test-ui.log || true
+          exit $RC
+
+      - name: 上传测试日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            build.log
+            test-ui.log
+          if-no-files-found: ignore
 
       - name: 编译 APK
         run: |

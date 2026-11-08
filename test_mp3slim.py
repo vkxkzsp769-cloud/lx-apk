@@ -131,6 +131,10 @@ def test_human():
     assert mp3slim.human(1024 * 1024 * 3.5).startswith("3.5MB")
 
 
+class SkipTest(Exception):
+    """依赖不满足（没素材/没引擎）—— 标记跳过，不算失败"""
+
+
 def test_missing_file_reports_error():
     """文件不存在时必须抛带原因的错，不能安静地返回 None"""
     if not mp3slim.available():
@@ -141,10 +145,6 @@ def test_missing_file_reports_error():
         assert "不存在" in str(e), "错误信息没说清原因: %s" % e
         return
     raise AssertionError("不存在的文件居然没报错")
-
-
-class SkipTest(Exception):
-    pass
 
 
 # ─────────────────────────── 需要引擎的部分 ───────────────────────────

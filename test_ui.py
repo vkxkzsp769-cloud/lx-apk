@@ -1656,6 +1656,29 @@ def test_no_undefined_names():
     print("  pyflakes 未发现未定义名字 ✓")
 
 
+def _slim_app(engine=True):
+    """建一个 App，并把 mp3slim 引擎状态固定成 engine。
+
+    这几条测试都不应该依赖「本机有没有编出 libmp3slim.so」——
+    UI 测试跑在装 Kivy 的机器上，引擎是另一个步骤才编的。
+    所以引擎可用性一律**显式打桩**，测的是界面接线本身。
+    """
+    import mp3slim
+    app = M.LxApp()
+    app.build()
+    if engine:
+        app._stub_orig = (mp3slim.available, mp3slim.engine_info)
+        mp3slim.available = lambda: True
+        mp3slim.engine_info = lambda: "MP3 压缩引擎就绪（测试桩）"
+    return app, mp3slim
+
+
+def _slim_unstub(app, mod):
+    orig = getattr(app, "_stub_orig", None)
+    if orig:
+        mod.available, mod.engine_info = orig
+
+
 def test_mp3slim_wired():
     """MP3 压缩页必须真的挂在界面上（不能只是 import 了模块）
 
@@ -1663,26 +1686,26 @@ def test_mp3slim_wired():
     但没接进 build()，用户点「压缩」页签什么都不会变 ——
     看起来像「功能没做」，实际上只是漏了一行 add_widget。
     """
-    import main as M2
-    app = M2.LxApp()
-    app.build()
-    # 1) 页签里有压缩视图
-    if M2.SLIM_VIEW not in app.nav_buttons:
-        raise AssertionError("导航里没有 %r 页签" % M2.SLIM_VIEW)
-    # 2) 两条工具栏都建好了（搜索栏 / 压缩工具栏）
-    for name in ("search_bar", "slim_bar", "slim_actions"):
-        if not hasattr(app, name):
-            raise AssertionError("缺少控件 %s" % name)
-    for name in ("ti_dir", "btn_slim_scan", "btn_slim_all", "btn_slim_stop",
-                 "sp_slim_level", "lbl_slim_engine"):
-        if not hasattr(app, name):
-            raise AssertionError("缺少控件 %s" % name)
-    # 3) 初始状态：压缩工具栏必须收着（高度 0），否则主界面白白少 56dp
-    if abs(app.slim_bar.height) > 0.5:
-        raise AssertionError("压缩工具栏初始高度应为 0，实际 %s" % app.slim_bar.height)
-    if app.search_bar.height <= 0:
-        raise AssertionError("搜索栏初始高度不该是 0")
-    print("  压缩页控件齐全，初始收起正确 ✓")
+    app, mod = _slim_app()
+    try:
+        # 1) 页签里有压缩视图
+        if M.SLIM_VIEW not in app.nav_buttons:
+            raise AssertionError("导航里没有 %r 页签" % M.SLIM_VIEW)
+        # 2) 控件都建好了
+        for name in ("search_bar", "slim_bar", "slim_actions", "ti_dir",
+                     "btn_slim_scan", "btn_slim_all", "btn_slim_stop",
+                     "sp_slim_level", "sp_slim_out", "lbl_slim_engine"):
+            if not hasattr(app, name):
+                raise AssertionError("缺少控件 %s" % name)
+        # 3) 初始状态：压缩工具栏收着（否则主界面白白少 56dp）
+        if abs(app.slim_bar.height) > 0.5:
+            raise AssertionError("压缩工具栏初始高度应为 0，实际 %s"
+                                 % app.slim_bar.height)
+        if app.search_bar.height <= 0:
+            raise AssertionError("搜索栏初始高度不该是 0")
+        print("  压缩页控件齐全，初始收起正确 ✓")
+    finally:
+        _slim_unstub(app, mod)
 
 
 def test_mp3slim_view_switch():
@@ -1691,23 +1714,24 @@ def test_mp3slim_view_switch():
     BoxLayout 按 size_hint 分高度：只改 opacity 不改 height，
     透明的那条照样占 56dp —— 表现就是「列表被挤掉两行」。
     """
-    import main as M2
-    app = M2.LxApp()
-    app.build()
-    app.show_library_view(M2.SLIM_VIEW)
-    if app.slim_bar.height <= 0:
-        raise AssertionError("切到压缩页后工具栏没有展开")
-    if abs(app.search_bar.height) > 0.5:
-        raise AssertionError("切到压缩页后搜索栏没有收起（仍占 %s）"
-                             % app.search_bar.height)
-    if app._view != M2.SLIM_VIEW:
-        raise AssertionError("_view 没更新")
-    app.show_library_view("discover")
-    if app.search_bar.height <= 0:
-        raise AssertionError("切回发现页后搜索栏没有恢复")
-    if abs(app.slim_bar.height) > 0.5:
-        raise AssertionError("切回发现页后压缩工具栏没有收起")
-    print("  两条工具栏高度互让正确 ✓")
+    app, mod = _slim_app()
+    try:
+        app.show_library_view(M.SLIM_VIEW)
+        if app.slim_bar.height <= 0:
+            raise AssertionError("切到压缩页后工具栏没有展开")
+        if abs(app.search_bar.height) > 0.5:
+            raise AssertionError("切到压缩页后搜索栏没有收起（仍占 %s）"
+                                 % app.search_bar.height)
+        if app._view != M.SLIM_VIEW:
+            raise AssertionError("_view 没更新")
+        app.show_library_view("discover")
+        if app.search_bar.height <= 0:
+            raise AssertionError("切回发现页后搜索栏没有恢复")
+        if abs(app.slim_bar.height) > 0.5:
+            raise AssertionError("切回发现页后压缩工具栏没有收起")
+        print("  两条工具栏高度互让正确 ✓")
+    finally:
+        _slim_unstub(app, mod)
 
 
 def test_mp3slim_no_silent_disabled():
@@ -1715,26 +1739,19 @@ def test_mp3slim_no_silent_disabled():
 
     历史教训：按钮看着能点、点下去什么都不发生 —— 比直接报错难受得多。
     """
-    import main as M2
-    import mp3slim
-    # 临时把引擎伪装成不可用
-    orig = mp3slim.available
-    mp3slim.available = lambda: False
-    orig_info = mp3slim.engine_info
-    mp3slim.engine_info = lambda: "MP3 压缩引擎不可用（测试）"
+    app, mod = _slim_app(engine=False)
     try:
-        app = M2.LxApp()
-        app.build()
-        app.show_library_view(M2.SLIM_VIEW)
+        mod.available = lambda: False
+        mod.engine_info = lambda: "MP3 压缩引擎不可用（测试）"
+        app.show_library_view(M.SLIM_VIEW)
         if not app.btn_slim_scan.disabled:
             raise AssertionError("引擎不可用时「扫描」按钮仍可点")
         if "不可用" not in (app.lbl_slim_engine.text or ""):
             raise AssertionError("界面没有说明引擎不可用: %r"
                                  % app.lbl_slim_engine.text)
+        print("  引擎不可用时如实禁用并说明 ✓")
     finally:
-        mp3slim.available = orig
-        mp3slim.engine_info = orig_info
-    print("  引擎不可用时如实禁用并说明 ✓")
+        _slim_unstub(app, mod)
 
 
 def test_mp3slim_row_geometry():
@@ -1743,44 +1760,56 @@ def test_mp3slim_row_geometry():
     搜索结果行栽过一次：预算比 text_size 宽 22dp，截完仍换行、撑出第三行
     盖住下一首。压缩行必须用同一套：预算 = 行宽 − 内衬，text_size 高度封顶。
     """
-    import main as M2
-    app = M2.LxApp()
-    app.build()
-    app.show_library_view(M2.SLIM_VIEW)
-    app._slim_rows = [{"path": "/tmp/一首名字特别特别长的歌用来测试截断行为.mp3",
-                       "size": 8 * 1024 * 1024, "info": None,
-                       "state": "idle", "out": None, "result": None}]
-    app._render_slim_rows()
-    rows = list(app.results.children)
-    if not rows:
-        raise AssertionError("没有建出行控件")
-    btn = rows[0]._slim_btn
-    if abs(rows[0].height - M2.dp(64)) > 0.5:
-        raise AssertionError("行高应为 64dp，实际 %s" % rows[0].height)
-    # text_size 高度必须封顶，否则文字一多就外溢
-    if btn.text_size[1] is None:
-        raise AssertionError("text_size 高度没有封顶，长文本会溢出盖住下一行")
-    if btn.text_size[1] > M2.dp(56):
-        raise AssertionError("text_size 高度 %s 超过了行内可用高度" % btn.text_size[1])
-    print("  压缩行几何正确（文字不出框）✓")
+    app, mod = _slim_app()
+    try:
+        app.show_library_view(M.SLIM_VIEW)
+        app._slim_rows = [{"path": "/tmp/一首名字特别特别长的歌用来测试截断行为.mp3",
+                           "size": 8 * 1024 * 1024, "info": None,
+                           "state": "idle", "out": None, "result": None}]
+        # 给结果卡一个真实宽度并跑一次布局：text_size 是**绑定在 size 上**的，
+        # 不布局就永远是 (None, None)，断言会误报（这条测试自己踩过）
+        app.results.width = 360
+        app._render_slim_rows()
+        rows = list(app.results.children)
+        if not rows:
+            raise AssertionError("没有建出行控件")
+        row = rows[0]
+        row.do_layout()
+
+        if abs(row.height - M.dp(64)) > 0.5:
+            raise AssertionError("行高应为 64dp，实际 %s" % row.height)
+        btn = row._slim_btn
+        if btn.text_size[1] is None:
+            raise AssertionError("text_size 高度没有封顶，长文本会溢出盖住下一行")
+        if btn.text_size[1] > M.dp(56):
+            raise AssertionError("text_size 高度 %s 超过了行内可用高度"
+                                 % btn.text_size[1])
+        # 预算不能超过实际文字区（行宽 − 内衬 32），否则截完还会换行
+        if btn.text_size[0] is not None and btn.text_size[0] > btn.width:
+            raise AssertionError("text_size 宽 %s 超过控件宽 %s"
+                                 % (btn.text_size[0], btn.width))
+        print("  压缩行几何正确（文字不出框）✓")
+    finally:
+        _slim_unstub(app, mod)
 
 
 def test_mp3slim_batch_guard():
     """批量压缩期间必须拦住重复启动（两个线程同时写同一个文件会毁文件）"""
-    import main as M2
-    app = M2.LxApp()
-    app.build()
-    app.show_library_view(M2.SLIM_VIEW)
-    app._slim_rows = [{"path": "/tmp/a.mp3", "size": 1024, "info": None,
-                       "state": "idle", "out": None, "result": None}]
-    app._slim_busy = True          # 假装正在压
-    before = len(app._slim_pending)
-    app.slim_run_all()
-    if len(app._slim_pending) != before:
-        raise AssertionError("忙碌时仍改动了队列（应直接拒绝）")
-    if "已经在压缩" not in app.status.text and "停止" not in app.status.text:
-        raise AssertionError("忙碌时没有明确提示: %r" % app.status.text)
-    print("  批量压缩有重入保护 ✓")
+    app, mod = _slim_app()
+    try:
+        app.show_library_view(M.SLIM_VIEW)
+        app._slim_rows = [{"path": "/tmp/a.mp3", "size": 1024, "info": None,
+                           "state": "idle", "out": None, "result": None}]
+        app._slim_busy = True          # 假装正在压
+        before = list(app._slim_pending)
+        app.slim_run_all()
+        if list(app._slim_pending) != before:
+            raise AssertionError("忙碌时仍改动了队列（应直接拒绝）")
+        if "已经在压缩" not in app.status.text and "停止" not in app.status.text:
+            raise AssertionError("忙碌时没有明确提示: %r" % app.status.text)
+        print("  批量压缩有重入保护 ✓")
+    finally:
+        _slim_unstub(app, mod)
 
 
 def test_static():
