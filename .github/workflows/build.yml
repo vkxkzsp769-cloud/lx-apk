@@ -397,14 +397,21 @@ jobs:
           - 详细说明见仓库 README 与 编译APK说明.md
           - 提交: $GITHUB_SHA"
 
+          # ⚠ 不要用 --clobber 覆盖已有 Release。
+          # 事故：把 version 写成历史值 2.9.0（10-06 就已经发过），
+          # 结果新 APK 覆盖了那个老 release 的 asset，而 Releases 列表
+          # 按**创建时间**排序 —— 老 release 排在列表后面，用户根本看不到
+          # 本次构建，还以为根本没发出来。
+          # 现在的规则：tag 已存在就直接失败，逼你改版本号，绝不悄悄覆盖。
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG 已存在，覆盖上传"
-            gh release upload "$TAG" "$OUT" --clobber
-          else
-            gh release create "$TAG" "$OUT" \
-              --title "落雪音源下载器 $TAG" \
-              --notes "$NOTES"
+            echo "::error::Release $TAG 已经存在（历史版本号被复用）"
+            echo "请把 buildozer.spec 里的 version 改成一个**从未用过**的新值。"
+            echo "已有 tags: $(git tag | tr '\n' ' ')"
+            exit 1
           fi
+          gh release create "$TAG" "$OUT" \
+            --title "落雪音源下载器 $TAG" \
+            --notes "$NOTES"
           echo "✓ 已发布: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
 
       - name: 上传 APK

@@ -15,7 +15,7 @@ source.include_patterns = assets/*, assets/sources/*, assets/fonts/*, sources/*
 # 2MB 的 C 源码白白塞进 apk（对运行没有任何帮助）。
 source.exclude_patterns = test_desktop.py, lx_engine.py, test_ui.py, tests/*, native/*, recipes/*
 
-version = 2.9.0
+version = 2.10.0
 
 # release 模式打包成 apk 而不是 aab。
 # buildozer 官方默认 `android.release_artifact = aab`（见 buildozer/
@@ -27,11 +27,17 @@ version = 2.9.0
 # 再装。详见 .github/workflows/build.yml 的签名说明。
 android.release_artifact = apk
 
+# ⚠ 版本号**绝不能复用历史值**：Releases 是按 tag 发布的，
+# 复用旧版本号会「覆盖」那个老 release 的 asset —— 老发布页被替换，
+# 新版本又因为 release 的创建时间还是旧的，在 Releases 列表里排到后面，
+# 用户根本找不到（2.9.0 就踩过：10-06 的老 release 被 11-13 的构建覆盖）。
+# 发版前先看一眼 https://github.com/<repo>/tags 里最大的版本号。
+#
 # versionCode。buildozer 官方默认是 1（default.spec 里
 # `# android.numeric_version = 1`），不显式设置的话每个版本都是 1。
 # Android 要求新包的 versionCode >= 已装版本，显式递增最稳妥。
 # 每次发版把它往上加（跟 version 对应：2.6.7 -> 20607）。
-android.numeric_version = 20900
+android.numeric_version = 21000
 
 # 只用 kivy（不锁版本）。锁 kivy==2.3.x 会拉 thorvg 依赖，
 # 其 recipe 在 NDK r25b 下 glob() 返回空 -> IndexError 导致编译失败。
