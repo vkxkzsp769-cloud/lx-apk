@@ -83,10 +83,23 @@ class Mp3SlimCoreRecipe(Recipe):
         # ⚠ 必须带上 env['CFLAGS']：NDK 交叉编译的 --sysroot / target 参数都在
         # 里面（arch.get_env() 提供）。只给 -I 会让 clang 用宿主头文件，
         # 编出来的 .so 链接到不存在的 libc 符号，装到手机上一加载就崩。
-        cc = env.get("CC") or arch.get_env().get("CC") or "clang"
 
-        cmd = [
-            cc,
+        # ⚠ 不要把 env["CC"] 整体当成可执行文件路径传给 sh.Command()。
+        # p4a 的 arch.get_env()["CC"] 是一整条**带空格和参数的命令行**：
+        #   "/usr/bin/ccache /home/.../android-ndk-r25b/.../bin/clang -target
+        #    aarch64-linux-android21 -fomit-frame-pointer -march=armv8-a -fPIC"
+        # 直接 sh.Command(cc) 会抛 CommandNotFound —— 实测整个 create 直接失败。
+        #
+        # 正确做法：把这条命令串**按空白切成若干段**，
+        #   第 1 段（ccache 或 clang）当可执行文件，其余段原样排在编译参数**前面**。
+        # 这样 ccache 包装、NDK 的 --target / -march 全都原样生效，
+        # 也不用经过 shell（省掉引号转义带来的所有麻烦）。
+        raw_cc = env.get("CC") or arch.get_env().get("CC") or "clang"
+        cc_parts = str(raw_cc).split()
+        if not cc_parts:
+            cc_parts = ["clang"]
+
+        cmd = cc_parts + [
             "-O3", "-fPIC", "-shared",
             "-DHAVE_CONFIG_H",        # 用 native/mp3slim/config.h
             "-funroll-loops",
@@ -102,7 +115,9 @@ class Mp3SlimCoreRecipe(Recipe):
 
         info("mp3slimcore: 编译 libmp3slim.so（%d 个 C 文件，arch=%s）"
              % (len(srcs), arch.arch))
+        info("mp3slimcore: cc = %s" % " ".join(cc_parts))
         with current_directory(build_dir):
+            # cc_parts[0] 是 ccache 或 clang，其余（NDK 的 --target 等）当参数
             shprint(sh.Command(cmd[0]), *cmd[1:], _env=env)
 
         if not os.path.exists(out):
