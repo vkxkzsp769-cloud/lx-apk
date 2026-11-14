@@ -20,6 +20,7 @@ when Android suspends Kivy/the process or kills the app. Polling requires live t
 """
 import logging
 import math
+import threading
 
 try:
     from kivy.utils import platform
@@ -55,6 +56,9 @@ class MediaNotification:
         self._helper = None
         self._closed = False
         self._reported = set()
+        self._poller = None
+        self._poller_stop = None
+        self._poller_interval = 0.25
         if platform == "android":
             try:
                 from jnius import autoclass
@@ -104,7 +108,10 @@ class MediaNotification:
             self._report("update")
 
     def poll(self):
-        """Drain up to 64 commands in the caller's Kivy tick (no auto-scheduling)."""
+        """Drain queued commands now (called from the Kivy tick when visible)."""
+        self._drain()
+
+    def _drain(self):
         if self._closed or self._helper is None:
             return
         for _ in range(64):
@@ -120,14 +127,50 @@ class MediaNotification:
             try:
                 self._on_action(str(command))
             except Exception:
-                # A UI action failure must not escape the tick or lose later actions.
+                # A UI action failure must not escape or lose later actions.
                 _LOG.exception("Media notification action failed: %s", command)
+
+    def start_polling(self, interval=0.25):
+        """起一个**常驻后台线程**轮询通知命令。
+
+        ⚠ 为什么必须这样：原来只在 Kivy 的 `_tick`（0.5s 一次）里 poll()，
+          而 **App 退到后台时 Kivy 的 Clock 会停摆** —— 那恰恰是用户
+          点通知栏「上一首/下一首/暂停」的时刻，命令永远取不出去，
+          表现就是「通知按钮全都没反应」。
+        Android 侧 drainCommand() 只是从 ArrayBlockingQueue 取字符串，
+        在 Python 后台线程调用完全安全；动作本身再用 ui() 转回 Kivy 线程。
+        """
+        if self._poller is not None or self._closed:
+            return
+        self._poller = threading.Thread(target=self._poll_loop,
+                                        name="media-poll", daemon=True)
+        self._poller_stop = threading.Event()
+        self._poller_interval = max(0.05, float(interval))
+        self._poller.start()
+
+    def _poll_loop(self):
+        while not self._poller_stop.is_set():
+            try:
+                self._drain()
+            except Exception:
+                _LOG.exception("media poll loop")
+            self._poller_stop.wait(self._poller_interval)
+
+    def stop_polling(self):
+        if self._poller is None:
+            return
+        try:
+            self._poller_stop.set()
+        except Exception:
+            pass
+        self._poller = None
 
     def close(self):
         """Idempotently cancel notification, unregister receiver, release session."""
         if self._closed:
             return
         self._closed = True
+        self.stop_polling()
         helper, self._helper = self._helper, None
         if helper is not None:
             try:

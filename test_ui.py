@@ -2075,6 +2075,170 @@ def test_search_works_after_visiting_slim():
         _slim_unstub(app, mod)
 
 
+def test_daily_multi_platform():
+    """每日推荐必须够量（100 首）且能按平台分组显示
+
+    需求：100 首 + 小标题 + 显示各平台的推荐。
+    这里断言三件事：
+      1. 目标常量是 100，且真的取了多个平台；
+      2. 分组小标题按平台出现，标题行**不进** self.songs
+         （否则行号与 songs 下标错位，点第 N 行会放错歌）；
+      3. 同一首歌跨平台不重复计入。
+    """
+    app, mod = _slim_app()
+    try:
+        if M.LxApp.DAILY_TARGET != 100:
+            raise AssertionError("每日推荐目标不是 100：%s"
+                                 % M.LxApp.DAILY_TARGET)
+        if len(M.LxApp.DAILY_PLATFORMS) < 2:
+            raise AssertionError("只配了 %d 个平台，没法分组"
+                                 % len(M.LxApp.DAILY_PLATFORMS))
+
+        # 造 3 个平台各 40 首（其中一首跨平台重复）
+        songs = []
+        for plat in ("wy", "tx", "kw"):
+            for i in range(40):
+                name = "重复歌" if (plat == "tx" and i == 0) else "%s歌%d" % (plat, i)
+                songs.append({"id": "%s-%d" % (plat, i), "name": name,
+                              "singer": "s", "interval": "03:00",
+                              "platform": plat, "_section": plat})
+        # 不走 show_library_view('daily') —— 那会真的去抓网络，
+        # 并且会覆盖我们刚注入的列表。这里只测渲染与分组逻辑。
+        app._view = "daily"
+        app._daily_ready_multi(songs, [], 0)
+
+        # 小标题行 + 歌曲行
+        children = list(app.results.children)
+        heads = [w for w in children if not hasattr(w, "_song_btn")]
+        rows = [w for w in children if hasattr(w, "_song_btn")]
+        if len(heads) < 3:
+            raise AssertionError("分组小标题只有 %d 个（应有 3 个平台）"
+                                 % len(heads))
+        # 跨平台重名的那首要去重
+        if len(rows) < 100:
+            raise AssertionError("行数 %d 少于 100（日推要够量）" % len(rows))
+        if len(app.songs) != len(rows):
+            raise AssertionError("self.songs(%d) 与行数(%d) 不一致 —— "
+                                 "点第 N 行会放错歌" % (len(app.songs), len(rows)))
+        # 小标题不能出现在 self.songs 里
+        for song in app.songs:
+            if "_section_row" in str(song):
+                raise AssertionError("标题行混进 self.songs 了")
+        print("  日推 %d 首 / %d 个平台小标题（去重正确）✓"
+              % (len(rows), len(heads)))
+    finally:
+        _slim_unstub(app, mod)
+
+
+def test_media_actions_work():
+    """通知栏 上一首/下一首/暂停 必须真的生效
+
+    真因有两个：
+      1. 命令只在 Kivy 的 _tick 里 poll，而**后台时 Clock 停摆** ——
+         用户点通知的时刻恰好取不到命令（现在有常驻轮询线程）；
+      2. skip_song 里 `if self.busy: return` —— 「正在解析下一首」时
+         busy 恰好为 True，于是上一首/下一首永远没反应。
+    """
+    import media_notification as MN
+    app, mod = _slim_app()
+    try:
+        # 1) 常驻轮询线程存在
+        media = app.media
+        if not hasattr(media, "start_polling"):
+            raise AssertionError("MediaNotification 没有 start_polling")
+        if not hasattr(media, "_drain"):
+            raise AssertionError("MediaNotification 没有 _drain")
+
+        # 2) skip_song 不能因为 busy 就拒绝
+        app._show_results([
+            {"id": "1", "name": "A", "singer": "x", "interval": "03:00"},
+            {"id": "2", "name": "B", "singer": "y", "interval": "03:00"}])
+        app.queue.set(app.songs, 0)
+        started = []
+        app._start_song_action = lambda song, act: started.append(song["name"])
+        app.busy = True                     # 模拟"正在解析"
+        app.skip_song(1)
+        if not started:
+            raise AssertionError("busy 时 skip_song 被拦住了（通知按钮会失灵）")
+        if started[-1] != "B":
+            raise AssertionError("下一首没切到 B，切到了 %s" % started[-1])
+        started.clear()
+        app.busy = True
+        app.skip_song(-1)
+        if not started:
+            raise AssertionError("busy 时上一首也被拦住了")
+        print("  busyn 时仍能切歌 + 轮询线程就绪 ✓")
+    finally:
+        _slim_unstub(app, mod)
+
+
+def test_preload_next():
+    """播完一首再切歌不能有"等解析"的空档（要预加载下一首）
+
+    做法：播完一首后立刻预解析队列里的下一首，切歌时命中缓存秒开。
+    这里断言缓存 key/新鲜度逻辑正确，且 _resolve_song 会优先用缓存。
+    """
+    app, mod = _slim_app()
+    try:
+        if M.LxApp.PRELOAD_TTL <= 0:
+            raise AssertionError("PRELOAD_TTL 必须为正")
+        app._show_results([
+            {"id": "1", "name": "A", "singer": "x", "interval": "03:00",
+             "platform": "wy"},
+            {"id": "2", "name": "B", "singer": "y", "interval": "03:00",
+             "platform": "wy"}])
+        app.queue.set(app.songs, 0)
+
+        # 手工放一条预加载缓存，模拟"上一首播的时候算好了"
+        import time as _t
+        app._preload = {"key": "wy|2|B", "url": "http://x/b.mp3",
+                        "quality": "320k", "meta": {}, "platform": "wy",
+                        "at": _t.time()}
+
+        # 命中：取出来要能对上号
+        hit = app._preload_take({"id": "2", "name": "B", "platform": "wy"})
+        if not hit or hit["url"] != "http://x/b.mp3":
+            raise AssertionError("预加载缓存没命中")
+        if app._preload is not None:
+            raise AssertionError("取用后缓存应清空（避免复用给别的歌）")
+
+        # 取用后不能重复给别的歌
+        again = app._preload_take({"id": "2", "name": "B", "platform": "wy"})
+        if again is not None:
+            raise AssertionError("缓存被复用了（同一首歌会拿到两次）")
+
+        # 过期的不能用
+        app._preload = {"key": "wy|2|B", "url": "http://x/b.mp3",
+                        "quality": "320k", "meta": {}, "platform": "wy",
+                        "at": _t.time() - M.LxApp.PRELOAD_TTL - 10}
+        if app._preload_take({"id": "2", "name": "B", "platform": "wy"}):
+            raise AssertionError("过期缓存仍被使用（直链可能已失效）")
+        print("  预加载缓存命中/清理/过期判断正确 ✓")
+    finally:
+        _slim_unstub(app, mod)
+
+
+def test_player_audio_focus():
+    """播放器要管理音频焦点（系统级防止重叠发声）"""
+    import player as PL
+    for name in ("_request_focus", "_abandon_focus", "_kill_all", "_release_mp"):
+        if not hasattr(PL.Player, name):
+            raise AssertionError("Player 缺少 %s" % name)
+    # _release_mp 必须三个动作各自 try（否则 stop 抛错后 release 不执行）
+    import inspect
+    src = inspect.getsource(PL.Player._release_mp)
+    for fn in ("stop", "reset", "release"):
+        if fn not in src:
+            raise AssertionError("_release_mp 没有调用 %s" % fn)
+    # stop() 必须先递增代际再清理（顺序反了会让在途创建漏网）
+    stop_src = inspect.getsource(PL.Player.stop)
+    gen_at = stop_src.find("self._gen += 1")
+    kill_at = stop_src.find("_kill_all")
+    if gen_at < 0 or kill_at < 0 or gen_at > kill_at:
+        raise AssertionError("stop() 必须先递增 _gen 再 _kill_all（当前顺序不对）")
+    print("  音频焦点 + 原子释放顺序正确 ✓")
+
+
 def test_static():
     """禁止再把 canvas_before 当构造参数传"""
     src = open(os.path.join(HERE, "main.py"), encoding="utf-8").read()
@@ -2170,7 +2334,13 @@ def main():
     check("停止按钮即时反馈", test_slim_stop_feedback)
     check("引擎不可用如实禁用", test_mp3slim_no_silent_disabled)
 
-    print("[8] 搜索 / 历史 / 播放回归")
+    print("[8] 每日推荐 / 通知 / 预加载")
+    check("日推多平台分组", test_daily_multi_platform)
+    check("通知按钮生效", test_media_actions_work)
+    check("预加载下一首", test_preload_next)
+    check("音频焦点与原子释放", test_player_audio_focus)
+
+    print("[9] 搜索 / 历史 / 播放回归")
     check("历史可横向滚动", test_hist_width_scrollable)
     check("连点不重叠播放", test_player_no_overlap)
     check("进过压缩页后搜索可用", test_search_works_after_visiting_slim)

@@ -102,7 +102,7 @@ class MusicLibrary:
 
     def store_daily(self, platform, songs, day=None, offset=0):
         key = self.daily_key(platform, day, offset)
-        songs = self._unique(songs)[:30]
+        songs = self._unique(songs)[:200]
         if not songs:
             return
         old = dict(self.daily)

@@ -32,23 +32,28 @@ class Player:
     PAUSED = "paused"
 
     def __init__(self):
-        self._mp = None            # android.media.MediaPlayer
-        # 播放代际号：每次 play/stop 递增。修复“快速换歌双首重叠”——
-        # _build 是投到 UI 线程执行的，self._mp 要等它在 UI 线程跑完才被赋值；
-        # 在它跑完前用户又点了下一首，stop() 看到的 _mp 还是旧的/None，
-        # 什么都没释放 → 两首歌各自 start()，而界面只握得住后创建的实例
-        # （前一首成孤儿，停不掉）。所有 MediaPlayer 都带出生时的号，
-        # 号不对 = 已被取代 → 拒绝 start 并自我释放。
+        # 播放代际号：每次 play/stop 递增。
+        # 修复「快速换歌双首重叠」：_build 是投到 Android UI 线程执行的，
+        # self._mp 要等它在 UI 线程跑完才被赋值；在那之前用户又点了下一首，
+        # stop() 看到的 _mp 还是旧的/None → 两首各自 start()，
+        # 而界面只握得住后创建的那个（前面的成孤儿，停都停不掉）。
         self._gen = 0
-        self._gen_of = {}          # mp -> 出生代际
-        # 登记**所有**创建过的 MediaPlayer。
-        # 为什么需要：self._mp 只记得住最后一个。一旦某次创建没被接管
-        # （代际不对、或者 UI 线程上两条创建任务交错），那个实例就成了
-        # 「孤儿」—— 它会继续发声，而界面手里没有任何句柄能暂停它。
-        # 真机现象正是「两首同时响，按钮怎么按都停不下来，只能杀后台」。
-        # 有了这张表，stop() 可以把每一个都放掉，孤儿不可能存活。
+        # 每个 MediaPlayer 出生时的代际号。key 用 Java 的 hashCode()：
+        # pyjnius 每次跨 JNI 都会把同一个 Java 对象包成**新的 Python 代理**，
+        # 用代理当 dict 键（默认按 id 哈希）注册时和回调时根本对不上
+        # —— 上一版因此把每首歌都拒播了。hashCode() 才是底层对象的稳定身份。
+        self._gen_of = {}
+        # 登记**所有**还活着的 MediaPlayer。
+        # self._mp 只记得住最后一个；一旦某次创建没被接管（代际不对、
+        # 或 UI 线程上两条创建任务交错），那个实例就成了孤儿 —— 它会继续
+        # 发声，而界面手里没有任何句柄能暂停它（真机现象：两首同时响、
+        # 按钮按了没反应、只能杀后台）。
+        # ⚠ 只在 _lock 内读写，且 stop() 要「清空 + 释放」原子完成，
+        #   不能先取快照再清空 —— 那中间 UI 线程新建的实例会漏网（复现过）。
         self._live = []
         self._lock = threading.RLock()
+        # 自检序号：每次 play/stop 递增。UI 线程上的 _build 完成时比一次，
+        # 发现自己是"上帝已死"的旧代际就地释放，绝不留到下一首。
         self._sound = None         # 桌面兜底
         self._state = self.IDLE
         self._duration = 0.0
@@ -57,6 +62,41 @@ class Player:
         self._on_event = None
         if IS_ANDROID:
             self._prepare_ui()
+
+    # ---------- 生命周期（内部）----------
+    def _kill_all(self, release_fn=None):
+        """清空并释放**所有**存活实例 —— 在 _lock 内一次做完
+
+        release_fn(mp) 由调用方给（UI 线程 vs 当前线程）；不给就直接调。
+        关键：不能在锁外"先取快照、再清空"，那中间的窗口会让 UI 线程刚
+        创建好的实例漏掉 —— 那个实例就会一直发声且无人能停（已复现）。
+        """
+        with self._lock:
+            live = list(self._live)
+            self._live = []
+            self._gen_of = {}
+            self._mp = None
+        if not live:
+            return
+        for mp in live:
+            try:
+                (release_fn or self._release_mp)(mp)
+            except Exception:
+                log_exc("_kill_all 释放")
+
+    @staticmethod
+    def _release_mp(mp):
+        """stop → reset → release，每一步都要各自 try
+
+        MediaPlayer 在错误状态下 stop()/reset() 会抛 IllegalStateException，
+        三个动作绑在一个 try 里的话，第一个抛了后面 release 就不执行 ——
+        实例既没停也没释放，正是「杀后台才能安静」的来源。
+        """
+        for fn in ("stop", "reset", "release"):
+            try:
+                getattr(mp, fn)()
+            except Exception:
+                pass
 
     # ---------- 状态查询 ----------
     @property
@@ -106,36 +146,21 @@ class Player:
         self._ui = _run
 
     def stop(self):
+        """停掉一切。**原子**：递增代际 → 清空登记 → 释放全部
+
+        顺序很重要：
+          1. 先递增 _gen —— 让所有"正在 UI 线程排队创建"的实例立刻作废，
+             它们跑起来时会自检并自我释放；
+          2. 再在锁内一次性摘走 _live 并释放 —— 不能分两步，
+             中间窗口会让刚创建的实例漏网（复现过，会一直发声）。
+        """
         try:
-            mp = self._mp
-            self._mp = None
-            # 把所有登记在案的实例一起放掉（不只是 self._mp）。
-            # 任何一个漏网的都会继续发声，而界面再也握不到它。
-            with self._lock:
-                live = list(getattr(self, "_live", []) or [])
-                self._live = []
-                if mp is not None and mp not in live:
-                    live.append(mp)
-            if live:
-                def _release_all():
-                    for m in live:
-                        try:
-                            m.stop()
-                        except Exception:
-                            pass
-                        try:
-                            m.reset()
-                        except Exception:
-                            pass
-                        try:
-                            m.release()
-                        except Exception:
-                            pass
-                # 没有 UI 线程通道时也必须放掉，否则 MediaPlayer 泄漏
-                if self._ui is not None:
-                    self._ui(_release_all)
-                else:
-                    _release_all()
+            self._gen += 1            # 先作废在途的创建
+            self._abandon_focus()
+            ui = self._ui
+            # 释放动作必须在 Android UI 线程上做（MediaPlayer 不是线程安全的）
+            self._kill_all(release_fn=(lambda mp: ui(lambda: self._release_mp(mp)))
+                           if ui is not None else None)
             snd = self._sound
             self._sound = None
             if snd is not None:
@@ -149,10 +174,7 @@ class Player:
         finally:
             self._state = self.IDLE
             self._listeners = []
-            # 在途的“正在创建/已 prepare 未播”的实例全部作废
-            self._gen = getattr(self, "_gen", 0) + 1
-            with self._lock:
-                self._gen_of = {}
+            self._duration = 0.0
 
     # ---------- 错误确认 ----------
     def _note_error(self, what, extra, delay=2.5):
@@ -187,8 +209,12 @@ class Player:
               "error"(文本) / "ended"(无)
         界面记得用 ui() 转回主线程。
         """
+        # stop() 内部先递增 _gen，再**同步**把释放任务投到 UI 线程。
+        # 之后 _play_android 也往 UI 线程投创建任务 —— 两者都是投递到
+        # 同一个串行队列，先投的必定先执行，所以"旧的先停、新的再建"
+        # 这个顺序是有保证的。
         self.stop()
-        self._gen = getattr(self, "_gen", 0) + 1
+        self._gen += 1
         self._on_event = on_event
         self._state = self.BUFFERING
         if IS_ANDROID:
@@ -225,19 +251,42 @@ class Player:
                         _mk = mp.hashCode()
                     except Exception:
                         _mk = id(mp)
-                    if player._gen_of.get(_mk, -1) != getattr(player, "_gen", 0):
-                        try:
-                            mp.stop()
-                        except Exception:
-                            pass
-                        try:
-                            mp.release()
-                        except Exception:
-                            pass
+                    with player._lock:
+                        my_gen = player._gen_of.get(_mk, -1)
+                        stale = (my_gen != player._gen)
+                        if stale:
+                            try:
+                                player._live.remove(mp)
+                            except ValueError:
+                                pass
+                    if stale:
+                        player._release_mp(mp)
+                        diag("onPrepared 时已过期，释放（gen %s）" % my_gen)
                         return
                     # 作废可能已经排上的错误确认（见 _note_error）
                     player._error_gen = getattr(player, "_error_gen", 0) + 1
                     player._duration = max(0.0, mp.getDuration() / 1000.0)
+                    # 最后一道兜底：start **之前**把登记表里除自己以外的
+                    # 实例全部停掉。理论上前面几道闸已经保证不会有多余实例，
+                    # 但「有声音重叠」是用户最能感知的故障，值得在最热的
+                    # 那个点上再花一次 O(n)（n 正常是 0 或 1）。
+                    siblings = []
+                    with player._lock:
+                        for other in player._live:
+                            try:
+                                same = (other.hashCode() == _mk)
+                            except Exception:
+                                same = (other is mp)
+                            if not same:
+                                siblings.append(other)
+                    for other in siblings:
+                        player._release_mp(other)
+                        with player._lock:
+                            try:
+                                player._live.remove(other)
+                            except ValueError:
+                                pass
+                        diag("启动前清理了多余实例")
                     mp.start()
                     player._state = player.PLAYING
                     diag("MediaPlayer 就绪，时长=%.1fs" % player._duration)
@@ -270,12 +319,23 @@ class Player:
         prep, err, done = _Prepared(), _Error(), _Done()
         self._listeners = [prep, err, done]     # 保活，防 GC
 
-        my_gen = getattr(self, "_gen", 0)
+        my_gen = self._gen        # play() 里刚递增过，这是本次播放的代际
 
         def _build():
             try:
+                # 第一道自检：排到 UI 线程时已经过期 → 连创建都省了
                 if self._gen != my_gen:
-                    return          # 排队期间已被新播放取代，不再创建
+                    diag("_build 排到时已过期（gen %d != %d），跳过创建"
+                         % (my_gen, self._gen))
+                    return
+                # 先抢音频焦点：Android 会因此打断别的音频流
+                # （包括本 App 里万一漏掉的另一个 MediaPlayer）。
+                # 这是在应用层之外多一层系统级保证 —— 重叠播放声音
+                # 是用户最能感知的故障，值得加这一道。
+                try:
+                    self._request_focus()
+                except Exception:
+                    log_exc("request_focus")
                 mp = MediaPlayer()
                 try:
                     b = AudioAttributesBuilder()
@@ -289,35 +349,26 @@ class Player:
                 mp.setOnErrorListener(err)
                 mp.setOnCompletionListener(done)
                 mp.setDataSource(url)
-                try:
-                    with self._lock:
-                        self._gen_of[mp.hashCode()] = my_gen
-                        self._live.append(mp)
-                except Exception:
-                    with self._lock:
-                        self._gen_of[id(mp)] = my_gen
-                        self._live.append(mp)
-                mp.prepareAsync()
-                # 只有仍属当前代际才接管；否则**立刻释放**（交给 onPrepared
-                # 的代际校验回收太晚 —— 那之间它可能已经开始出声）。
-                if self._gen == my_gen:
-                    self._mp = mp
-                else:
-                    with self._lock:
-                        try:
-                            self._live.remove(mp)
-                        except ValueError:
-                            pass
-                        try:
-                            self._gen_of.pop(mp.hashCode(), None)
-                        except Exception:
-                            pass
+                # 登记与接管必须在**同一个锁区间**内完成，中间不能让
+                # stop() 插进来（否则 stop 拿到不含新实例的快照，
+                # 而新实例又已 prepare 完毕开始出声 —— 就是重叠播放）。
+                with self._lock:
                     try:
-                        mp.release()
+                        self._gen_of[mp.hashCode()] = my_gen
                     except Exception:
-                        pass
+                        self._gen_of[id(mp)] = my_gen
+                    if self._gen != my_gen:
+                        # 锁内自检：确认自己还是当前代际才登记
+                        stale = True
+                    else:
+                        stale = False
+                        self._live.append(mp)
+                        self._mp = mp
+                if stale:
+                    self._release_mp(mp)
                     diag("MediaPlayer 创建期间已被取代，已释放")
                     return
+                mp.prepareAsync()
                 diag("MediaPlayer 已创建并 prepareAsync: %s" % url[:80])
             except Exception as e:
                 log_exc("MediaPlayer 创建")
@@ -328,6 +379,88 @@ class Player:
             self._emit("error", "设备不支持播放")
             return
         self._ui(_build)
+
+    def _audio_manager(self):
+        """惰性拿 AudioManager（拿不到就返回 None，不影响播放）"""
+        am = getattr(self, "_am", False)
+        if am is not False:
+            return am
+        self._am = None
+        try:
+            from jnius import autoclass
+            act = autoclass("org.kivy.android.PythonActivity").mActivity
+            self._am = act.getSystemService("audio")
+        except Exception:
+            log_exc("_audio_manager")
+        return self._am
+
+    def _request_focus(self):
+        """请求 AUDIOFOCUS_GAIN（音乐类）。
+
+        失败/超时都不拦播放 —— 焦点只是"更礼貌、更干净"，
+        真正保证不重叠的仍是上层的一次只允许一个实例。
+        """
+        am = self._audio_manager()
+        if am is None:
+            return
+        try:
+            from jnius import autoclass
+            AD = autoclass("android.media.AudioManager")
+            listener = self._focus_listener()
+            if listener is None:
+                return
+            am.requestAudioFocus(listener, AD.STREAM_MUSIC, AD.AUDIOFOCUS_GAIN)
+            diag("已请求音频焦点")
+        except Exception as e:
+            diag("请求音频焦点失败（忽略）: %r" % (e,))
+
+    def _focus_listener(self):
+        """音频焦点回调对象（保持存活，否则会被 GC 掉导致回调失效）"""
+        if getattr(self, "_focus_lst", None) is not None:
+            return self._focus_lst
+        try:
+            from jnius import PythonJavaClass, java_method
+
+            player = self
+
+            class _Focus(PythonJavaClass):
+                __javainterfaces__ = [
+                    "android/media/AudioManager$OnAudioFocusChangeListener"]
+                __javacontext__ = "app"
+
+                @java_method("(I)V")
+                def onAudioFocusChange(self, change):
+                    # 永久失去焦点 -> 暂停（别硬顶着放，会和别的音频打架）
+                    try:
+                        if change in (-1, -2):      # LOSS / LOSS_TRANSIENT
+                            diag("失去音频焦点 change=%s，暂停" % change)
+                            player._pause_from_focus()
+                    except Exception:
+                        log_exc("onAudioFocusChange")
+
+            self._focus_lst = _Focus()
+            return self._focus_lst
+        except Exception:
+            log_exc("_focus_listener")
+            return None
+
+    def _pause_from_focus(self):
+        try:
+            mp = self._mp
+            if mp is not None:
+                mp.pause()
+                self._state = self.PAUSED
+        except Exception:
+            log_exc("_pause_from_focus")
+
+    def _abandon_focus(self):
+        try:
+            am = self._audio_manager()
+            lst = getattr(self, "_focus_lst", None)
+            if am is not None and lst is not None:
+                am.abandonAudioFocus(lst)
+        except Exception:
+            log_exc("_abandon_focus")
 
     # ---- 桌面兜底 ----
     def _play_desktop(self, url):

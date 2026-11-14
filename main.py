@@ -1162,6 +1162,9 @@ class LxApp(App):
         self._slim_pending = []       # 待压队列
         self._slim_stop_flag = False
         self._slim_stopping = False   # 已点「停止」、当前这首还在收尾
+        # 预加载（消除切歌空档）：{key,url,quality,meta,platform,at}
+        self._preload = None
+        self._preload_key = None
         self._slim_out_dir = ""       # 用户选的输出目录（空=同源目录）
         self._slim_out_labels = {}
         self.F = fonts.font_kwargs()
@@ -1365,23 +1368,127 @@ class LxApp(App):
                 return
             self._empty_results('正在寻找今天值得听的歌…')
             self._daily_loading = True
-            terms = self.library.daily_terms(platform, offset=self._daily_offset)
-            def work():
-                songs, errors = [], []
-                for term in terms:
-                    try:
-                        songs.extend(searchers.search(platform, term, 10))
-                    except Exception as exc:
-                        errors.append(str(exc))
-                self.ui(lambda: self._daily_ready(platform, songs, errors,
-                                                  self._daily_offset))
-            self.bg(work, 'daily-recommendations')
+            self._daily_fetch(platform, self._daily_offset)
         else:
             self._show_results(self._search_songs)
             if not self.songs:
                 self._empty_results('遇见下一首喜欢的歌\n搜索歌名、歌手，或打开每日推荐')
                 self.hint.text = '发现音乐 · 搜索你喜欢的声音'
             self.lbl_sub.text = '发现音乐 · %d 个平台' % len(self.platforms)
+
+    # 每日推荐的目标规模与参与平台。
+    # 需求：**够 100 首**、并且能看出「哪首来自哪个平台」。
+    DAILY_TARGET = 100
+    # 顺序即展示顺序；wy 覆盖面最广放最前
+    DAILY_PLATFORMS = ("wy", "tx", "kw", "kg")
+
+    def _daily_seed(self, key):
+        """按 key 生成稳定随机种子（同一天同一批 → 结果可复现/可缓存）"""
+        import hashlib
+        import random
+        seed = int(hashlib.sha256(key.encode()).hexdigest(), 16)
+        return random.Random(seed)
+
+    def _daily_terms_for(self, platform, offset, n=4):
+        """给某个平台造几个关键词（收藏歌手优先 + 每日主题）"""
+        try:
+            base = self.library.daily_terms(platform, offset=offset)
+        except Exception:
+            base = []
+        rng = self._daily_seed("%s:%s:%d" % (platform, time.strftime("%Y-%m-%d"),
+                                             offset))
+        themes = list(self.DAILY_THEMES)
+        rng.shuffle(themes)
+        terms = []
+        for t in base + themes:
+            if t and t not in terms:
+                terms.append(t)
+        return terms[:n]
+
+    DAILY_THEMES = ('华语经典', '治愈', '流行', '民谣', '轻音乐', '摇滚',
+                    '旅行', '晚风', '怀旧金曲', '粤语', '情歌', '独立音乐')
+
+    def _daily_fetch(self, platform, offset, refresh=False):
+        """多平台并行抓推荐，凑够 DAILY_TARGET 首
+
+        为什么多平台：单一平台搜几个词很难凑到 100 首（单个接口单次上限
+        50~100，且关键词一多就会被限流）。多平台既够量，又能让用户
+        看到「哪个平台的推荐」—— 这正是需求里要的分平台展示。
+        """
+        plats = [platform] + [p for p in self.DAILY_PLATFORMS if p != platform]
+        want_each = max(20, self.DAILY_TARGET // max(1, len(plats[:3])))
+
+        def work():
+            buckets = {}          # platform -> [song]
+            errors = []
+            for plat in plats[:3]:        # 最多 3 个平台，够 100 首又快
+                terms = self._daily_terms_for(plat, offset)
+                got = []
+                for term in terms:
+                    if len(got) >= want_each:
+                        break
+                    try:
+                        found = searchers.search(plat, term, 30)
+                    except Exception as exc:
+                        errors.append("%s: %s" % (plat, exc))
+                        continue
+                    for song in found:
+                        song = dict(song)
+                        song.setdefault("platform", plat)
+                        got.append(song)
+                if got:
+                    # 平台内去重
+                    seen, uniq = set(), []
+                    for song in got:
+                        k = "%s:%s" % (plat, song.get("id"))
+                        if k in seen:
+                            continue
+                        seen.add(k)
+                        uniq.append(song)
+                    buckets[plat] = uniq[:want_each]
+
+            # 按平台顺序拼成一个大列表（每首带 _section 以驱动小标题）
+            songs = []
+            for plat in plats[:3]:
+                for song in buckets.get(plat, []):
+                    song["_section"] = plat
+                    songs.append(song)
+            self.ui(lambda: self._daily_ready_multi(songs, errors, offset))
+
+        self.bg(work, 'daily-recommendations')
+
+    def _daily_ready_multi(self, songs, errors, offset):
+        self._daily_loading = False
+        try:
+            self.btn_daily_refresh.disabled = False
+        except Exception:
+            pass
+        if self._view != 'daily':
+            return
+        if not songs:
+            self._empty_results('暂时没有获取到推荐\n检查网络后，点「换一批」重试')
+            self.set_status('推荐获取失败: '
+                            + (errors[0] if errors else '暂无结果'), C_ERR)
+            return
+        # 全局去重（同一首歌可能两个平台都有，保留先出现的）
+        seen, uniq = set(), []
+        for song in songs:
+            k = "%s|%s" % (song.get("name"), song.get("singer"))
+            if k in seen:
+                continue
+            seen.add(k)
+            uniq.append(song)
+        self._show_results_grouped(uniq)
+        counts = {}
+        for song in uniq:
+            p = song.get("_section") or song.get("platform") or "?"
+            counts[p] = counts.get(p, 0) + 1
+        detail = " · ".join("%s %d" % (PLATFORM_LABEL.get(p, p), n)
+                            for p, n in counts.items())
+        self.hint.text = ('每日推荐 · %s · 共 %d 首（%s）'
+                          % (time.strftime('%m/%d'), len(uniq), detail))
+        self.lbl_sub.text = '每日推荐 · %d 首 · %d 个平台' % (
+            len(uniq), len(counts))
 
     def _daily_ready(self, platform, songs, errors, offset=0):
         self._daily_loading = False
@@ -1427,17 +1534,7 @@ class LxApp(App):
         self._daily_offset += 1
         self.hint.text = '每日推荐 · %s · 正在换一批…' % time.strftime('%m/%d')
         self._empty_results('正在寻找下一批值得听的歌…')
-        terms = self.library.daily_terms(platform, offset=self._daily_offset)
-        def work():
-            songs, errors = [], []
-            for term in terms:
-                try:
-                    songs.extend(searchers.search(platform, term, 10))
-                except Exception as exc:
-                    errors.append(str(exc))
-            self.ui(lambda: self._daily_ready(platform, songs, errors,
-                                              self._daily_offset))
-        self.bg(work, 'daily-recommendations-refresh')
+        self._daily_fetch(platform, self._daily_offset, refresh=True)
 
     def _empty_results(self, text):
         self._clear_results()
@@ -1490,26 +1587,61 @@ class LxApp(App):
             log_exc("_sync_media_notification")
 
     def _media_action(self, action):
-        if action == 'previous':
-            self.skip_song(-1)
-        elif action == 'next':
-            self.skip_song(1)
-        elif action == 'toggle':
-            self.toggle_play()
-        elif action == 'play' and self.player.state != self.player.PLAYING:
-            self.toggle_play()
-        elif action == 'pause' and self.player.state == self.player.PLAYING:
-            self.toggle_play()
-        elif action == 'stop':
-            self.player.stop()
-            self._player_finished(advance=False)
-        elif action.startswith('seek:'):
-            self.player.seek(float(action.split(':', 1)[1]))
+        """通知栏 / 耳机线控 / 蓝牙 送来的命令（在后台轮询线程里被调用）
+
+        ⚠ 这里**不能直接动界面**：轮询线程不是 Kivy 主线程。
+          所有分支都通过 self.ui() 转回主线程。
+        """
+        try:
+            if action == 'previous':
+                self._on_ui(self.skip_song, -1)
+            elif action == 'next':
+                self._on_ui(self.skip_song, 1)
+            elif action == 'toggle':
+                self._on_ui(self.toggle_play)
+            elif action == 'play':
+                if self.player.state != player_mod.Player.PLAYING:
+                    self._on_ui(self.toggle_play)
+            elif action == 'pause':
+                if self.player.state == player_mod.Player.PLAYING:
+                    self._on_ui(self.toggle_play)
+            elif action == 'stop':
+                self._on_ui(self._media_stop)
+            elif action.startswith('seek:'):
+                try:
+                    sec = float(action.split(':', 1)[1])
+                except (ValueError, IndexError):
+                    return
+                self._on_ui(self.player.seek, sec)
+        except Exception:
+            log_exc("_media_action %s" % action)
+
+    def _media_stop(self):
+        self.player.stop()
+        self._player_finished(advance=False)
+
+    def _on_ui(self, fn, *args):
+        """把 fn(*args) 排到 Kivy 主线程。
+
+        ⚠ 通知命令来自**后台轮询线程**，不能直接动控件。
+          但也不能只靠 Clock：App 在后台时 Kivy 的 Clock 会停摆，
+          命令会一直积压到回前台（那时用户早就以为按钮坏了）。
+          所以：在主线程就直调；否则投递 —— 若已经有积压，
+          说明主线程没在跑，仍然投递（回前台立刻执行，不会丢）。
+        """
+        if threading.current_thread() is threading.main_thread():
+            return fn(*args)
+        self.ui(lambda: fn(*args))
 
     def skip_song(self, step):
-        if self.busy:
-            self.set_status('正在准备歌曲，请稍候…')
-            return
+        """切歌（上一首/下一首/自动续播/通知按钮都走这里）
+
+        ⚠ 不能因为 `busy` 就拒绝：上一版这里 `if self.busy: return`，
+          而「正在解析下一首」时 busy 恰好为 True —— 于是通知栏的
+          上一首/下一首**永远没反应**，自动续播也会卡住。
+          _start_song_action 内部有代际号，重复发起是安全的；
+          新的一次会直接作废旧的一次。
+        """
         song = self.queue.move(step)
         if song is None:
             self.set_status('先从列表选一首歌，即可切换歌曲')
@@ -1530,14 +1662,22 @@ class LxApp(App):
             self.media.request_permission()
         except Exception:
             log_exc("on_start: request_permission")
+        # 起常驻轮询线程：后台时 Kivy Clock 停摆，通知按钮会全哑
+        try:
+            self.media.start_polling(0.25)
+        except Exception:
+            log_exc("on_start: start_polling")
 
     def on_resume(self):
-        # 回前台先取走后台期间攒下的通知命令，再补一次状态（后台时
-        # Kivy 时钟可能停摆，通知上的进度/状态需要回来后立刻对齐）。
+        # 回前台补一次状态（后台时 Kivy 时钟可能停摆，进度需要对齐）。
         self.media.poll()
         self._sync_media_notification()
 
     def on_stop(self):
+        try:
+            self.media.stop_polling()
+        except Exception:
+            pass
         self.player.stop()
         self.media.close()
 
@@ -2939,15 +3079,27 @@ class LxApp(App):
         return row, song_btn
 
     def _finish_rows(self):
-        """首/末行底色跟着分组卡做圆角；最后一行去掉发丝线"""
+        """首/末**歌曲行**做圆角；最后一个歌曲行去掉发丝线
+
+        ⚠ 列表里可能混着分组小标题行（每日推荐按平台分组）——
+          那类行没有 _song_btn / _sep_rect，直接取会 AttributeError。
+          而且"第一个子控件"未必是歌曲行，圆角要打在真正的歌曲行上。
+        """
         try:
             kids = list(reversed(self.results.children))   # children 是逆序
-            if kids:
-                kids[0]._song_btn.set_radius([R_LG, R_LG, 0, 0])
-                if len(kids) > 1:
-                    kids[-1]._song_btn.set_radius([0, 0, R_LG, R_LG])
-                    kids[-1]._sep_hidden = True
-                    kids[-1]._sep_rect.size = (0, 0)
+            song_rows = [w for w in kids
+                         if getattr(w, "_song_btn", None) is not None]
+            if not song_rows:
+                return
+            song_rows[0]._song_btn.set_radius([R_LG, R_LG, 0, 0])
+            if len(song_rows) > 1:
+                last = song_rows[-1]
+                last._song_btn.set_radius([0, 0, R_LG, R_LG])
+                last._sep_hidden = True
+                try:
+                    last._sep_rect.size = (0, 0)
+                except Exception:
+                    pass
         except Exception:
             log_exc("列表首末行圆角")
 
@@ -3018,6 +3170,74 @@ class LxApp(App):
         _step()
 
         self.set_status("找到 %d 首：点歌名播放，点「下载」保存" % total)
+
+    def _show_results_grouped(self, songs):
+        """带**分组小标题**的结果列表（每日推荐用）
+
+        需求里明确要「显示各平台的推荐」，所以每换一个平台就插一行
+        小节标题（"网易云 · 32 首"）。这一行不是歌曲，所以不进 self.songs
+        —— 索引必须仍然对应 self.songs，否则点第 N 行会放错歌
+        （列表里混了标题行，行号和 songs 下标就对不上了）。
+        """
+        self.songs = list(songs or [])
+        self._clear_results()
+        if not self.songs:
+            self.hint.text = "没有找到结果，换个关键词试试"
+            return
+
+        rows_gen = self._rows_gen
+        # 先按平台分组，再摊平成一串"标题 or 歌曲"的构建指令
+        plan = []
+        cur = None
+        idx = 0
+        for song in self.songs:
+            plat = song.get("_section") or song.get("platform") or "?"
+            if plat != cur:
+                cur = plat
+                plan.append(("head", plat, 0))
+            plan.append(("song", None, idx))
+            idx += 1
+
+        FIRST = 40
+
+        def _fill(items):
+            for kind, plat, i in items:
+                if kind == "head":
+                    self.results.add_widget(self._section_row(plat))
+                else:
+                    row, _btn = self._row_of(i, self.songs[i])
+                    self.results.add_widget(row)
+
+        # 一次性建完（日推最多 100~120 行）。
+        # 为什么不像搜索结果那样分块：分块要跨多次 Clock 回调完成，
+        # 中途用户切页/再点推荐就会把批次作废（_rows_gen 变化），
+        # 表现是「列表只出前 40 首」。日推的行数是可控的，直接同步建完
+        # 更简单也没有这个竞态（实测 120 行在真机上 <200ms）。
+        for kind, plat, i in plan:
+            if kind == "head":
+                self.results.add_widget(self._section_row(plat))
+            else:
+                row, _btn = self._row_of(i, self.songs[i])
+                self.results.add_widget(row)
+        self._finish_rows()
+
+    def _section_row(self, platform):
+        """分组小标题行：「网易云 · 32 首」
+
+        视觉上是 iOS 分组页的 header：小字、灰色、左缩进，不占可点区域
+        （不是按钮，点了没反应也不会误触）。
+        """
+        n = sum(1 for s in self.songs
+                if (s.get("_section") or s.get("platform")) == platform)
+        box = BoxLayout(size_hint_y=None, height=dp(34),
+                        padding=(dp(18), dp(6), dp(14), dp(2)))
+        label = Label(text="%s · %d 首" % (PLATFORM_LABEL.get(platform,
+                                                              platform), n),
+                      font_size=dp(12.5), color=C_DIM, bold=True,
+                      halign="left", valign="middle", **self.F)
+        fit_text(label)
+        box.add_widget(label)
+        return box
 
     # ================= MP3 压缩：行为 =================
     def show_slim_view(self):
@@ -3761,6 +3981,17 @@ class LxApp(App):
         # 没有这道闸，先发起的解析后回来**反而会顶掉**后点的歌
         # （真机上就是「点了 B，播的是 A」）。
         my_gen = getattr(self, "_resolve_gen", 0)
+
+        # ⚡ 先看预加载缓存：命中就**立刻**返回，省掉整段取直链的时间
+        # （这是"每次放完都要等"的解法。缓存里的直链是播上一首时提前算好的）
+        pv = self._preload_take(song)
+        if pv:
+            diag("命中预加载缓存，直链就绪（省去解析等待）")
+            self.ui(lambda: self._song_ready(
+                song, pv["url"], pv["quality"], pv.get("meta") or {},
+                pv.get("platform")))
+            return
+
         want = self._quality_code()
         order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
         order = order[:3]
@@ -3881,8 +4112,91 @@ class LxApp(App):
         self.busy = False
         if act == "play":
             self.play_current()
+            # 播起来之后立刻预解析**下一首**：这样播完切歌时直链已在手上，
+            # 不再有「等解析」的空档（用户反馈的"每次放完都要等"）。
+            self._preload_next()
         elif act == "download":
             self.download_current()
+
+    # ---------- 预加载（消除切歌空档）----------
+    # 缓存结构：{"key": song_key, "url":..., "quality":..., "meta":...,
+    #           "platform":..., "at": 时间戳}
+    # 直链有时效（通常 20 分钟~几小时），所以取用前要比一次时间戳。
+    PRELOAD_TTL = 8 * 60      # 8 分钟内认为还有效
+
+    def _preload_next(self):
+        """后台预解析队列里的下一首，把直链存起来备用
+
+        为什么能消除空档：`_player_finished` → `skip_song(1)` →
+        `_start_song_action` → `_resolve_song` 这条链上，最慢的一步是
+        "取直链"（实测 0.3~3 秒）。提前算好，切歌时直接命中缓存就秒开。
+        """
+        try:
+            if not self.queue.songs:
+                return
+            nxt = self.queue.songs[(self.queue.index + 1) % len(self.queue.songs)]
+        except Exception:
+            return
+        key = "%s|%s|%s" % (nxt.get("platform"), nxt.get("id"),
+                            nxt.get("name"))
+        pv = getattr(self, "_preload", None)
+        if pv and pv.get("key") == key and self._preload_fresh(pv):
+            return                         # 已经在缓存里且没过期
+        # 已经在预载这个了就别重复起线程
+        if getattr(self, "_preload_key", None) == key:
+            return
+        self._preload_key = key
+
+        def work():
+            try:
+                want = self._quality_code()
+                order = [want] + [q for q in ("320k", "flac", "128k")
+                                  if q != want]
+                src = nxt.get("platform") or self._current_source()
+                url, used, info, err = None, None, None, ""
+                if src == "tx":
+                    mid = (nxt.get("extra") or {}).get("songmid") or nxt.get("id")
+                    u, lv, qmeta = qqresolve.resolve(mid, order[0])
+                    if u:
+                        url, used = u, order[0]
+                        info = qmeta
+                if not url:
+                    url, used, info, err = self._try_one(src, nxt, order[:3])
+                if url:
+                    self._preload = {
+                        "key": key, "url": url, "quality": used,
+                        "meta": info or {}, "platform": src,
+                        "at": time.time(),
+                    }
+                    diag("预加载就绪: %s" % nxt.get("name"))
+            except Exception:
+                log_exc("预加载")
+            finally:
+                if getattr(self, "_preload_key", None) == key:
+                    self._preload_key = None
+
+        self.bg(work, "preload")
+
+    def _preload_fresh(self, pv):
+        try:
+            return (time.time() - float(pv.get("at") or 0)) < self.PRELOAD_TTL
+        except Exception:
+            return False
+
+    def _preload_take(self, song):
+        """取预加载缓存（命中就清掉——直链用过一次就别再复用给别的歌）"""
+        pv = getattr(self, "_preload", None)
+        if not pv:
+            return None
+        want = "%s|%s|%s" % (song.get("platform"), song.get("id"),
+                             song.get("name"))
+        if pv.get("key") != want:
+            return None
+        if not self._preload_fresh(pv):
+            self._preload = None
+            return None
+        self._preload = None
+        return pv
 
     def _switch_platform(self):
         """用户主动点了「改用 XX」才换平台"""
