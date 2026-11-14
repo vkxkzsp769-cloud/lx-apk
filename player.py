@@ -41,6 +41,14 @@ class Player:
         # 号不对 = 已被取代 → 拒绝 start 并自我释放。
         self._gen = 0
         self._gen_of = {}          # mp -> 出生代际
+        # 登记**所有**创建过的 MediaPlayer。
+        # 为什么需要：self._mp 只记得住最后一个。一旦某次创建没被接管
+        # （代际不对、或者 UI 线程上两条创建任务交错），那个实例就成了
+        # 「孤儿」—— 它会继续发声，而界面手里没有任何句柄能暂停它。
+        # 真机现象正是「两首同时响，按钮怎么按都停不下来，只能杀后台」。
+        # 有了这张表，stop() 可以把每一个都放掉，孤儿不可能存活。
+        self._live = []
+        self._lock = threading.RLock()
         self._sound = None         # 桌面兜底
         self._state = self.IDLE
         self._duration = 0.0
@@ -101,27 +109,41 @@ class Player:
         try:
             mp = self._mp
             self._mp = None
-            if mp is not None:
-                def _release():
-                    try:
-                        mp.stop()
-                    except Exception:
-                        pass
-                    try:
-                        mp.reset()
-                        mp.release()
-                    except Exception:
-                        pass
+            # 把所有登记在案的实例一起放掉（不只是 self._mp）。
+            # 任何一个漏网的都会继续发声，而界面再也握不到它。
+            with self._lock:
+                live = list(getattr(self, "_live", []) or [])
+                self._live = []
+                if mp is not None and mp not in live:
+                    live.append(mp)
+            if live:
+                def _release_all():
+                    for m in live:
+                        try:
+                            m.stop()
+                        except Exception:
+                            pass
+                        try:
+                            m.reset()
+                        except Exception:
+                            pass
+                        try:
+                            m.release()
+                        except Exception:
+                            pass
                 # 没有 UI 线程通道时也必须放掉，否则 MediaPlayer 泄漏
-                # （原来只在 self._ui 存在时才 release）
                 if self._ui is not None:
-                    self._ui(_release)
+                    self._ui(_release_all)
                 else:
-                    _release()
-            if self._sound is not None:
-                self._sound.stop()
-                self._sound.unload()
-                self._sound = None
+                    _release_all()
+            snd = self._sound
+            self._sound = None
+            if snd is not None:
+                try:
+                    snd.stop()
+                    snd.unload()
+                except Exception:
+                    log_exc("player.stop sound")
         except Exception:
             log_exc("player.stop")
         finally:
@@ -129,7 +151,8 @@ class Player:
             self._listeners = []
             # 在途的“正在创建/已 prepare 未播”的实例全部作废
             self._gen = getattr(self, "_gen", 0) + 1
-            self._gen_of = {}
+            with self._lock:
+                self._gen_of = {}
 
     # ---------- 错误确认 ----------
     def _note_error(self, what, extra, delay=2.5):
@@ -267,13 +290,34 @@ class Player:
                 mp.setOnCompletionListener(done)
                 mp.setDataSource(url)
                 try:
-                    self._gen_of[mp.hashCode()] = my_gen
+                    with self._lock:
+                        self._gen_of[mp.hashCode()] = my_gen
+                        self._live.append(mp)
                 except Exception:
-                    self._gen_of[id(mp)] = my_gen
+                    with self._lock:
+                        self._gen_of[id(mp)] = my_gen
+                        self._live.append(mp)
                 mp.prepareAsync()
-                # 只有仍属当前代际才接管（否则 onPrepared 的代际校验会回收它）
+                # 只有仍属当前代际才接管；否则**立刻释放**（交给 onPrepared
+                # 的代际校验回收太晚 —— 那之间它可能已经开始出声）。
                 if self._gen == my_gen:
                     self._mp = mp
+                else:
+                    with self._lock:
+                        try:
+                            self._live.remove(mp)
+                        except ValueError:
+                            pass
+                        try:
+                            self._gen_of.pop(mp.hashCode(), None)
+                        except Exception:
+                            pass
+                    try:
+                        mp.release()
+                    except Exception:
+                        pass
+                    diag("MediaPlayer 创建期间已被取代，已释放")
+                    return
                 diag("MediaPlayer 已创建并 prepareAsync: %s" % url[:80])
             except Exception as e:
                 log_exc("MediaPlayer 创建")

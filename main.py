@@ -1161,6 +1161,7 @@ class LxApp(App):
         self._slim_active = None      # 当前在压第几行
         self._slim_pending = []       # 待压队列
         self._slim_stop_flag = False
+        self._slim_stopping = False   # 已点「停止」、当前这首还在收尾
         self._slim_out_dir = ""       # 用户选的输出目录（空=同源目录）
         self._slim_out_labels = {}
         self.F = fonts.font_kwargs()
@@ -1199,17 +1200,26 @@ class LxApp(App):
         # 正确姿势：只动画一个自定义 NumericProperty，观察者里把
         # scale 和 translate **成对**写好 —— 一处更新，也省掉每帧双动画。
         self.main.add_widget(self._build_header())
+
+        # ⚠ 两条工具栏（搜索 / 压缩）用一个**插槽**换，而不是叠在一起靠
+        #   height=0 收起 —— Kivy 的布局容器**不裁剪**子控件：
+        #   高度 0 的面板里，固定高度的胶囊/按钮照样画出来、照样收触摸，
+        #   于是「透明但还在」的压缩工具栏压在搜索栏上面，搜索框点不动、
+        #   停止按钮也关不掉（这次真机反馈的 bug 就是我这么写出来的）。
+        #   这个坑本工程在搜索历史面板上已经记录过一次（见 _build_hist 注释），
+        #   我换了块地方又踩了一遍。
+        #   正确做法：**同一时刻只挂一个**，切换时 remove_widget / add_widget。
+        self.toolbar_slot = BoxLayout(orientation="vertical", size_hint_y=None,
+                                      height=dp(56))
         self.search_bar = self._build_search()
-        self.main.add_widget(self.search_bar)
-        # 压缩页的工具栏与搜索栏**同一行位置**，靠高度在 56/0 之间切换。
-        # 不两个都占位：BoxLayout 里多一条隐形行会白吃 56dp，
-        # 小屏上就是「列表凭空少两行」。
         self.slim_bar = self._build_slim_bar()
-        self.slim_bar.height = 0
-        self.slim_bar.opacity = 0.0
-        self.slim_bar.disabled = True
-        self.main.add_widget(self.slim_bar)
-        self.main.add_widget(self._build_slim_actions())
+        self._active_bar = None
+        self.main.add_widget(self.toolbar_slot)
+        self._set_active_bar(self.search_bar)
+
+        # 批量操作条先**不挂**（见 _slim_actions_visible）：
+        # 只有进入压缩页并扫到文件后才 add_widget 到 main 上。
+        self.slim_actions = self._build_slim_actions()
         self.main.add_widget(self._build_hist())
         self.main.add_widget(self._build_navigation())
         self.main.add_widget(self._build_results())
@@ -1587,6 +1597,15 @@ class LxApp(App):
     # 只存关键词、只走 UI 入口：do_search / _search_work 一字未动
     HIST_MAX = 20
 
+    # 列表行尺寸：搜索结果行与压缩页文件行**共用同一组常量**。
+    # 两边各自硬编码过一套不同的值（72/42/58 vs 64/38/54），
+    # 切页时列表会整体缩一下、字基线也对不齐 —— 真机反馈的
+    # 「各控件不对齐」就是这么来的。共用常量 = 想不一致都难。
+    ROW_H = 72          # 行高
+    ROW_BTN = 42        # 右侧圆形按钮直径
+    ROW_COL = 58        # 右侧圆形按钮所占列宽
+    ROW_PAD = 32        # 文字按钮左右内衬合计
+
     def _hist_path(self):
         return os.path.join(appenv.APP_DIR, "search_history.json")
 
@@ -1633,6 +1652,10 @@ class LxApp(App):
 
     def _go_search(self, *_):
         """搜索按钮 / 回车的新入口：先记历史，再转原始逻辑 do_search"""
+        # 压缩页里搜索栏是**没挂载**的（见 _set_active_bar），
+        # 这时要先切回发现页，否则用户看不到结果区/搜索框，像"搜索没反应"。
+        if getattr(self, "_view", None) == SLIM_VIEW:
+            self.show_library_view("discover")
         kw = (self.ti_search.text or "").strip()
         if kw:
             self._add_history(kw)
@@ -1655,10 +1678,27 @@ class LxApp(App):
                          pos_hint={"center_y": 0.5}, **self.F)
         clr.bind(on_release=self._clear_history)
         head.add_widget(clr)
-        self._hist_sv = ScrollView(do_scroll_y=False, size_hint_y=None, height=dp(34))
-        self._hist_row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(8),
-                                   padding=(0, 0))
-        self._hist_row.bind(minimum_width=self._hist_row.setter("width"))
+        # 历史胶囊行是**横向滚动**：ScrollView 的滚动范围来自内容宽度，
+        # 而 BoxLayout **没有** minimum_width 属性（只有 minimum_height）。
+        # 原代码 `bind(minimum_width=...)` 只是给控件加了个普通 attribute，
+        # setter 又指向 width —— 结果内容宽度永远是 0，ScrollView 认为
+        # 「没东西可滚」，手指怎么划都不动（真机反馈的「历史多了滑不了」）。
+        # 正确做法：自己累加子控件宽度，算出真实内容宽度再写回 width。
+        self._hist_sv = ScrollView(
+            do_scroll_x=True, do_scroll_y=False,
+            size_hint_y=None, height=dp(34),
+            scroll_type=["content"],      # 手指按在胶囊上也能拖
+            bar_width=0,
+            effect_cls="ScrollEffect")
+        self._hist_row = BoxLayout(orientation="horizontal",
+                                   size_hint=(None, None),
+                                   height=dp(34), width=dp(0),
+                                   spacing=dp(8), padding=(0, 0))
+        # 子控件增减/宽度变化 → 重算内容宽度。
+        # children 属性在 Kivy 里**会**派发，但重建过程中会触发很多次，
+        # 而且我们要的是"全部加完之后"的宽度 —— 所以增删结束都显式调一次
+        # （_rebuild_chips 里已经这么做了）；这个 bind 只是兜底。
+        self._hist_row.bind(children=lambda *_: self._sync_hist_width())
         self._hist_sv.add_widget(self._hist_row)
         # ⚠ Kivy 的布局容器**不会裁剪**子控件：高度 0 的面板里，标题行(24dp)
         # 和胶囊条(34dp)照样画出来、照样收触摸 —— 首屏「搜索框和历史叠在一起」、
@@ -1670,6 +1710,34 @@ class LxApp(App):
         self._rebuild_chips()
         return box
 
+    def _sync_hist_width(self, *_):
+        """按子控件累加出历史胶囊行的真实宽度（横向 ScrollView 靠它滚动）
+
+        BoxLayout **没有** minimum_width 属性（只有 minimum_height），
+        所以内容宽度必须自己算并写回 width。算错/不算的后果就是
+        「历史多了滑不动」—— ScrollView 认为内容宽度为 0，没东西可滚。
+
+        实现要点：**不要依赖布局后的 w.width**。
+        Kivy 里 width 要等下一次布局才更新，而我们在建完胶囊的同一拍就要
+        定宽度；没布局过时 width 还是默认 100，累加结果完全不对。
+        所以胶囊的宽度在**创建时**就算好并记在 _chip_w 里，这里只做求和。
+        """
+        row = getattr(self, "_hist_row", None)
+        if row is None:
+            return
+        try:
+            widths = getattr(self, "_chip_w", None) or []
+            total = float(sum(widths))
+            n = len(widths)
+            if n > 1:
+                total += dp(8) * (n - 1)
+            pad = row.padding
+            if isinstance(pad, (list, tuple)) and len(pad) == 4:
+                total += pad[0] + pad[2]
+            row.width = max(total, dp(1))
+        except Exception:
+            log_exc("_sync_hist_width")
+
     def _hist_attach_parts(self):
         box = self._hist_box
         if not box.children:
@@ -1677,31 +1745,43 @@ class LxApp(App):
                 box.add_widget(w)
 
     def _rebuild_chips(self):
+        """重建历史胶囊：宽度在这里算好并缓存，供横向滚动用"""
         if getattr(self, "_hist_row", None) is None:
             return                       # build() 早期被调时容错
         self._hist_row.clear_widgets()
+        self._chip_w = []                # 每个胶囊的宽度（_sync_hist_width 用）
         h = self._load_history()
         if not h:
             tip = Label(text="还没有搜索记录，搜过的歌名会出现在这里",
-                        size_hint_x=None, width=dp(300), font_size=dp(12),
-                        color=C_FAINT, halign="left", valign="middle", **self.F)
+                        size_hint=(None, None), size=(dp(300), dp(34)),
+                        font_size=dp(12), color=C_FAINT,
+                        halign="left", valign="middle", **self.F)
             fit_text(tip)
             self._hist_row.add_widget(tip)
+            self._chip_w.append(dp(300))
+            self._sync_hist_width()
             return
         from kivy.core.text import Label as CoreLabel
         for i, kw in enumerate(h[:10]):   # 一屏胶囊最多 10 个，横向可滑
             try:
+                # ⚠ 不能读 lb.texture_size 之后就丢掉 —— CoreLabel 要 refresh()
+                #   才把纹理算出来，否则拿到的是 (0,0)，胶囊宽度全变最小值。
                 lb = CoreLabel(text=kw, font_size=dp(13), **self.F)
                 lb.refresh()
-                w = min(dp(220), lb.texture_size[0] + dp(26))
+                tw = float(lb.texture_size[0])
+                if tw <= 0:                 # 极端情况：退回按字数估算
+                    tw = len(kw) * dp(13)
+                w = min(dp(220), tw + dp(26))
             except Exception:
                 w = dp(26) + dp(13) * len(kw)
+            w = max(dp(56), w)              # 再短的词也别缩成一个点
             chip = SpringButton(text=kw, font_size=dp(13),
                                 size_hint=(None, None), size=(w, dp(34)),
                                 bg_color=C_CTRL, color=C_TEXT, pill=True,
                                 pos_hint={"center_y": 0.5}, **self.F)
             chip.bind(on_release=lambda b, k=kw: self._chip_tap(k))
             self._hist_row.add_widget(chip)
+            self._chip_w.append(w)          # 记住宽度（不依赖布局结果）
             if getattr(self, "_hist_open", False):
                 # 逐个弹入：从 0.93 缩放回位，每个晚 30ms ——
                 # iOS「最近搜索」展开时的那种涟漪感。
@@ -1714,6 +1794,8 @@ class LxApp(App):
                 _an = Animation(_press=0.0, d=0.5, t=spring_t)
                 Clock.schedule_once(
                     lambda *_, a=_an, c=chip: a.start(c), 0.03 * i)
+        # 全部建完再定宽度（建一个算一次会算到中间态）
+        self._sync_hist_width()
 
     def _chip_tap(self, kw):
         """点历史胶囊：填回搜索框并直接重搜"""
@@ -1734,7 +1816,7 @@ class LxApp(App):
             self._rebuild_chips()
             self._hist_attach_parts()
             self._hist_box.opacity = 0.0
-            Animation(height=dp(96), opacity=1.0, d=0.30,
+            Animation(height=self._hist_height(), opacity=1.0, d=0.30,
                       t=spring_t).start(self._hist_box)
             # 保险丝带世代号：快速「展开→收起」时，旧的展开保险丝必须作废，
             # 否则它会晚半步到达、把已经收起的面板又撑开（2.8.7 现象：
@@ -1742,9 +1824,24 @@ class LxApp(App):
             self._hist_gen = getattr(self, "_hist_gen", 0) + 1
             g = self._hist_gen
             Clock.schedule_once(
-                lambda *_: self._hist_fuse(dp(96), g), 0.8)
+                lambda *_: self._hist_fuse(self._hist_height(), g), 0.8)
         except Exception:
             log_exc("_show_hist")
+
+    def _hist_height(self):
+        """历史面板高度：标题行(24) + 间距(6) + 胶囊行(34) + 上下内衬
+
+        胶囊是**横向**排的一排（横向 BoxLayout 装在横向 ScrollView 里），
+        所以历史再多也占一行高度 —— 多了靠横向滑动看，
+        **不要**靠继续长高（会把下面的结果区挤没）。
+        真机反馈「历史多了显示不了、也滑不动」的根因不在高度，
+        在宽度：BoxLayout 没有 minimum_width，滚不起来（见 _sync_hist_width）。
+        """
+        return dp(self.HIST_HEAD_H) + dp(self.HIST_GAP) + dp(self.HIST_ROW_H) + dp(8)
+
+    HIST_ROW_H = 34      # 一行胶囊的高度
+    HIST_HEAD_H = 24     # 「搜索历史 / 清除」标题行
+    HIST_GAP = 6
 
     def _hist_fuse(self, h, gen):
         if getattr(self, "_hist_gen", 0) != gen:
@@ -1971,6 +2068,27 @@ class LxApp(App):
     # 这里把它整个搬进 App：原生 .so 做编解码（见 mp3slim.py），
     # 界面复用落雪现有的「大标题 + 分组卡 + 底部抽屉」布局语言，
     # 不引入任何新的视觉元素 —— 用户不用学第二套操作。
+    def _set_active_bar(self, bar):
+        """工具栏插槽：换掉当前挂着的那一条（同一时刻只挂一个）
+
+        为什么不用 height=0 收起：Kivy 不裁剪子控件，高度 0 的容器里的
+        胶囊/按钮仍然会被绘制、仍然会抢触摸 —— 这正是「压缩工具栏浮在
+        搜索栏上」那个 bug 的成因。remove_widget 之后它才真的不存在。
+        """
+        slot = self.toolbar_slot
+        if getattr(self, "_active_bar", None) is bar:
+            return
+        try:
+            slot.clear_widgets()
+        except Exception:
+            log_exc("_set_active_bar clear")
+        slot.add_widget(bar)
+        self._active_bar = bar
+        # 高度跟着当前这条走（两条都是 56，留成显式赋值以免将来改布局忘记）
+        slot.height = bar.height or dp(56)
+        bar.size_hint_y = None
+        bar.height = dp(56)
+
     def _build_slim_bar(self):
         """压缩页的工具栏：目录胶囊 + 扫描/设置按钮（一行，52dp）
 
@@ -2012,8 +2130,7 @@ class LxApp(App):
         放页面里而不是抽屉里：批量压缩是这个功能的主操作，
         藏进设置抽屉等于让用户去翻菜单 —— 与「主操作一眼可见」相悖。
         """
-        row = BoxLayout(size_hint_y=None, height=0, opacity=0.0,
-                        disabled=True,
+        row = BoxLayout(size_hint_y=None, height=dp(46),
                         padding=(dp(16), dp(2), dp(16), dp(2)), spacing=dp(8))
         self.btn_slim_all = SpringButton(
             text="压缩全部", font_size=dp(13), bold=True, pill=True,
@@ -2776,14 +2893,15 @@ class LxApp(App):
 
     def _row_of(self, i, s):
         """建一行搜索结果（iOS 分组卡里的单元格：歌名两行 + 右圆钮 + 发丝线）"""
-        row = BoxLayout(size_hint_y=None, height=dp(72), spacing=dp(2),
-                        padding=(0, dp(4), dp(4), dp(4)))
+        row = BoxLayout(size_hint_y=None, height=dp(LxApp.ROW_H),
+                        spacing=dp(2), padding=(0, dp(4), dp(4), dp(4)))
         # 歌名这块本身就是播放键 —— 点一下直接放，不再弹详情框
         try:
             # 文字区精确预算：行宽 - 收藏列(44) - 间距(2) - 下载列(58)
             # - 行右内衬(4) - 按钮左右内衬(32) = 行宽 - 140。
             # 预算必须 **≤** text_size 实际宽度（见下），否则 clip_text
             # 放行的文字仍会在按钮里换行、撑出第三行盖住下一行。
+            # 行宽 − 收藏列(44) − 间距(2) − 圆钮列(58) − 右内衬(4) − 内衬(32) = −140
             avail = max(60.0, self.results.width - dp(140))
         except Exception:
             avail = dp(220)
@@ -2799,6 +2917,7 @@ class LxApp(App):
         # 上一版遮挡真因：截断预算比真实文字区宽了 22dp，截完仍超 → 换行
         # 撑出第三行 → 纵向溢出盖住别的歌。这里 text_size 高度**封顶**，
         # 即便截断估计有出入也只会在框内，绝不外溢；预算同时改对。
+        song_btn.text_size = (None, dp(58))     # 先封顶，宽度等布局（同上）
         song_btn.bind(size=lambda b, v: setattr(b, "text_size",
                                                 (v[0] - dp(32), dp(58))))
         song_btn.bind(on_release=lambda b, idx=i: self.play_song(idx))
@@ -2910,13 +3029,9 @@ class LxApp(App):
         """
         self._hide_hist()
         self._clear_results()
-        # 一整行换掉：搜索栏收起（高度 0），工具栏撑开（56dp）
-        self.search_bar.height = 0
-        self.search_bar.opacity = 0.0
-        self.search_bar.disabled = True
-        self.slim_bar.height = dp(56)
-        self.slim_bar.opacity = 1.0
-        self.slim_bar.disabled = False
+        # 换工具栏：搜索栏整个从布局里摘掉，压缩工具栏挂上去。
+        # （不要用 height=0 —— Kivy 不裁剪，透明的栏仍会抢触摸，见 _set_active_bar）
+        self._set_active_bar(self.slim_bar)
         self.hint.text = "选一个文件夹，扫描后点「压缩」"
         if not (self.ti_dir.text or "").strip():
             # 默认就指向下载目录 —— 用户刚下完歌最想压的就是那里
@@ -2932,40 +3047,75 @@ class LxApp(App):
         # 宁可如实报错，也不要静默给出一个「点了没反应」的按钮）
         self.btn_slim_scan.disabled = not mp3slim.available()
         self._slim_actions_visible(bool(self._slim_rows))
-        self.lbl_sub.text = "MP3 压缩 · 输出仍是 .mp3，任何播放器都能播"
+        # 副标题告诉用户「现在用的什么档位」，不用去翻设置抽屉
+        self._refresh_slim_subtitle()
         self._refresh_slim_estimate()
         if self._slim_rows:
             self._render_slim_rows()
         else:
-            self._empty_results("还没有扫描到文件\n填一个文件夹路径，点右上角「扫描」")
+            self._empty_results(self._slim_empty_hint())
+
+    def _slim_empty_hint(self):
+        """空列表时的引导文案：一句操作 + 一句当前档位/预期"""
+        try:
+            label, br, mono = self._slim_level()
+            tier = label.split("·")[0].strip()
+        except Exception:
+            tier, br, mono = "128k", 128, 0
+        ch = "单声道" if mono else "立体声"
+        return ("还没有扫描到文件\n\n"
+                "① 上面填一个文件夹路径（默认已填下载目录）\n"
+                "② 点右边「扫描」\n"
+                "③ 点列表右侧圆钮压缩单个，或点「压缩全部」\n\n"
+                "当前档位：%s（%dkbps %s）" % (tier, br, ch))
+
+    def _refresh_slim_subtitle(self):
+        """副标题：压缩页显示档位，其它页显示原来的平台数"""
+        try:
+            label, br, mono = self._slim_level()
+            tier = label.split("·")[0].strip()
+        except Exception:
+            tier, br, mono = "128k", 128, 0
+        ch = " 单声道" if mono else ""
+        self.lbl_sub.text = ("MP3 压缩 · %s%s · 输出仍是 .mp3，任何播放器都能播"
+                             % (tier, ch))
 
     def _slim_actions_visible(self, show):
-        """批量操作条：有文件才展开，没文件就收成 0 高（不留死空间）"""
-        try:
-            row = self.slim_actions
-        except AttributeError:
+        """批量操作条：只在压缩页且扫到文件时才挂到布局上
+
+        ⚠ 不能用 height=0 藏 —— 里面是一整排按钮，Kivy 不裁剪，
+          它们仍会被画出来、仍会抢触摸（搜索栏点不动就是这么来的）。
+          这里是 remove_widget / add_widget，摘掉就是真的不在了。
+        """
+        row = getattr(self, "slim_actions", None)
+        if row is None:
             return
-        if show:
+        parent = getattr(self, "main", None)
+        if parent is None:
+            return
+        mounted = row in parent.children
+        if show and not mounted:
+            try:
+                # 紧跟在工具栏插槽后面（视觉上就在工具栏下方）
+                idx = parent.children.index(self.toolbar_slot)
+                parent.add_widget(row, index=max(0, idx))
+            except Exception:
+                try:
+                    parent.add_widget(row)
+                except Exception:
+                    log_exc("_slim_actions_visible add")
             row.height = dp(46)
-            row.opacity = 1.0
-            row.disabled = False
-        else:
-            row.height = 0
-            row.opacity = 0.0
-            row.disabled = True
+        elif not show and mounted:
+            try:
+                parent.remove_widget(row)
+            except Exception:
+                log_exc("_slim_actions_visible remove")
 
     def _leave_slim_view(self):
-        """离开压缩页：搜索栏回来、工具栏收起
-
-        高度必须显式归零（不是只改 opacity）—— BoxLayout 会照常按
-        size_hint_y 分高度，透明控件照样占地方，列表就被永久挤掉 56dp。
-        """
-        self.search_bar.height = dp(56)
-        self.search_bar.opacity = 1.0
-        self.search_bar.disabled = False
-        self.slim_bar.height = 0
-        self.slim_bar.opacity = 0.0
-        self.slim_bar.disabled = True
+        """离开压缩页：把搜索栏换回来（压缩工具栏从布局里摘掉）"""
+        self._set_active_bar(self.search_bar)
+        # 批量操作条也收起来（它同样不能靠 height=0 藏 —— 里面是整排按钮）
+        self._slim_actions_visible(False)
 
     def slim_scan(self, *_):
         """扫描输入框里的目录（后台做，避免大目录卡界面）"""
@@ -3043,9 +3193,15 @@ class LxApp(App):
             log_exc("压缩列表圆角")
 
     def _slim_row_of(self, idx, item):
-        """一行文件：文件名 + 体积/状态 + 右侧压缩钮"""
-        row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(2),
-                        padding=(0, dp(4), dp(4), dp(4)))
+        """一行文件：文件名 + 体积/状态 + 右侧压缩钮
+
+        ⚠ 尺寸必须和 _row_of（搜索结果行）一模一样：行高 72、圆钮 42、
+          圆钮列 58、文字内衬 32。之前这行自己用了 64/38/54，
+          用户在「发现」和「压缩」之间切换时会看到列表整体缩放一下，
+          字基线也对不齐 —— 这就是「各控件设计有误、不对齐」的直接原因。
+        """
+        row = BoxLayout(size_hint_y=None, height=dp(self.ROW_H),
+                        spacing=dp(2), padding=(0, dp(4), dp(4), dp(4)))
         name = os.path.basename(item["path"])
         sub = mp3slim.human(item["size"])
         if item.get("state") == "done" and item.get("result"):
@@ -3069,8 +3225,9 @@ class LxApp(App):
                 "%dHz" % info.get("sample_rate", 0),
                 info.get("channels", 0))
 
+        # 文字预算与歌曲行同一个公式：行宽 − 圆钮列 − 间距 − 右内衬 − 内衬
         try:
-            avail = max(80.0, self.results.width - dp(84))
+            avail = max(60.0, self.results.width - dp(96) - dp(self.ROW_COL))
         except Exception:
             avail = dp(220)
         line1 = clip_text(name, avail)
@@ -3079,8 +3236,11 @@ class LxApp(App):
             text="%s\n%s" % (line1, line2), halign="left", valign="middle",
             font_size=dp(15), color=C_TEXT, bg_color=C_ITEM, radius=0,
             padding=(dp(16), dp(6)), **self.F)
-        btn.bind(size=lambda b, v: setattr(b, "text_size",
-                                           (v[0] - dp(32), dp(52))))
+        # 高度**先写死**（58dp 封顶），宽等第一次布局再算 —— 只写 size 回调的话，
+        # 首帧 text_size 还是 (None, None)，长文件名会先换行撑破行高再被纠正。
+        btn.text_size = (None, dp(58))
+        btn.bind(size=lambda b, v: setattr(
+            b, "text_size", (v[0] - dp(self.ROW_PAD), dp(58))))
         btn.bind(on_release=lambda b, i=idx: self.slim_compress_one(i))
         row.add_widget(btn)
         row._slim_btn = btn
@@ -3088,18 +3248,19 @@ class LxApp(App):
 
         state = item.get("state", "idle")
         if state == "done":
-            ico = IconButton("download", dia=dp(38), icon_color=C_OK,
-                             bg=(0.90, 0.97, 0.92, 1))
+            ico = IconButton("download", dia=dp(self.ROW_BTN),
+                             icon_color=C_OK, bg=(0.90, 0.97, 0.92, 1))
             ico.opacity = 0.55
         elif state == "running":
-            ico = IconButton("pause", dia=dp(38), icon_color=C_FAINT,
-                             bg=C_CTRL)
+            ico = IconButton("pause", dia=dp(self.ROW_BTN),
+                             icon_color=C_FAINT, bg=C_CTRL)
             ico.opacity = 0.55
         else:
-            ico = IconButton("slim", dia=dp(38), icon_color=C_ACCENT,
+            ico = IconButton("slim", dia=dp(self.ROW_BTN),
+                             icon_color=C_ACCENT,
                              bg=(0.926, 0.953, 1.0, 1))
         ico.bind(on_release=lambda b, i=idx: self.slim_compress_one(i))
-        row.add_widget(VCenter(ico, w=dp(54), h=dp(56)))
+        row.add_widget(VCenter(ico, w=dp(self.ROW_COL), h=dp(64)))
         attach_sep(row, inset=dp(16))
         return row
 
@@ -3137,6 +3298,12 @@ class LxApp(App):
         if lbl is not None:
             lbl.text = text
             lbl.color = C_DIM
+        # 压缩页的副标题也反映档位（用户改档位时立刻看到）
+        if getattr(self, "_view", None) == SLIM_VIEW:
+            try:
+                self._refresh_slim_subtitle()
+            except Exception:
+                log_exc("_refresh_slim_subtitle")
 
     def pick_slim_out(self, *_):
         """选输出文件夹（复用系统目录选择器，回调码 0x1237）"""
@@ -3238,16 +3405,34 @@ class LxApp(App):
         self._slim_pump_next()
 
     def slim_stop(self, *_):
-        """停止当前批（当前文件压完就停，不留半截文件）"""
+        """停止当前批（当前文件压完就停，不留半截文件）
+
+        ⚠ 压缩是**阻塞调用**（一首歌 3~15 秒），停不下来是物理限制：
+          不能中途砍断 C 调用（会留下半截 .mp3）。所以这里做的是
+          「立刻给反馈 + 队列清空 + 当前这首压完就收尾」。
+          之前只设了一个标记、状态栏一句话，而状态栏又被进度更新
+          不断覆盖 —— 用户看到的就是「点了停止没反应 / 关不掉」。
+          现在：按钮立刻变成「正在停止…」并禁用，进度文案也改掉，
+          这样"点了有反应"是立刻可见的。
+        """
         if not self._slim_busy:
             self.set_status("没有在压缩")
             return
         self._slim_stop_flag = True
         self._slim_pending = []
-        self.set_status("正在停止…（当前文件结束就停）")
+        # 立刻反馈：按钮态 + 进度文案都得变
+        try:
+            self.btn_slim_stop.text = "正在停止…"
+            self.btn_slim_stop.disabled = True
+        except Exception:
+            log_exc("slim_stop 按钮态")
+        self._slim_stopping = True
+        self.set_status("正在停止…（当前文件压完就停，不留半截文件）")
 
     def _slim_pump_next(self):
         """取下一个待压文件开工；队列空了就收尾"""
+        if not getattr(self, "_slim_stop_flag", False):
+            self._slim_stopping = False
         if self._slim_stop_flag:
             self._slim_finish_batch("已停止")
             return
@@ -3320,8 +3505,14 @@ class LxApp(App):
         rows[idx]["pct"] = pct
         # 进度条复用底部的下载进度胶囊 —— 它是这个 App 唯一的「百分比」入口
         self.pb.value = pct
-        self.set_status("压缩中 %s: %d%%" % (
-            os.path.basename(rows[idx]["path"]), pct))
+        if getattr(self, "_slim_stopping", False):
+            # 用户已经点了停止：不要再把状态栏刷回「压缩中」，
+            # 否则那句「正在停止…」一闪就没，看起来像没点中。
+            self.set_status("正在停止… %s %d%%"
+                            % (os.path.basename(rows[idx]["path"]), pct))
+        else:
+            self.set_status("压缩中 %s: %d%%" % (
+                os.path.basename(rows[idx]["path"]), pct))
         # 就地更新小字，避免整表重建（重建会闪、还会丢滚动位置）
         row = self._slim_row_widget(idx)
         if row is not None:
@@ -3384,6 +3575,13 @@ class LxApp(App):
         self._slim_busy = False
         self._slim_active = None
         self._slim_pending = []
+        self._slim_stopping = False
+        # 恢复停止按钮（它可能被 slim_stop 置灰了）
+        try:
+            self.btn_slim_stop.text = "停止"
+            self.btn_slim_stop.disabled = False
+        except Exception:
+            log_exc("_slim_finish_batch 恢复按钮")
         rows = getattr(self, "_slim_rows", None) or []
         done = len([x for x in rows if x.get("state") == "done"])
         failed = len([x for x in rows if x.get("state") == "error"])
@@ -3411,14 +3609,29 @@ class LxApp(App):
         self._act_on_song(idx, "download")
 
     def _act_on_song(self, idx, action):
+        """点歌名 / 点下载：**最后一次点击说了算**
+
+        旧行为：`busy` 为真时直接吞掉点击（只弹一句「正在处理中」）。
+        真机上的表现是「点 A 又在解析，再点 B 没反应，然后 A 自己播起来」，
+        用户以为点坏了，反复点 —— 而且两个解析同时在跑时，
+        先回来的那首会顶掉后点的，播的和点的不一致。
+        现在改成：新点击立即作废旧解析（_resolve_gen 自增），
+        并且**先停掉正在放的音频**，不会出现两首同时响。
+        """
         try:
             if not 0 <= idx < len(self.songs):
                 return
-            if self.busy:
-                self.set_status("正在处理中，请稍候…")
-                return
             if action == 'play':
                 self.queue.set(self.songs, idx)
+                # 立刻掐掉当前这首：新歌的直链要好几百毫秒甚至几秒才回来，
+                # 这段时间里旧歌还在放 = 用户听到的「重叠播放」。
+                try:
+                    if self.player.is_active():
+                        self.player.stop()
+                        self._bg_playing(False)
+                        self.btn_play.text = "播放"
+                except Exception:
+                    log_exc("_act_on_song stop")
             self._start_song_action(self.songs[idx], action)
         except Exception as e:
             self.busy = False
@@ -3427,6 +3640,10 @@ class LxApp(App):
 
     def _start_song_action(self, song, action):
         try:
+            # 每次发起都换一个代际号：在途的老解析回来时会被丢掉，
+            # 不会出现「点 B 播 A」或两首同时响。
+            self._resolve_gen = getattr(self, "_resolve_gen", 0) + 1
+            self._resolve_song_obj = song
             self.busy = True
             self._cur_song = song
             self._playing_song = song
@@ -3540,6 +3757,10 @@ class LxApp(App):
 
     def _resolve_song(self, song):
         """后台：解析直链（本平台内依次尝试各音质，不换平台）"""
+        # 本代际号：解析途中用户又点了别的歌 → 本次结果直接丢弃。
+        # 没有这道闸，先发起的解析后回来**反而会顶掉**后点的歌
+        # （真机上就是「点了 B，播的是 A」）。
+        my_gen = getattr(self, "_resolve_gen", 0)
         want = self._quality_code()
         order = [want] + [q for q in ("320k", "flac", "128k") if q != want]
         order = order[:3]
@@ -3571,6 +3792,10 @@ class LxApp(App):
             url, used, info, err2 = self._try_one(source, song, order)
             err = err2 or err
 
+        if my_gen != getattr(self, "_resolve_gen", 0):
+            diag("解析结果已过期，丢弃（用户已点了别的歌）")
+            return
+
         if url:
             meta = getattr(self, "_pre_meta", None) or songinfo.probe(url)
             self._pre_meta = None
@@ -3581,9 +3806,12 @@ class LxApp(App):
         # 用户选了 QQ 音乐就是要 QQ 音乐 —— 偷偷换成网易云/酷狗
         # 等于给了一首「来源不对」的歌，比直接说失败更糟。
         # 失败就如实报错，是否换平台由用户自己决定（见 _song_failed）。
+        if my_gen != getattr(self, "_resolve_gen", 0):
+            diag("解析失败但已过期，不回写状态")
+            return
+        # （注意：这里只调一次。原代码连着调了两次 _song_failed，
+        #  第二次不带 platform，会把带平台的错误信息覆盖成通用文案。）
         self.ui(lambda: self._song_failed(err, source))
-
-        self.ui(lambda: self._song_failed(err))
 
     def _song_failed(self, err, platform=None):
         name = PLATFORM_LABEL.get(platform or "", platform or "")
